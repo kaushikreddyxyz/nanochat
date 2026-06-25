@@ -1,0 +1,3 @@
+# Secrets — keep out of GitHub Copilot context/indexing.
+.env
+.env.local
