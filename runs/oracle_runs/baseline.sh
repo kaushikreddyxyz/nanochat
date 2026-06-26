@@ -186,7 +186,7 @@ if [ -z "${WANDB_RUN:-}" ]; then
     WANDB_AUTHED=$(python3 -c "
 import os
 try:
-    import nanochat._env  # loads repo .env if present (injects WANDB_API_KEY / HF_TOKEN)
+    import nanochat.common  # loads nanochat/.env + mirrors WANDB_TOKEN->WANDB_API_KEY (exactly as training does)
 except Exception:
     pass
 ok = bool(os.environ.get('WANDB_API_KEY'))
