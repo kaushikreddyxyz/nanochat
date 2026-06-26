@@ -82,6 +82,8 @@ parser.add_argument("--seed", type=int, default=1337, help="RNG seed for weight 
 parser.add_argument("--save-optimizer", type=str, default="every", choices=["every", "final", "never"], help="when to save optimizer state with checkpoints: 'every' checkpoint (resume anywhere), 'final' step only (resume from end, lighter), or 'never' (smallest, not resumable)")
 parser.add_argument("--compress-checkpoints", type=int, default=1, help="gzip-compress checkpoint .pt files (1=on, 0=off); loading auto-detects compression")
 parser.add_argument("--checkpoint-compress-level", type=int, default=4, help="gzip level 1-9 for checkpoint compression (higher = smaller files, slower)")
+# Model ablations
+parser.add_argument("--no-value-embeds", action="store_true", help="zero and freeze the ResFormer value-embedding tables so they neither contribute nor learn (matched no-value-embeds control; identical to the default run in every other respect given --seed)")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -179,6 +181,19 @@ if resuming:
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
+
+# Optional ablation: disable the ResFormer value embeddings. We zero the value-embedding
+# tables and freeze them, so they neither contribute to the forward (v = v + gate*0 == v)
+# nor receive gradient updates. Done AFTER init_weights (and any resume load) so that,
+# given the same --seed, every other parameter is bit-identical to the default run -- the
+# only difference is whether value embeddings are learned. The ve_gate stays present but is
+# a no-op (its output is multiplied by the zeroed value embedding).
+if args.no_value_embeds:
+    with torch.no_grad():
+        for ve in model.value_embeds.values():
+            ve.weight.zero_()
+            ve.weight.requires_grad_(False)
+    print0(f"--no-value-embeds: zeroed + froze {len(model.value_embeds)} value-embedding table(s)")
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)

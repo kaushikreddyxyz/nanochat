@@ -9,28 +9,32 @@
 # in GPT.forward is a no-op), therefore this run is a clean "no-oracle" baseline
 # BY CONSTRUCTION — nothing here needs to disable the oracle explicitly.
 #
-# Defaults: d26, bf16 (fp8 OFF), compute-optimal data ratio (12), periodic
-# weights-only checkpoints, gzip-compressed checkpoints, deterministic seed.
+# Defaults: d24, fp8 (bf16 base + fp8 GEMM for speed), compute-optimal data ratio (12),
+# periodic checkpoints, gzip-compressed checkpoints, deterministic seed.
 #
-# Expected cost @ d26 / bf16 / compute-optimal, $26 per 8xH100-node-hr:
-#   ~8-9.5 h wall-clock  ->  ~$215-245.   (d24 instead: ~5.4-6.1 h -> ~$140-160)
+# Expected cost @ d24 / fp8 / compute-optimal, $26 per 8xH100-node-hr:
+#   ~4.2 h wall-clock  ->  ~$110.   (PRECISION=bf16: ~5.4-6.1 h -> ~$140-160; d26/fp8: ~6.4 h -> ~$165)
 #
 # ---------------------------------------------------------------------------
 # USAGE
 #   bash runs/oracle_runs/baseline.sh                      # full run (from anywhere)
 #   screen -L -Logfile runs/oracle_runs/baseline.log -S baseline bash runs/oracle_runs/baseline.sh
 #   SMOKE=1 bash runs/oracle_runs/baseline.sh             # quick OOM/pipeline check, nothing saved
+#   bash runs/oracle_runs/no_value_embeds.sh             # IDENTICAL run but value embeddings disabled (sets NO_VALUE_EMBEDS=1)
 #
 # CONTROLLABLE KNOBS (all env-overridable, e.g. `DEPTH=24 DEVICE_BATCH_SIZE=8 bash ...`)
 #   Model:        DEPTH=26  RATIO=12  MAX_SEQ_LEN=2048  DEVICE_BATCH_SIZE=16  NPROC=8
+#   Precision:    PRECISION=fp8          # fp8 (bf16 base + fp8 GEMM, fastest, default) | bf16 | fp16 | fp32
+#                 FP8_RECIPE=tensorwise  # (advanced) fp8 scaling recipe when PRECISION=fp8: tensorwise | rowwise
 #   Repro:        SEED=1337
 #   Checkpoints:  SAVE_EVERY=2000        # model-checkpoint cadence in steps (-1=final only, 0=never)
 #                 SAVE_OPTIMIZER=every   # every | final | never  (optimizer state policy; see note)
 #                 COMPRESS_CHECKPOINTS=1 # gzip checkpoints (load auto-detects)
 #                 COMPRESS_LEVEL=4       # gzip level 1-9
 #   Eval/log:     EVAL_EVERY=250  CORE_METRIC_EVERY=2000  SAMPLE_EVERY=2000
+#   Ablation:     NO_VALUE_EMBEDS=0      # 1 = zero+freeze value embeddings (or just run no_value_embeds.sh)
 #   Data:         TRAIN_SHARDS=<n>       # override the auto-sized shard count if you want
-#   Output:       MODEL_TAG=oracle_baseline_d${DEPTH}
+#   Output:       MODEL_TAG=oracle_baseline_d${DEPTH}_${PRECISION}   (auto-includes value-embeds + precision variant)
 #   Mode:         SMOKE=1                # run a 3-step validation at the real config, then exit
 #
 # CHECKPOINT DISK NOTE: at d26, a full checkpoint is ~14 GB compressed (~6 GB model
@@ -63,11 +67,13 @@ banner () {
 }
 
 # --- config (all env-overridable) -------------------------------------------
-DEPTH=${DEPTH:-26}                              # the single complexity dial
+DEPTH=${DEPTH:-24}                              # the single complexity dial
 RATIO=${RATIO:-12}                              # data:param ratio (12 = nanochat compute-optimal)
 MAX_SEQ_LEN=${MAX_SEQ_LEN:-2048}                # context length
-DEVICE_BATCH_SIZE=${DEVICE_BATCH_SIZE:-16}      # per-GPU microbatch; REDUCE to 8/4/2 if you OOM (d26+bf16 is memory-heavy)
+DEVICE_BATCH_SIZE=${DEVICE_BATCH_SIZE:-16}      # per-GPU microbatch; REDUCE to 8/4/2 if you OOM (larger DEPTH is memory-heavy)
 NPROC=${NPROC:-8}                               # GPUs / processes
+PRECISION=${PRECISION:-fp8}                     # ONE precision slider: fp8 (bf16 base + fp8 GEMM, fastest, default) | bf16 | fp16 | fp32
+FP8_RECIPE=${FP8_RECIPE:-tensorwise}           # (advanced) fp8 scaling recipe when PRECISION=fp8: tensorwise | rowwise
 SEED=${SEED:-1337}                              # RNG seed for weight init (share with treatment runs)
 SAVE_EVERY=${SAVE_EVERY:-2000}                  # model-checkpoint cadence (steps); -1=final only, 0=never
 SAVE_OPTIMIZER=${SAVE_OPTIMIZER:-every}         # optimizer save policy: every | final | never
@@ -76,16 +82,28 @@ COMPRESS_LEVEL=${COMPRESS_LEVEL:-4}             # gzip level 1-9
 EVAL_EVERY=${EVAL_EVERY:-250}                   # val bpb cadence
 CORE_METRIC_EVERY=${CORE_METRIC_EVERY:-2000}    # CORE metric cadence
 SAMPLE_EVERY=${SAMPLE_EVERY:-2000}              # in-training sampling cadence
-MODEL_TAG=${MODEL_TAG:-oracle_baseline_d${DEPTH}}   # checkpoint dir name, kept distinct from other runs
+NO_VALUE_EMBEDS=${NO_VALUE_EMBEDS:-0}           # 1 = zero+freeze value embeddings (no_value_embeds.sh sets this); the ONLY difference vs the default run
 TRAIN_SHARDS=${TRAIN_SHARDS:-}                  # override the auto-sized shard count if set
 SMOKE=${SMOKE:-0}                               # 1 = quick validation run (no full training, nothing saved)
+# Derive the value-embeds ablation flag + a tag/run suffix so the two variants never collide
+if [ "$NO_VALUE_EMBEDS" = "1" ]; then NO_VE_FLAG="--no-value-embeds"; TAGSUFFIX="_noVE"; VE_STATUS="DISABLED (zeroed+frozen)"; else NO_VE_FLAG=""; TAGSUFFIX=""; VE_STATUS="learned"; fi
+# Precision: one slider -> base compute dtype (NANOCHAT_DTYPE) + fp8 toggle. fp8 keeps a bf16
+# base and only accelerates the big matmuls (master weights stay fp32, eval runs in bf16).
+case "$PRECISION" in
+    fp8)  FP8_FLAG="--fp8 --fp8-recipe=${FP8_RECIPE}"; PREC_DESC="bf16 base + fp8 GEMM (${FP8_RECIPE})"; PREC_TAG="fp8" ;;   # NANOCHAT_DTYPE left auto => bf16
+    bf16) FP8_FLAG=""; PREC_DESC="bf16"; PREC_TAG="bf16" ;;
+    fp16) export NANOCHAT_DTYPE="float16"; FP8_FLAG=""; PREC_DESC="fp16"; PREC_TAG="fp16" ;;
+    fp32) export NANOCHAT_DTYPE="float32"; FP8_FLAG=""; PREC_DESC="fp32"; PREC_TAG="fp32" ;;
+    *)    echo "ERROR: PRECISION must be one of: fp8 | bf16 | fp16 | fp32 (got '$PRECISION')" >&2; exit 1 ;;
+esac
+MODEL_TAG=${MODEL_TAG:-oracle_baseline${TAGSUFFIX}_d${DEPTH}_${PREC_TAG}}   # checkpoint dir name (incl. value-embeds + precision variant so runs never collide)
 
 export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 mkdir -p "$NANOCHAT_BASE_DIR"
 TOK_DIR="$NANOCHAT_BASE_DIR/tokenizer"
 
-banner "ORACLE BASELINE (negative control): d${DEPTH}, ratio ${RATIO}, bf16, seed ${SEED}"
+banner "ORACLE BASELINE (negative control): d${DEPTH}, ratio ${RATIO}, ${PREC_DESC}, seed ${SEED} | value_embeds=${VE_STATUS}"
 
 # --- python venv setup with uv ----------------------------------------------
 command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -122,7 +140,7 @@ PY
 )"
 TRAIN_SHARDS=${TRAIN_SHARDS:-$PLAN_SHARDS}
 echo ""
-echo "  >> tag=${MODEL_TAG}  device_batch_size=${DEVICE_BATCH_SIZE}  gpus=${NPROC}  seed=${SEED}"
+echo "  >> tag=${MODEL_TAG}  device_batch_size=${DEVICE_BATCH_SIZE}  gpus=${NPROC}  seed=${SEED}  value_embeds=${VE_STATUS}"
 echo "  >> save_every=${SAVE_EVERY}  save_optimizer=${SAVE_OPTIMIZER}  compress=${COMPRESS_CHECKPOINTS}(lvl ${COMPRESS_LEVEL})  shards=${TRAIN_SHARDS}"
 
 # =============================================================================
@@ -152,6 +170,8 @@ if [ "$SMOKE" = "1" ]; then
         --total-batch-size="$SMOKE_TBS" \
         --num-iterations=3 \
         --seed="$SEED" \
+        $NO_VE_FLAG \
+        $FP8_FLAG \
         --save-every=0 \
         --eval-every=-1 --core-metric-every=-1 --sample-every=-1 \
         --run=dummy
@@ -161,7 +181,7 @@ if [ "$SMOKE" = "1" ]; then
 fi
 
 # --- wandb: seamless auto-detect (auto-on if authenticated, else disabled) ---
-DEFAULT_RUN="baseline_d${DEPTH}_bf16_r${RATIO}"
+DEFAULT_RUN="baseline${TAGSUFFIX}_d${DEPTH}_${PREC_TAG}_r${RATIO}"
 if [ -z "${WANDB_RUN:-}" ]; then
     WANDB_AUTHED=$(python3 -c "
 import os
@@ -219,9 +239,9 @@ wait "$DATASET_DOWNLOAD_PID"
 echo "  >> Dataset ready."
 
 # --- base model pretraining (NO oracle = negative control; bf16; compute-opt)
-banner "Pretraining base model — d${DEPTH}, ratio ${RATIO}, bf16, NO oracle"
+banner "Pretraining base model — d${DEPTH}, ratio ${RATIO}, ${PREC_DESC}, NO oracle"
 # Key choices:
-#   * NO --fp8                       => bf16 training (cleaner numerics for control vs treatment diffs)
+#   * precision via the PRECISION knob (default fp8 = bf16 base + fp8 GEMM for speed; set PRECISION=bf16 for cleanest numerics)
 #   * --target-param-data-ratio=12   => compute-optimal token horizon
 #   * --total-batch-size omitted     => auto-computed optimal batch from scaling laws
 #   * --seed                         => reproducible init (share with treatment runs)
@@ -233,6 +253,8 @@ torchrun --standalone --nproc_per_node="$NPROC" -m scripts.base_train -- \
     --device-batch-size="$DEVICE_BATCH_SIZE" \
     --model-tag="$MODEL_TAG" \
     --seed="$SEED" \
+    $NO_VE_FLAG \
+    $FP8_FLAG \
     --save-every="$SAVE_EVERY" \
     --save-optimizer="$SAVE_OPTIMIZER" \
     --compress-checkpoints="$COMPRESS_CHECKPOINTS" \
