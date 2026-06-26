@@ -74,9 +74,14 @@ parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number o
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
-parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--save-every", type=int, default=-1, help="save model checkpoints every N steps (-1 = only at end, 0 = never save)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+# Reproducibility & checkpoint controls
+parser.add_argument("--seed", type=int, default=1337, help="RNG seed for weight init (same seed => identical init across runs/ranks; the pretraining dataloader is already deterministic)")
+parser.add_argument("--save-optimizer", type=str, default="every", choices=["every", "final", "never"], help="when to save optimizer state with checkpoints: 'every' checkpoint (resume anywhere), 'final' step only (resume from end, lighter), or 'never' (smallest, not resumable)")
+parser.add_argument("--compress-checkpoints", type=int, default=1, help="gzip-compress checkpoint .pt files (1=on, 0=off); loading auto-detects compression")
+parser.add_argument("--checkpoint-compress-level", type=int, default=4, help="gzip level 1-9 for checkpoint compression (higher = smaller files, slower)")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -94,6 +99,20 @@ if device_type == "cuda":
 else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
+
+# Reproducibility: pin weight init with a configurable seed so paired runs (e.g. the oracle
+# control vs treatment) initialize identically. This re-seed is ungated by rank, so all ranks
+# init the same weights — genuinely required here because nanochat uses no DDP/param broadcast
+# (DistMuonAdamW only all-reduces gradients), so divergent init would never resync. Cross-rank
+# parity already held via compute_init's fixed seed(42); the value added here is making the
+# seed configurable (overriding that 42). torch.manual_seed already seeds every CUDA/MPS device
+# generator internally, so no explicit cuda.manual_seed_all is needed. NOTE: the seed pins only
+# *weight init* — data order is pinned independently, by the deterministic loader (rank-strided,
+# no shuffle/RNG) given a fixed shard set + world_size + batch + seq_len, not by this seed.
+# Residual GPU-atomic nondeterminism in the backward pass means run-to-run bit-exactness is
+# still not guaranteed (the init lottery is fixed, the trajectory is not).
+torch.manual_seed(args.seed)
+print0(f"Seeded RNGs with seed={args.seed}")
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
@@ -473,13 +492,28 @@ while True:
             print0(tokenizer.decode(sample[0]))
         model.train()
 
-    # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
-    if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+    # save checkpoint: decide whether to write model weights and/or optimizer state this step.
+    #   --save-every:     -1 = only final, 0 = never, N>0 = every N steps (+ final)
+    #   --save-optimizer: 'every' (with each checkpoint) | 'final' (only last step) | 'never'
+    if args.save_every == 0:
+        save_model_now = False
+        save_opt_now = False
+    else:
+        save_model_now = last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0)
+        if args.save_optimizer == "never":
+            save_opt_now = False
+        elif args.save_optimizer == "final":
+            save_opt_now = last_step
+        else:  # "every"
+            save_opt_now = save_model_now
+        if save_opt_now and not save_model_now:
+            save_model_now = True  # need a matching model checkpoint to use the optimizer state
+    if save_model_now:
         save_checkpoint(
             checkpoint_dir,
             step,
             orig_model.state_dict(), # model parameters
-            optimizer.state_dict(), # optimizer state
+            optimizer.state_dict() if save_opt_now else None, # optimizer state (optional)
             { # metadata saved as json
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
@@ -496,6 +530,8 @@ while True:
                 },
             },
             rank=ddp_rank,
+            compress=bool(args.compress_checkpoints),
+            compress_level=args.checkpoint_compress_level,
         )
 
     # termination conditions (TODO: possibly also add loss explosions etc.)

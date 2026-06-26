@@ -38,7 +38,6 @@ class GPTConfig:
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
 
-
 def norm(x):
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
 
@@ -448,6 +447,20 @@ class GPT(nn.Module):
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
                 x = x + gate * x_pre_smear
 
+        # Oracle injection (oracle-encodings): a frozen, per-token-id additive
+        # feature placed in the residual stream right before the trunk -- the
+        # RoPE-era analogue of adding a positional encoding to the embedding.
+        # Added *after* norm (so its amplitude is controllable, not normed away)
+        # and *after* smear (so it stays an exact per-token signal), and folded
+        # into x0 below so it persists via the x0 residual. No-op unless an
+        # oracle is attached (see nanochat.oracle.inject.attach_oracle); the
+        # self.inject gate flips it off for ablation (ΔCE) / delayed injection.
+        # The same path serves training and kv-cache decode: oracle_fn(idx)
+        # returns the rows for whatever tokens are in idx.
+        oracle_fn = getattr(self, "oracle_fn", None)
+        if oracle_fn is not None and getattr(self, "inject", True):
+            x = x + oracle_fn(idx).to(x.dtype)
+
         # Forward the trunk of the Transformer
         x0 = x  # save initial normalized embedding for x0 residual
         n_layer = self.config.n_layer
@@ -481,7 +494,7 @@ class GPT(nn.Module):
             return logits
 
     @torch.inference_mode()
-    def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
+    def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42): 
         """
         Naive autoregressive streaming inference.
         To make it super simple, let's assume:
