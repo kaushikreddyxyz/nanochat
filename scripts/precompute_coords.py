@@ -172,7 +172,8 @@ def resolve_layout(ps, layer8, r_check):
         print("WARNING: probe_set.json has no 'main_block_concepts'; using name-sorted "
               "'concepts' as encoder pred column order. If the encoder was trained on the "
               "pre-fix (family-sorted) score store this attaches phase angles to the WRONG "
-              "concepts (see out/PERMUTATION_FIX.md).", file=sys.stderr)
+              "concepts (see the superproject's attribution/README.md "
+              "permutation note).", file=sys.stderr)
         pred_order = concepts
     assert set(concepts) == set(pred_order), \
         "main_block_concepts and concepts must be the same names (order differs)"

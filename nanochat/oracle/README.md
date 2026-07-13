@@ -1,5 +1,40 @@
 # nanochat.oracle — oracle-feature injection
 
+## Status & review guide (2026-07-13)
+
+History reads linearly: `main` → `experimental-setup` (the prior baseline-run
+setup, 3 commits) → the injection work on top (4 commits):
+
+1. `9f9469b` — the v1 coord-injection diffs applied verbatim (baseline for review)
+2. `29fa9a2` — modules moved in as `nanochat.oracle`, imports normalized, align vendored
+3. `96b79cc` — gpt.py routed through `InjectionSite` (v2), optimizer contract, legacy-flag compat
+4. `197bfdd` — tests + this README
+
+Suggested review order: `injections.py` (the design contract lives in its
+docstring) → `gpt.py` (`setup_injection_sites`, the forward hook) →
+`scripts/base_train.py` (flags, param groups) → `coords_store.py` /
+`coord_dataloader.py` (unchanged v1 semantics) → `scripts/precompute_coords.py`
+→ `tests/`. All 3 test files + `python -m nanochat.oracle.smoke` pass on CPU.
+
+**Blockers before any injected training run** (deliberate, not oversights):
+
+- **The coord store does not exist.** The old `oracle-coords`/`-b` HF repos
+  were deleted 2026-07-09; the precompute fleet (below) must run first.
+- **Encoder gap**: the precompute loader implements the legacy Exp-A encoder
+  head, but the Exp-A checkpoint repo (`oracle-encoder`) was also deleted
+  2026-07-09. What exists: the per-layer oracles on
+  `kaushikreddyxyz/oracle-encoders` (`layer06/08/14/best_stripped.pt`,
+  head = `OracleMLPHead` 1024→4096→54 — a *different* head). Before the fleet
+  runs, either point the loader at a per-layer checkpoint via a small adapter
+  (natural choice: `layer08`, since `build_coords` consumes the L8 block), or
+  supply a surviving local Exp-A checkpoint. This is experiment-design work,
+  not a bug.
+- GPU-side validations never run on the real stack (see the end of this file).
+- Open decision: whether to add a **coords-on eval pass** (eval is coords-off
+  by design today).
+
+---
+
 Two feature families live here:
 
 1. **Geometric-manifold oracle** (`inject.py`, `smoke.py`): a frozen additive
@@ -133,8 +168,10 @@ every pod: the **baseline run's tokenizer** at `$NANOCHAT_BASE_DIR/tokenizer`
 (coord/token alignment is keyed to its exact merges) and the ClimbMix shards
 at `$NANOCHAT_BASE_DIR/base_data_climbmix` (`python -m nanochat.dataset`).
 The probe set json lives in the superproject (e.g.
-`attribution/out/probe_set.json`); the encoder checkpoint is the frozen Exp-A
-Qwen encoder (`best.pt`).
+`attribution/out/probe_set.json`). The encoder checkpoint: historically the
+frozen Exp-A Qwen encoder (`best.pt`) — **its HF repo was deleted 2026-07-09**;
+see the encoder-gap blocker in the status section for the per-layer-oracle
+replacement path.
 
 ```bash
 # 1) pod 0 fits continents PCA + the global coord scale ONCE (shared by all pods)

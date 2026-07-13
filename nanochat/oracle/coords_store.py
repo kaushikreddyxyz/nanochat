@@ -86,7 +86,9 @@ def make_orthonormal_P(n_embd: int, r: int, seed: int = 1337) -> np.ndarray:
 #          "main_block_concepts" (family-sorted in the current store) -- NOT
 #          "concepts" (name-sorted). Attaching phase angles to the wrong
 #          concept was the coords half of the permutation bug (see the
-#          superproject's PERMUTATION_FIX.md). If None, defaults to `concepts`
+#          superproject's attribution/README.md permutation note; the full
+#          PERMUTATION_FIX.md post-mortem is in its git history). If None,
+#          defaults to `concepts`
 #          for backward compatibility (only correct for a fixed/rerun probe_set
 #          where main_block_concepts == concepts).
 #   families: {concept: family}
