@@ -21,6 +21,7 @@ shows only the injection hunks. Keep it that way when either file changes.
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import gc
+import sys
 import json
 import time
 import math
@@ -36,7 +37,8 @@ from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
 from nanochat.injection.sites import InjectionCfg, reassert_optimizability, parse_gate_spec, calibrate_auto_gate
 from nanochat.injection.sources import open_store, RuntimeProbeScoreSource
-from nanochat.injection.activation_dataloader import acts_data_loader_with_state
+from nanochat.injection.activation_dataloader import acts_data_loader_buffered
+from nanochat.injection.buffering import coordinate_rebuffer, duty_cycle_forecast, rebuffer_progress, size_prefetch_streams
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
@@ -107,9 +109,18 @@ parser.add_argument("--compact-tokens", action="store_true", help="OPT-IN: cut n
 # Staying-ahead guarantees (Amendment 2): the activation source must keep up with training.
 parser.add_argument("--starvation-threshold", type=float, default=0.15, help="warn if time-blocked-waiting-on-activations exceeds this fraction of step time over the window")
 parser.add_argument("--starvation-window", type=int, default=50, help="rolling window (steps) for the blocked-fraction starvation check")
-parser.add_argument("--starvation-abort", action="store_true", help="hard-fail (instead of warn) when the blocked fraction exceeds --starvation-threshold")
-parser.add_argument("--target-step-time", type=float, default=0.5, help="assumed seconds/step used ONLY for the startup throughput verdict (required tok/s = total_batch_size / this)")
-parser.add_argument("--startup-throughput-docs", type=int, default=64, help="minimum docs the loader must produce at startup before the throughput verdict is reported")
+parser.add_argument("--starvation-abort", action="store_true", help="hard-fail (instead of warn) when the blocked fraction exceeds --starvation-threshold, or when the prefill duty-cycle forecast is < 1x")
+parser.add_argument("--target-step-time", type=float, default=0.5, help="assumed seconds/step used for the prefill duty-cycle forecast (consumption tok/s = total_batch_size / world / this)")
+# Video-player buffering / backpressure (token-denominated, per rank). Prefill warms the
+# activation buffer before step 1; a dry buffer triggers a DDP-coordinated rebuffer.
+parser.add_argument("--prefill-tokens", type=int, default=-1, help="warm the activation buffer to this many tokens before step 1 (-1 = 4x per-rank batch tokens)")
+parser.add_argument("--rebuffer-tokens", type=int, default=-1, help="when the buffer runs dry, pause consumption until it refills to this many tokens, then resume (-1 = prefill/2)")
+parser.add_argument("--dry-tokens", type=int, default=-1, help="buffer depth (tokens) below which the buffer counts as dry and a rebuffer is triggered (-1 = one per-rank batch)")
+parser.add_argument("--buffer-max-tokens", type=int, default=-1, help="backpressure cap: production blocks once the buffer reaches this many tokens (-1 = 2x prefill)")
+parser.add_argument("--buffer-check-every", type=int, default=1, help="steps between the DDP-coordinated buffer-low check (one cheap int all_reduce)")
+parser.add_argument("--download-streams", type=int, default=-1, help="concurrent shard download streams for prefetch sources that don't set 'streams' (-1 = size from prefill bandwidth vs forecast consumption)")
+parser.add_argument("--shard-bytes", type=float, default=8.7e9, help="approx bytes per score shard, for prefetch stream sizing")
+parser.add_argument("--tokens-per-shard", type=float, default=-1.0, help="approx nanochat tokens covered by one score shard, for prefetch stream sizing (-1 = skip auto-sizing, honor --download-streams / configured streams)")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -548,6 +559,7 @@ if scaler is not None:
 # pre-download. Config-driven per runtime source ("prefetch": {...}); a plain
 # local score dir with everything present is a no-op passthrough (no prefetcher).
 import threading as _threading
+_prefetchers = []   # (name, ShardPrefetcher, auto_size) — re-sized after the prefill bandwidth measurement
 def _attach_prefetchers():
     from nanochat.injection.prefetch import (ShardPrefetcher, make_hf_score_fetcher,
                                              make_local_deleter, repo_for_factory)
@@ -567,14 +579,20 @@ def _attach_prefetchers():
         order = sorted(src.shards)
         def _on_wait(sid, nm=_name):
             print0(f"[prefetch:{nm}] shard {sid} not staged yet — blocking (window behind; see starvation log)")
+        # streams/ahead: explicit config wins; else the CLI default; else (both -1)
+        # auto-size after prefill from the measured NIC bandwidth vs forecast consumption.
+        cfg_streams = pf.get("streams", args.download_streams)
+        auto_size = cfg_streams is None or int(cfg_streams) < 0
+        init_streams = 2 if auto_size else int(cfg_streams)   # conservative start until sized
         p = ShardPrefetcher(order, fetch, delete_fn=delete, ahead=int(pf.get("ahead", 2)),
                             keep_behind=int(pf.get("keep_behind", 1)),
-                            on_wait=_on_wait, on_delete=src.evict_shard)
+                            on_wait=_on_wait, on_delete=src.evict_shard, streams=init_streams)
         src._mm_lock = _threading.Lock()
         src.score_loc = staging          # per-shard reads now come from the local staging dir
         src.prefetcher = p.start()
+        _prefetchers.append((_name, p, auto_size))
         print0(f"[prefetch:{_name}] rolling window ahead={p.ahead} keep_behind={p.keep_behind} "
-               f"staging={staging} ({len(order)} shards)")
+               f"streams={p.streams}{' (auto)' if auto_size else ''} staging={staging} ({len(order)} shards)")
 _attach_prefetchers()
 
 # -----------------------------------------------------------------------------
@@ -585,36 +603,79 @@ dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_s
 # stock: eval is activations-off by design. loader_stats carries the Amendment-2
 # staying-ahead counters (produce time/tokens, queue depth).
 loader_stats = {}
-train_loader = acts_data_loader_with_state(loader_tokenizer, injection_sources, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, lookup_workers=args.lookup_workers, stats=loader_stats)
+# Video-player buffering: token-denominated targets, per rank. prefill warms the
+# buffer before step 1; a dry buffer triggers a DDP-coordinated rebuffer.
+_per_rank_step_tokens = max(1, total_batch_size // ddp_world_size)
+prefill_tokens = args.prefill_tokens if args.prefill_tokens > 0 else 4 * _per_rank_step_tokens
+rebuffer_tokens = args.rebuffer_tokens if args.rebuffer_tokens > 0 else max(1, prefill_tokens // 2)
+dry_tokens = args.dry_tokens if args.dry_tokens > 0 else max(1, _per_rank_step_tokens)
+buffer_max_tokens = args.buffer_max_tokens if args.buffer_max_tokens > 0 else 2 * prefill_tokens
+buffer_max_tokens = max(buffer_max_tokens, prefill_tokens)
+assert 0 <= dry_tokens < rebuffer_tokens <= prefill_tokens, (
+    f"buffering needs dry < rebuffer <= prefill, got dry={dry_tokens} "
+    f"rebuffer={rebuffer_tokens} prefill={prefill_tokens} (see --dry/--rebuffer/--prefill-tokens)")
+buffer_ctrl, train_loader = acts_data_loader_buffered(
+    loader_tokenizer, injection_sources, args.device_batch_size, args.max_seq_len, split="train",
+    device=device, resume_state_dict=dataloader_resume_state_dict, lookup_workers=args.lookup_workers,
+    stats=loader_stats, prefill_tokens=prefill_tokens, rebuffer_tokens=rebuffer_tokens,
+    dry_tokens=dry_tokens, max_tokens=buffer_max_tokens)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
-x, y, acts, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
-# Startup throughput verdict (Amendment 2): the kickoff produced a burst of docs
-# (buffer_size worth); extrapolate the source's real tokens/s vs training's
-# consumption. Assumption: training consumes total_batch_size tokens per step at
-# ~--target-step-time seconds/step. lookup_workers>0 => the burst already reflects
-# the pool. Reported once; the live starvation monitor is the authority thereafter.
-def _startup_throughput_verdict():
-    pd, ps = loader_stats.get("produced_docs", 0), loader_stats.get("produce_seconds", 0.0)
-    pt = loader_stats.get("produced_tokens", 0)
-    if pd < args.startup_throughput_docs or ps <= 0:
-        print0(f"[staying-ahead] startup throughput: inconclusive ({pd} docs in {ps:.3f}s "
-               f"< --startup-throughput-docs={args.startup_throughput_docs}); relying on live monitor")
+# tty-aware buffering progress: carriage-return bar on a tty, plain periodic lines
+# off it (rank 0 only). ``activity`` is the current shard file / align stage.
+_buffer_tty = sys.stdout.isatty()
+def _buffer_activity():
+    for _nm, _p, _ in _prefetchers:
+        s = _p.stats()
+        return f"downloading shard {s['frontier'] + 1} / aligning"
+    return "aligning"
+def _buffer_progress(depth, target, rate):
+    if not master_process:
         return
-    src_tok_s = pt / ps
-    # per-rank comparison: this loader (and its counters) feed ONE rank, which
-    # consumes total_batch_size/world tokens per step. Best-fit cropping discards
-    # ~35% of produced tokens, so ratios below ~1.5 are already marginal — the
-    # verdict bands account for that.
-    req_tok_s = total_batch_size / ddp_world_size / max(args.target_step_time, 1e-9)
-    ratio = src_tok_s / max(req_tok_s, 1e-9)
-    verdict = "OK" if ratio >= 1.5 else ("MARGINAL" if ratio >= 1.0 else "WILL STARVE")
-    print0(f"[staying-ahead] source ~{src_tok_s:,.0f} tok/s ({pd} docs, {ps:.2f}s) vs this rank "
-           f"~{req_tok_s:,.0f} tok/s (total_batch_size={total_batch_size:,} / {ddp_world_size} ranks "
-           f"@ {args.target_step_time}s/step, workers={args.lookup_workers}) => {ratio:.2f}x — {verdict}")
-    if verdict == "WILL STARVE" and args.starvation_abort:
-        raise SystemExit("[staying-ahead] --starvation-abort: startup verdict WILL STARVE")
-_startup_throughput_verdict()
+    _pct, _eta, msg = rebuffer_progress(depth, target, rate, activity=_buffer_activity())
+    if _buffer_tty:
+        sys.stdout.write("\r[buffering] " + msg + "   "); sys.stdout.flush()
+    else:
+        print(f"[buffering] {msg}", flush=True)
+
+print0(f"[buffering] prefill={prefill_tokens:,} rebuffer={rebuffer_tokens:,} dry={dry_tokens:,} "
+       f"max={buffer_max_tokens:,} tok (per rank); warming buffer before step 1...")
+buffer_ctrl.wait_prefill(_buffer_progress)
+if _buffer_tty and master_process:
+    sys.stdout.write("\r" + " " * 100 + "\r"); sys.stdout.flush()
+x, y, acts, dataloader_state_dict = next(train_loader) # first batch, drawn from the warmed buffer
+
+# Free duty-cycle forecast (replaces the old sampling verdict): production rate was
+# measured DURING prefill, so the forecast costs nothing extra. Consumption = this
+# rank's total_batch_size/world tokens per --target-step-time seconds/step.
+_prod_tok_s = buffer_ctrl.produce_rate()
+_cons_tok_s = total_batch_size / ddp_world_size / max(args.target_step_time, 1e-9)
+_ratio, _duty, _forecast = duty_cycle_forecast(_prod_tok_s, _cons_tok_s)
+print0(f"[buffering] {_forecast} (source ~{_prod_tok_s:,.0f} tok/s vs this rank ~{_cons_tok_s:,.0f} tok/s "
+       f"@ {args.target_step_time}s/step, workers={args.lookup_workers})")
+if _ratio < 1.0 and args.starvation_abort:
+    raise SystemExit(f"[buffering] --starvation-abort: forecast duty cycle ~{_duty*100:.0f}% (< 100%)")
+
+# Prefetch auto-sizing: size download streams from the measured NIC bandwidth
+# (mean fetch seconds over --shard-bytes) vs the seconds one shard lasts in
+# training (--tokens-per-shard / consumption). Logs the arithmetic; raises streams.
+def _size_prefetchers():
+    if args.tokens_per_shard <= 0:
+        return
+    cover_s = args.tokens_per_shard / max(_cons_tok_s, 1e-9)
+    for _nm, _p, _auto in _prefetchers:
+        if not _auto:
+            continue
+        _mfs = _p.stats().get("mean_fetch_seconds", 0.0)
+        if _mfs <= 0:
+            print0(f"[prefetch:{_nm}] no fetch timed during prefill; keeping streams={_p.streams}")
+            continue
+        _bw = args.shard_bytes / _mfs
+        _streams, _ahead, _msg = size_prefetch_streams(args.shard_bytes, _bw, cover_s,
+                                                       max_streams=8, min_ahead=_p.ahead)
+        print0(f"[prefetch:{_nm}] {_msg}")
+        _p.set_streams(_streams)
+_size_prefetchers()
 
 # -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
@@ -692,6 +753,29 @@ from collections import deque as _deque
 _starv_wait = _deque(maxlen=args.starvation_window)
 _starv_dt = _deque(maxlen=args.starvation_window)
 _last_starv_warn = -10**9
+
+# DDP-coordinated rebuffer: per-rank buffer-low flags all_reduce(MAX) at the step
+# boundary, so ranks pause/refill/resume TOGETHER (independent per-rank stalls
+# amplify at allreduce). A barrier after the refill keeps the resume in lockstep.
+def _allreduce_max_int(v):
+    t = torch.tensor([int(v)], device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return int(t.item())
+def _rebuffer_if_dry(step):
+    local_low = buffer_ctrl.buffer_low()
+    if not coordinate_rebuffer(local_low, ddp_world_size, _allreduce_max_int):
+        return
+    if master_process:
+        print0("!" * 80)
+        print0(f"[buffering] activation buffer ran dry (step {step}) — pausing all ranks to "
+               f"rebuffer to {rebuffer_tokens:,} tok")
+        print0("!" * 80)
+    buffer_ctrl.do_rebuffer(_buffer_progress)
+    if is_ddp_initialized():
+        dist.barrier()   # resume together
+    if _buffer_tty and master_process:
+        sys.stdout.write("\r" + " " * 100 + "\r"); sys.stdout.flush()
+    print0(f"[buffering] resumed at buffer {buffer_ctrl.buffer_tokens():,} tok")
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -813,6 +897,10 @@ while True:
     if last_step:
         break
 
+    # video-player rebuffer, DDP-coordinated (before consuming this step's batches)
+    if step % max(1, args.buffer_check_every) == 0:
+        _rebuffer_if_dry(step)
+
     # -------------------------------------------------------------------------
     # single training step
     # evaluate the gradient
@@ -883,9 +971,10 @@ while True:
     # with a windowed starvation check (warn loudly, or hard-fail with --starvation-abort).
     _starv_wait.append(act_wait); _starv_dt.append(dt)
     q_depth = loader_stats.get("queue_depth", 0)
+    buf_tok = loader_stats.get("buffer_tokens", 0)
     blocked_frac = act_wait / dt if dt > 0 else 0.0
     win_frac = (sum(_starv_dt) and sum(_starv_wait) / sum(_starv_dt)) or 0.0
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | act_wait: {act_wait*1000:.1f}ms ({blocked_frac*100:.0f}%) | qdepth: {q_depth} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | act_wait: {act_wait*1000:.1f}ms ({blocked_frac*100:.0f}%) | qdepth: {q_depth} | buftok: {buf_tok:,} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if len(_starv_dt) >= min(args.starvation_window, 10) and win_frac > args.starvation_threshold:
         msg = (f"[staying-ahead] STARVATION: activation wait = {win_frac*100:.0f}% of step time over "
                f"last {len(_starv_dt)} steps (> {args.starvation_threshold*100:.0f}%); qdepth={q_depth}. "
@@ -900,6 +989,7 @@ while True:
             "train/act_wait_ms": act_wait * 1000,
             "train/act_blocked_frac": win_frac,
             "train/act_queue_depth": q_depth,
+            "train/buffer_tokens": buf_tok,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,

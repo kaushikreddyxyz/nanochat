@@ -27,15 +27,22 @@ pre-injection..HEAD`):
     (`activation_dataloader.py` stats, `injection_train.py`); (3) **rolling shard
     prefetch** (`prefetch.py`, config-driven, window + rollover, minimal disk);
     stale `nanochat/oracle/` leftover removed.
+13. **video-player buffering / backpressure** (`buffering.py` +
+    `activation_dataloader.py` `BufferControl`, `injection_train.py`): token-
+    denominated **prefill** before step 1, a **free duty-cycle forecast**
+    (replaces the startup verdict), **rebuffer with hysteresis** on a dry buffer,
+    **DDP-coordinated** pause/resume, and **multi-stream** shard prefetch
+    (`ShardPrefetcher.streams` + bandwidth auto-sizing).
 
 Suggested review order: `sites.py` (the injection contract + gate/auto) →
 `sources.py` (ActivationSource + store format + runtime probe sources + overlap
 align + prefetch hook) → `compact.py` (compact-tokens wrapper) → `prefetch.py`
-(rolling shard prefetcher) → `gpt.py` (`setup_injection_sites`, forward hook) →
-`scripts/injection_train.py` (align_policy/compact/prefetch/staying-ahead wiring)
-→ `activation_dataloader.py` (positional join + staying-ahead stats) →
-`scripts/precompute_activations.py` → `tests/`. All 6 test files +
-`python -m nanochat.injection.smoke` pass on CPU.
+(rolling shard prefetcher, multi-stream) → `buffering.py` (prefill/rebuffer/
+forecast/coordinate pure logic) → `gpt.py` (`setup_injection_sites`, forward
+hook) → `scripts/injection_train.py` (align_policy/compact/prefetch/buffering
+wiring) → `activation_dataloader.py` (positional join, `_ChunkProducer` +
+`_pack_batches` + `BufferControl`) → `scripts/precompute_activations.py` →
+`tests/`. All 7 test files + `python -m nanochat.injection.smoke` pass on CPU.
 
 **Why the package is named `injection`, not `oracle`**: in this project's
 terminology "oracle" is reserved for the *reliance failure mode* under study,
@@ -280,8 +287,8 @@ corpus the stored backend is free at runtime.
 
 ### Rolling shard prefetch (ops, `injection/prefetch.py`)
 
-The score shards are ~8.7 GB each, so a real run downloads them in a background
-routine **while training runs** rather than bulk pre-downloading. `ShardPrefetcher`
+The score shards are ~8.7 GB each, so a real run downloads them in background
+threads **while training runs** rather than bulk pre-downloading. `ShardPrefetcher`
 keeps a small window (`ahead`, default 2) of shards staged beyond the consumption
 frontier and **deletes consumed shards behind** (`keep_behind`, default 1) so disk
 stays at ~2 shards. Consumption is monotonic (the loader enumerates shards in
@@ -291,6 +298,20 @@ set `HF_HUB_DISABLE_XET=1` (xet stalls on pods). When a shard is evicted the sou
 drops its cached memmap first (the `on_delete` hook), so a delete never races an
 open memmap. A **local score dir with everything present is a no-op passthrough**
 (no prefetcher, no thread).
+
+**Multi-stream (`streams`, `set_streams`).** One 8.7 GB shard covers ~50 s of
+full-speed training but takes ~45–210 s to fetch depending on NIC, so a single
+stream can't keep the window ahead. `ShardPrefetcher` runs `streams` worker
+threads; each **reserves** the nearest un-staged in-window shard under the lock
+before fetching (so siblings pick different shards, never the same one), and the
+inline `ensure` fallback adds at most one catch-up fetch. If `streams` isn't set
+explicitly, `injection_train` **sizes it from the prefill bandwidth measurement**:
+`buffering.size_prefetch_streams(shard_bytes, measured_MB/s, cover_seconds)` where
+`cover_seconds = --tokens-per-shard / consumption`, logging the one-line arithmetic
+(`prefetch sizing: 8.7GB / 90MB/s = 97s download vs 50s/shard training (~1.9x) =>
+2 streams, ahead=3`) and calling `set_streams` (workers only grow). Omit
+`--tokens-per-shard` to skip auto-sizing and honor `--download-streams` / a
+configured `streams`.
 
 Wired per runtime source via a `"prefetch"` block in the source spec (else off):
 
@@ -302,36 +323,71 @@ Wired per runtime source via a `"prefetch"` block in the source spec (else off):
                         "climbmix_dir": "/workspace/climbmix",
                         "repos": ["kaushikreddyxyz/climbmix-scored",
                                   "kaushikreddyxyz/climbmix-scored-overflow"],
-                        "per_repo": 25, "ahead": 2, "keep_behind": 1}}
+                        "per_repo": 25, "ahead": 2, "keep_behind": 1, "streams": 3}}
 ```
 
 `repos`/`per_repo` give the count-based shard→repo assignment (25 shards/repo, as
 the scorer wrote them); omit them to pull every shard from
-`score_shards_dir_or_repo`. Store metadata (`columns/quant/corpus_stats.json`) is
-read once at init from the repo; only per-shard files roll through `staging_dir`.
+`score_shards_dir_or_repo`. `streams` is optional (auto-sized when absent). Store
+metadata (`columns/quant/corpus_stats.json`) is read once at init from the repo;
+only per-shard files roll through `staging_dir`.
 
-### Staying-ahead guarantees (Amendment 2)
+### Buffering (video-player prefill / rebuffer, `injection/buffering.py`)
 
-The scoring path must provably keep up with training. `acts_data_loader_with_state`
-updates a cheap `stats` dict each batch (no hot-path overhead when unused);
-`injection_train` reads it:
+The activation source must keep up with training, so consumption is decoupled from
+production behind a **token-denominated buffer** (like a video player pre-buffering
+then rebuffering on a stall). A single background producer thread runs the
+tokenize+lookup+align (`_ChunkProducer.next_chunk`) into a bounded deque; the
+best-fit packer draws chunks from it (`BufferControl`, in
+`activation_dataloader.py`). Packing is **byte-identical** to the synchronous
+`acts_data_loader_with_state` (same chunks, same best-fit — a test pins it), so a
+buffered run is bit-comparable to a baseline. All targets are **per rank** (the
+loader feeds one rank).
+
+- **Prefill.** Before step 1 the buffer warms to `--prefill-tokens` (default `4×`
+  the per-rank per-step tokens = `total_batch_size / world`). `wait_prefill` blocks
+  the trainer until then; a tty-aware progress bar (carriage-return on a tty, plain
+  periodic lines off it; DDP rank 0 only) shows percent + ETA.
+- **Free duty-cycle forecast** (replaces the old startup sampling verdict). Production
+  rate is measured *during* prefill — already producing — so the forecast costs
+  nothing extra. After warm-up the script prints one line:
+  `activation production ~2.4x consumption — forecast duty cycle ~100%`, or when the
+  source lags: `~0.4x consumption — forecast duty cycle ~40%, consider more
+  --lookup-workers / download streams`. Consumption =
+  `total_batch_size / world / --target-step-time`. `--starvation-abort` hard-fails a
+  forecast below 1× (otherwise it is advisory).
+- **Rebuffer with hysteresis.** Mid-training, if the buffer falls below
+  `--dry-tokens` (default one per-rank batch) it counts as **dry**: consumption pauses
+  and the producer refills to `--rebuffer-tokens` (default `prefill/2`) before
+  resuming — deliberately past the dry mark so a source hovering at the dry line
+  can't thrash (`dry < rebuffer ≤ prefill`, `BufferState`). A loud one-time banner,
+  then a progress line every few seconds
+  (`buffering 42% (~35s) — downloading shard 71 / aligning`).
+- **DDP-coordinated.** Independent per-rank stalls amplify at allreduce, so ranks
+  pause/refill/resume **together**: each step boundary does one cheap
+  `all_reduce(MAX)` of a buffer-low int (`coordinate_rebuffer`, a pure function
+  unit-tested with simulated ranks) — if ANY rank is dry, all rebuffer, and a
+  `barrier` after the refill keeps the resume in lockstep. `--buffer-check-every`
+  spaces the check (default every step).
+- **Backpressure.** Production blocks once the buffer reaches `--buffer-max-tokens`
+  (default `2× prefill`) — never buffer the whole "video".
+
+### Staying-ahead metrics (Amendment 2)
+
+`_ChunkProducer` / `BufferControl` update a cheap `stats` dict (no hot-path overhead
+when unused); `injection_train` reads it:
 
 - **Step log** adds `act_wait: <ms> (<%>)` — cumulative time-blocked-waiting-on-
   activations this step (the wall time inside `next(train_loader)`) as a fraction of
-  step time — and `qdepth: <n>`, the docs buffered ahead of the packer (prefetch
-  depth proxy). wandb logs `train/act_wait_ms`, `train/act_blocked_frac`,
-  `train/act_queue_depth`.
-- **Startup throughput verdict**: the kickoff produces a burst of docs; the script
-  extrapolates the source's real tokens/s (gemma-tokenize + align included) vs
-  training's consumption (`total_batch_size / --target-step-time`, assumptions
-  printed) and prints a one-line verdict — `OK` (≥1.5×) / `MARGINAL` (1–1.5×) /
-  `WILL STARVE` (<1×). Tune with `--startup-throughput-docs`.
+  step time — plus `qdepth: <n>` (docs staged ahead of the packer) and `buftok: <n>`
+  (live buffer depth in tokens). wandb logs `train/act_wait_ms`,
+  `train/act_blocked_frac`, `train/act_queue_depth`, `train/buffer_tokens`.
 - **Starvation policy**: over `--starvation-window` steps, if the blocked fraction
   exceeds `--starvation-threshold` (default 0.15) it **warns loudly** (throttled);
-  `--starvation-abort` hard-fails instead (also fails on a `WILL STARVE` startup
-  verdict). Alignment on the CPU fixture (fake tokenizers) is ~20–30k docs/s
-  single-worker; in production the **gemma retokenization dominates**, so size
-  `--lookup-workers` to the real per-doc cost and let the monitor confirm.
+  `--starvation-abort` hard-fails instead (and also fails a sub-1× startup forecast).
+  Alignment on the CPU fixture (fake tokenizers) is ~20–30k docs/s single-worker; in
+  production the **gemma retokenization dominates**, so size `--lookup-workers` to the
+  real per-doc cost and let the monitor confirm.
 
 ## Training (`scripts/injection_train.py`)
 
@@ -481,7 +537,7 @@ parallelizes tokenize/align in spawn workers with byte-identical output.
 ```bash
 python -m pytest tests/test_injection_sites.py tests/test_activation_lockstep.py \
                  tests/test_precompute_activations.py tests/test_runtime_probe_source.py \
-                 tests/test_compact_tokens.py tests/test_shard_prefetch.py
+                 tests/test_compact_tokens.py tests/test_shard_prefetch.py tests/test_buffering.py
 python -m nanochat.injection.smoke
 ```
 
@@ -505,7 +561,16 @@ python -m nanochat.injection.smoke
   (mean ≡ last).
 - `test_shard_prefetch.py` — the rolling prefetcher with a FAKE fetcher: window
   stages ahead + deletes behind + stays bounded (not bulk), `on_delete` evict
-  hook, block+`on_wait` when the window is behind, local-dir no-op passthrough.
+  hook, block+`on_wait` when the window is behind, local-dir no-op passthrough,
+  and **multi-stream** (concurrent fetches bounded by `streams` + one inline
+  catch-up, no double-fetch, order preserved; `set_streams` grows the pool).
+- `test_buffering.py` — the video-player buffering layer: `BufferState`
+  hysteresis (prefill→running→rebuffer→running, stays paused past dry to
+  rebuffer), `coordinate_rebuffer` all-or-none across simulated DDP ranks
+  (incl. only-one-rank-low), `duty_cycle_forecast` / `rebuffer_progress` /
+  `size_prefetch_streams` math, `BufferControl` (prefill fills to target BEFORE
+  the first pull, dry detected, `do_rebuffer` refills to target), and the
+  buffered loader packing **byte-identically** to the synchronous loader.
 - `test_activation_lockstep.py` — the ride-along loader against the REAL
   packing source (ast-extracted from `nanochat/dataloader.py`): bit-identical
   token stream, activation↔token alignment through best-fit + crops,
@@ -522,7 +587,10 @@ python -m nanochat.injection.smoke
 Not validated on CPU (needs a real run): torch.compile + fp8 over the site
 graph, the runtime probe path's real gemma-tokenize throughput vs training
 consumption (fixture only so far), the qwen-encoder store index throughput at
-the 27M-doc scale, and the precompute encoder wiring on a real checkpoint + real
-tokenizer pair. SMOKE an injected launch first (a few steps, nothing saved):
-step time within ~3% of baseline and the per-site banner must print the expected
-`r` / `after_block` / `gate` / docs count.
+the 27M-doc scale, the precompute encoder wiring on a real checkpoint + real
+tokenizer pair, and the buffering layer under real load — the DDP-coordinated
+rebuffer collective and the multi-stream download bandwidth auto-sizing are
+CPU-tested with fakes/simulated ranks but never against real DDP or a real NIC.
+SMOKE an injected launch first (a few steps, nothing saved): step time within
+~3% of baseline and the per-site banner must print the expected `r` /
+`after_block` / `gate` / docs count.
