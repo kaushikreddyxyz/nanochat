@@ -34,8 +34,8 @@ import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
-from nanochat.injection.sites import InjectionCfg, reassert_optimizability
-from nanochat.injection.sources import open_store
+from nanochat.injection.sites import InjectionCfg, reassert_optimizability, parse_gate_spec, calibrate_auto_gate
+from nanochat.injection.sources import open_store, RuntimeProbeScoreSource
 from nanochat.injection.activation_dataloader import acts_data_loader_with_state
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -97,7 +97,10 @@ parser.add_argument("--no-value-embeds", action="store_true", help="zero and fre
 # Injection surface (exactly one of --activation-store / --activation-config required)
 parser.add_argument("--activation-store", type=str, default="", help="activation store dir (activations.int8/index.npy/meta.json[/P.npy] from scripts/precompute_activations.py): ONE tabular site named 'acts' with a frozen direction (the store's P if present, else seeded orthonormal)")
 parser.add_argument("--after-block", type=int, default=7, help="0-based block index for the single-store site; activations are added right AFTER transformer.h[N]")
-parser.add_argument("--gate", type=float, default=1.0, help="injected per-token RMS as a fraction of residual RMS (1.0 = as loud as the stream; the v1 run used 0.05)")
+parser.add_argument("--gate", type=str, default="0.05", help="injected loudness: a number (fraction of residual RMS, 0=off) OR 'auto'/'auto:0.1' to calibrate a per-channel gate from the source (target overall loudness, default 0.05). Default 0.05.")
+parser.add_argument("--gate-k", type=int, default=256, help="docs sampled (seeded) for --gate auto calibration")
+parser.add_argument("--gate-min-docs", type=int, default=16, help="fail --gate auto if the source yields fewer sample docs than this")
+parser.add_argument("--lookup-workers", type=int, default=0, help="threads for per-doc activation lookups in the ride-along loader (0=serial); overlaps runtime gemma scoring with training")
 parser.add_argument("--noise-sigma", type=float, default=0.15, help="gaussian noise std on standardized activations at load time, deterministic per doc-content hash; 0 disables")
 parser.add_argument("--activation-config", type=str, default="", help="JSON for the multi-site form: {\"sites\": [InjectionCfg dicts], \"sources\": {site: {\"kind\": \"qwen-encoder\"|\"probe-scores\", \"dir\": ..., \"noise_sigma\": ...}}}; mutually exclusive with --activation-store. See nanochat/injection/README.md")
 args = parser.parse_args()
@@ -191,6 +194,31 @@ model.init_weights() # 3) All tensors get initialized
 # Injection sites: built BEFORE any checkpoint load so injected checkpoints
 # (which carry injection_sites.* keys) load cleanly. Site inits draw no RNG
 # from the global stream.
+def _open_injection_source(name, spec, cfg, tok, seed):
+    """Store kinds -> open_store; 'probe-scores-runtime' -> RuntimeProbeScoreSource
+    (applies gold gemma scores at runtime, positional join via the ride-along
+    loader). 'probe-scores-live' is programmatic (needs a score_fn), not JSON-wired."""
+    kind = spec.get("kind")
+    if kind == "probe-scores-runtime":
+        from scripts.precompute_activations import parse_shard_range
+        sh = spec["shards"]
+        shards = parse_shard_range(sh) if isinstance(sh, str) else [int(s) for s in sh]
+        return RuntimeProbeScoreSource(
+            spec["score_shards_dir_or_repo"], shards, layer=int(spec.get("layer", 8)),
+            nano_enc=tok.enc, concepts=spec.get("concepts"),
+            gemma_model=spec.get("gemma_model", "google/gemma-2-2b"),
+            climbmix_dir=spec.get("climbmix_dir"), index_path=spec.get("index_path"),
+            build_hash_index=bool(spec.get("build_hash_index", False)),
+            noise_sigma=float(spec.get("noise_sigma", 0.15)), seed=seed, name=name)
+    return open_store(spec["dir"], noise_sigma=float(spec.get("noise_sigma", 0.15)),
+                      seed=seed, name=name, expect_kind=kind)
+
+def _gate_str(g):
+    if isinstance(g, (list, tuple)):
+        import numpy as _np; a = _np.asarray(g, float)
+        return f"vec[r={a.size}] rms={float(_np.sqrt((a**2).mean())):.4f} min={a.min():.4f} max={a.max():.4f}"
+    return str(g)
+
 assert bool(args.activation_store) != bool(args.activation_config), \
     "pass exactly one of --activation-store / --activation-config (vanilla runs use scripts/base_train.py)"
 if args.activation_store:
@@ -210,6 +238,42 @@ else:
     injection_source_specs = dict(_inj_spec["sources"])
     assert set(injection_source_specs) == {c.name for c in injection_cfgs}, \
         "--activation-config: 'sources' keys must match the site names exactly"
+
+base_dir = get_base_dir()
+output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
+checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+resuming = args.resume_from_step != -1
+
+# Resolve gate: numeric strings -> float; "auto[:target]" -> placeholder now,
+# calibrated per-channel from the source below (fresh runs) or reused from the
+# resumed checkpoint (no recalibration). Sources open BEFORE the sites so auto
+# can sample them; they are loader-side data plumbing, never model state.
+_auto_targets = {}
+for _cfg in injection_cfgs:
+    _is_auto, _val = parse_gate_spec(_cfg.gate)
+    if _is_auto:
+        _auto_targets[_cfg.name] = _val
+        _cfg.gate = float(_val)                 # placeholder until calibration/load
+    elif isinstance(_cfg.gate, str):
+        _cfg.gate = float(_cfg.gate)
+
+injection_sources = {}
+for _name, _spec in injection_source_specs.items():
+    _cfg = next(c for c in injection_cfgs if c.name == _name)
+    _src = _open_injection_source(_name, _spec, _cfg, tokenizer, args.seed)
+    assert _src.r == _cfg.r, f"site {_name!r}: source r={_src.r} != cfg r={_cfg.r}"
+    injection_sources[_name] = _src
+
+if _auto_targets and not resuming:
+    for _name, _target in _auto_targets.items():
+        _cfg = next(c for c in injection_cfgs if c.name == _name)
+        _gate_vec, _cal = calibrate_auto_gate(injection_sources[_name], target=_target,
+                                              k=args.gate_k, seed=args.seed, min_docs=args.gate_min_docs)
+        _cfg.gate = _gate_vec
+        print0(f"[auto-gate] {_name!r}: target={_target} active={_cal['n_active']}/{_cfg.r} "
+               f"rms(gate)={_cal['rms_gate']:.4f} ({_cal['n_docs']} docs, {_cal['n_tokens']} tokens); "
+               f"gate={[round(g, 4) for g in _gate_vec]}")
+
 model.setup_injection_sites(injection_cfgs)
 if args.activation_store:
     # Pin the frozen direction to the store's own P.npy when present (bit-exact
@@ -225,10 +289,6 @@ if args.activation_store:
                 torch.from_numpy(np.ascontiguousarray(P.T)).to(device))
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
-base_dir = get_base_dir()
-output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
-checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
-resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
@@ -242,7 +302,19 @@ if resuming:
     if missing:
         print0(f"warm-start: checkpoint has no injection sites; {len(missing)} site tensors keep their fresh init")
     reassert_optimizability(model.injection_sites)
+    for _name in _auto_targets:  # record the loaded (already-calibrated) gate in cfg -> saved meta
+        _cfg = next(c for c in injection_cfgs if c.name == _name)
+        _cfg.gate = model.injection_sites[_name].gate.detach().float().cpu().tolist()
+        print0(f"[auto-gate] {_name!r}: reusing calibrated gate from checkpoint (no recalibration)")
     del model_data # free up this memory after the copy
+
+# Startup banner: source kind, doc coverage, resolved gates.
+for _name, _src in injection_sources.items():
+    _cfg = next(c for c in injection_cfgs if c.name == _name)
+    print0(f"injection site {_name!r}: source={getattr(_src, 'source_kind', type(_src).__name__)} "
+           f"r={_src.r} after_block={_cfg.after_block} gate={_gate_str(_cfg.gate)} "
+           f"trainable_direction={_cfg.trainable_direction} optim={_cfg.optim} "
+           f"noise={float(injection_source_specs[_name].get('noise_sigma', 0.15))} docs={len(_src):,}")
 
 # Optional ablation: disable the ResFormer value embeddings. We zero the value-embedding
 # tables and freeze them, so they neither contribute to the forward (v = v + gate*0 == v)
@@ -256,20 +328,6 @@ if args.no_value_embeds:
             ve.weight.zero_()
             ve.weight.requires_grad_(False)
     print0(f"--no-value-embeds: zeroed + froze {len(model.value_embeds)} value-embedding table(s)")
-
-# Activation sources: loader-side data plumbing, never model state (the site
-# detaches, so activations are unoptimizable by construction). Built before
-# fp8 conversion + torch.compile.
-injection_sources = {}
-for _name, _spec in injection_source_specs.items():
-    _src = open_store(_spec["dir"], noise_sigma=float(_spec.get("noise_sigma", 0.15)),
-                      seed=args.seed, name=_name, expect_kind=_spec.get("kind"))
-    _cfg = next(c for c in injection_cfgs if c.name == _name)
-    assert _src.r == _cfg.r, f"site {_name!r}: store r={_src.r} != cfg r={_cfg.r}"
-    injection_sources[_name] = _src
-    print0(f"injection site {_name!r}: source={_src.source_kind} r={_src.r} after_block={_cfg.after_block} "
-           f"gate={_cfg.gate} trainable_direction={_cfg.trainable_direction} optim={_cfg.optim} "
-           f"noise={float(_spec.get('noise_sigma', 0.15))} docs={len(_src):,}")
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
@@ -441,7 +499,7 @@ dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_s
 # Ride-along loader: token path mirrors the stock best-fit loader 1:1, with
 # per-site (B, T, r) activation tensors in lockstep. The val loader stays
 # stock: eval is activations-off by design.
-train_loader = acts_data_loader_with_state(tokenizer, injection_sources, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+train_loader = acts_data_loader_with_state(tokenizer, injection_sources, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, lookup_workers=args.lookup_workers)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
 x, y, acts, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 

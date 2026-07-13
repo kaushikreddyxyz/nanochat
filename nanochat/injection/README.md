@@ -12,14 +12,20 @@ pre-injection..HEAD`):
 4. `197bfdd` — tests + first README
 5. `3adf4c8` — review-readiness README pass
 6. `9b6129d` — **base_train back to stock** (byte-identical to `pre-injection`)
-7. `c6d8f3d` — **package rename `nanochat.oracle` → `nanochat.injection`**, ActivationSource interface, gate default 1.0, activation-store-v2
+7. `c6d8f3d` — **package rename `nanochat.oracle` → `nanochat.injection`**, ActivationSource interface, activation-store-v2
 8. `9d38414` — **`scripts/injection_train.py`** (dedicated injection training script)
-9. (tip) — this README
+9. README for the four directives
+10. **gate → default 0.05, per-channel gate + `auto` calibration** (`sites.py`:
+    one gate mechanism replacing `channel_weights`; `--gate auto[:target]`)
+11. **runtime probe-score injection** (`RuntimeProbeScoreSource` /
+    `LiveProbeScoreSource`, positional ride-along join, `probe-scores-runtime`
+    wiring; the `repackage-probe-scores` skeleton deleted)
 
-Suggested review order: `sites.py` (the injection contract) → `sources.py`
-(ActivationSource + store format) → `gpt.py` (`setup_injection_sites`, forward
-hook) → `scripts/injection_train.py` → `activation_dataloader.py` →
-`scripts/precompute_activations.py` → `tests/`. All 3 test files +
+Suggested review order: `sites.py` (the injection contract + gate/auto) →
+`sources.py` (ActivationSource + store format + runtime probe sources) →
+`gpt.py` (`setup_injection_sites`, forward hook) → `scripts/injection_train.py`
+→ `activation_dataloader.py` (positional join) →
+`scripts/precompute_activations.py` → `tests/`. All 4 test files +
 `python -m nanochat.injection.smoke` pass on CPU.
 
 **Why the package is named `injection`, not `oracle`**: in this project's
@@ -27,22 +33,25 @@ terminology "oracle" is reserved for the *reliance failure mode* under study,
 not for the machinery that injects features. Both families (geometric-manifold
 `inject.py` and the contextual activation injection) live here.
 
-**Blockers before any injected training run** (deliberate, not oversights):
+**Blockers before an injected training run** (deliberate, not oversights):
 
-- **No activation store exists.** The old `oracle-coords`/`-b` HF repos were
-  deleted 2026-07-09; a store must be precomputed (fleet pipeline below) or
-  repackaged from the probe-score stores (see ProbeScoreSource status).
-- **Encoder gap** (qwen-encoder flavor): the precompute loader implements the
-  legacy Exp-A encoder head, but the Exp-A checkpoint repo (`oracle-encoder`)
-  was deleted 2026-07-09. What exists: per-layer oracles on
+- **Probe-score injection needs NO offline pass.** For a pre-scored corpus
+  (`climbmix-scored`, shards 0–184, full coverage) `RuntimeProbeScoreSource`
+  applies the scores at runtime — just stage/prefetch the score shards on the
+  pod (~8.7 GB each, rolling window; see the runtime section). This is the ready
+  path.
+- **Qwen-encoder flavor still needs a store + the encoder.** The old
+  `oracle-coords`/`-b` HF repos were deleted 2026-07-09, so that store must be
+  precomputed (fleet pipeline below), AND the Exp-A checkpoint repo
+  (`oracle-encoder`) was deleted 2026-07-09. What exists: per-layer oracles on
   `kaushikreddyxyz/oracle-encoders` (`layer06/08/14/best_stripped.pt`, head =
-  `OracleMLPHead` 1024→4096→54 — a *different* head). Before a fleet run,
-  point the loader at a per-layer checkpoint via a small adapter (natural
-  choice: `layer08`) or supply a surviving local Exp-A checkpoint.
-  Experiment-design work, not a bug.
-- **ProbeScoreSource repackaging is a NotImplemented boundary**: the reader is
-  complete; the offline `--mode repackage-probe-scores` pass is not (see below).
-- GPU-side validations never ran on the real stack (end of this file).
+  `OracleMLPHead` 1024→4096→54 — a *different* head). Before a fleet run, point
+  the precompute loader at a per-layer checkpoint via a small adapter (natural
+  choice: `layer08`) or a surviving local Exp-A checkpoint. Experiment-design
+  work, not a bug.
+- GPU-side validations never ran on the real stack (end of this file). In
+  particular the runtime probe path's real gemma-tokenize throughput vs training
+  consumption is measured only on the CPU fixture so far.
 - Open decision: whether to add an **activations-on eval pass** (eval is
   activations-off by design today).
 
@@ -67,7 +76,7 @@ with **fixed optimizability rules**:
 
 | part | what it is | optimizable? |
 |---|---|---|
-| **gate** | loudness dial: injected per-token RMS = `gate` × per-token RMS(residual). `gate=0` is exactly off. **Default 1.0** — as loud as the stream itself. | **NEVER.** A parameter so autograd *assigns* it a gradient every backward (a loggable want-signal, dL/dgate), but it sits in no optimizer group and is never stepped. |
+| **gate** | loudness dial (a scalar OR a length-r per-channel vector; **default 0.05**). Scalar: injected per-token RMS = `gate` × RMS(residual). Vector `v`: per-channel loudness — channels are pre-scaled by `v`, overall injected RMS = `rms(v)` × RMS(residual). `gate=0` (or an all-zero vector) is exactly off. `gate="auto"` calibrates the vector from the source (below). | **NEVER.** A parameter so autograd *assigns* it a gradient every backward (a loggable want-signal, per channel), but it sits in no optimizer group and is never stepped. |
 | **activation** | the content: a `(B, T, r)` tensor per batch from a pluggable `ActivationSource`. | **NEVER.** Produced without grad by the dataloader and additionally `detach()`ed by the site. |
 | **direction** | `(r, n_embd)` map from activation channels into the residual stream. | **The only optionally-trainable part**, controlled purely by freeze/unfreeze. Frozen + orthonormal init = "tabular" injection (the fixed-P v1 behavior); unfrozen = "free" injection. |
 
@@ -85,21 +94,42 @@ not a gradient path into the stream's own norm. Invariants (pinned by
 
 - **zero activation rows (BOS / missing doc) are an EXACT no-op** — no NaN, no
   branch (the `rms(z)` clamp), torch.compile-friendly;
-- injected per-token RMS == `gate` × per-token RMS(x);
+- injected per-token RMS == `gate` × per-token RMS(x) (scalar), or `rms(gate)` ×
+  RMS(x) for a per-channel gate vector; an **all-zero gate vector is an exact
+  no-op** and a `gate[c]=0` channel contributes exactly nothing;
 - `gate=0` is an exact forward no-op AND blocks all gradient to the direction;
-- forward values are identical to the retired v1 inline formula
-  `x + beta*(rms_x/rms_z)*zc` (the detach only changes gradients, deliberately).
+- the **scalar-gate forward is byte-identical to the retired v1 inline formula**
+  `x + beta*(rms_x/rms_z)*zc` (the detach only changes gradients, deliberately);
+  the per-channel path reduces to it continuously (a uniform vector `g·1` gives
+  `rms(gate)=g`, unit mix).
 
 `GPT.setup_injection_sites(cfgs)` attaches sites as an `nn.ModuleDict`
 (checkpointed, optimizer-visible); `GPT.forward(..., acts={name: (B,T,r)})`
 fires each site after its own block. `acts=None` (eval, inference, vanilla
 runs) is bit-identical to a model without sites.
 
-### Gate default changed to 1.0
+### Gate: default 0.05, per-channel, or auto
 
-`InjectionCfg.gate` (and `injection_train.py --gate`) default to **1.0**: the
-injected signal is as loud as the residual stream itself. The v1 run used
-0.05 — **anyone reproducing v1 must pass `--gate 0.05` explicitly**.
+`InjectionCfg.gate` and `injection_train.py --gate` default to **0.05** (the v1
+loudness). Three forms, one mechanism (the old separate `channel_weights` buffer
+is gone — folded into the gate):
+
+- **scalar** (`--gate 0.05`): overall loudness, injected RMS = gate × RMS(x).
+  Byte-identical to the old scalar path.
+- **per-channel vector** (a length-r list in an `--activation-config` site):
+  channels are pre-scaled by the vector before projection; overall loudness is
+  `rms(gate)`. An all-zero vector is an exact no-op; a zero entry mutes that
+  channel. The gate stays a never-optimized Parameter (its per-channel gradient
+  is a loggable want-signal).
+- **auto** (`--gate auto` or `--gate auto:0.1`): at injection_train startup,
+  sample K docs (`--gate-k`, default 256, seeded by `--seed`) from the site's
+  source, compute per-channel RMS + nonzero-rate of the standardized
+  activations, and set `gate_c ∝ 1/rms_c` on active channels (dead channels → 0),
+  scaled so `rms(gate)` = the target loudness (default 0.05, or `auto:<target>`).
+  This **equalizes each channel's typical contribution**. Deterministic in
+  (source, seed); fails loudly if the source yields `< --gate-min-docs` docs. The
+  calibrated vector is logged per site and stored in `cfg.gate` → the checkpoint
+  meta, so **resumes reuse it and never recalibrate**.
 
 ## Activation sources (`sources.py`)
 
@@ -128,15 +158,19 @@ Implementations:
   predictions of the frozen Qwen oracle-encoder, structured into r=14
   ring/PCA activations by `scripts/precompute_activations.py` (fit/sweep/
   assemble pipeline below). This is the renamed v1 `CoordSource`.
-- **`ProbeScoreSource`** (`source_kind: "probe-scores"`) — gold gemma probe
-  scores (one layer's 54 standardized scores, per the binding
-  one-layer-per-model rule) repackaged per nanochat token. Reader complete;
-  producer is a boundary (status below).
+- **`RuntimeProbeScoreSource`** (`kind: "probe-scores-runtime"`) — gold gemma
+  probe scores (one layer's 54 standardized scores, per the binding
+  one-layer-per-model rule) applied per nanochat token **at runtime, nothing
+  stored offline** (design below). The primary probe-score path.
+- **`LiveProbeScoreSource`** — same interface, scores computed live by an
+  injected `score_fn` callable (bounded stub; real gemma wiring is a follow-up).
+- **`ProbeScoreSource`** (`source_kind: "probe-scores"`) — reader for a
+  pre-built probe-scores v2 store; kept for completeness, superseded by the
+  runtime path (which needs no offline pass for a pre-scored corpus).
 - **`FnSource`** — arbitrary callable `fn(text, n_tokens) -> (n_tokens, r)`
-  for synthetic/control injections. A future **runtime gold-probe source**
-  (computing gemma probe scores on the fly) plugs in through the same
-  protocol.
-- `open_store(dir, ...)` dispatches on `meta.json["source_kind"]`.
+  for synthetic/control injections.
+- `open_store(dir, ...)` dispatches STORE readers on `meta.json["source_kind"]`;
+  the runtime sources are not stores — injection_train constructs them directly.
 
 ### Activation store format (`activation-store-v2`)
 
@@ -157,28 +191,63 @@ loader by `tests/test_activation_lockstep.py`). Readers **require** the v2
 format keys; legacy `coords.int8` support was **dropped entirely** (no pre-v2
 store exists anywhere — the old HF stores were deleted).
 
-### ProbeScoreSource repackaging status (NotImplemented boundary)
+### Runtime probe-score injection (no offline pass)
 
-What exists: the complete reader (`ProbeScoreSource`), and the alignment core
-— `nanochat_char_offsets` (nanochat byte→char offsets) + `align.gemma_to_qwen_map`
-prefix mode, which is tokenizer-agnostic and already tested; gemma offsets come
-from `align.get_offsets` on the (gated) gemma-2-2b fast tokenizer.
+Gold gemma probe scores are applied per nanochat token **at runtime, nothing
+stored offline** — replacing the old repackage-to-a-store idea. Two backends,
+one `ActivationSource` interface (`nanochat/injection/sources.py`):
 
-What remains (`scripts/precompute_activations.py --mode repackage-probe-scores`
-currently raises NotImplementedError with the same statement): walk each
-ClimbMix shard's parquet docs in row order alongside
-`hf.co/kaushikreddyxyz/climbmix-scored(+overflow…-7)` shard files
-(`scores_<sid>.npy` int8 `[n,3,54]`, `docs_<sid>.jsonl` `{doc,start,n}` spans,
-shards 0–184, full coverage); gemma-tokenize each doc
-(`add_special_tokens=False`, verify `len == n`, bit-check against
-`tokens_<sid>.npy` when local); map each nanochat token to the **last gemma
-token whose char span ends at or before it** (prefix mode — causal, no future
-leakage; this is the chosen policy, not mean-over-span); slice ONE layer's 54
-columns (`--layer 8` default; concept axis order = `columns.json["concepts"]`,
-the family-sorted main-block order — the permutation trap), dequantize with
-`quant.json` and standardize with `corpus_stats.json`; unmapped tokens get
-exact zero rows; write per-shard v2 store files and reuse assemble + the
-mandatory preflight.
+**Stored-scores backend (`RuntimeProbeScoreSource`, primary, fully working).**
+The scores already exist per gemma token in `hf.co/kaushikreddyxyz/climbmix-scored`
+(+`-overflow`, `-overflow-2..7`): `scores_<sid>.npy` int8 `[n,3,54]` (axis1:
+0=L6,1=L8,2=L14), `docs_<sid>.jsonl` `{doc,start,n}` spans (row order, full
+coverage), plus `quant.json`/`corpus_stats.json`/`columns.json`. Per doc:
+
+- **Positional join, no hashing, no startup walk.** The ride-along loader
+  re-runs the real corpus enumeration, so it knows each doc's `(shard, row)`;
+  `docs_<sid>.jsonl[row]` gives `(start, n_gemma)` into the score memmap. The
+  loader tracks `(shard, row)` from `_document_batches`' `(pq_idx, rg_idx,
+  epoch)` state plus a per-row-group cursor and parquet row-group metadata
+  (cheap); `docs_<sid>.jsonl` and the score memmap load lazily per shard. (A
+  text-keyed hash-index fallback exists — `build_hash_index`/`index_path`,
+  needs `climbmix_dir` — for callers without the position; it *does* pay the
+  parquet-walk startup cost.)
+- **On-the-fly alignment.** Retokenize the doc with the gemma fast tokenizer
+  (`add_special_tokens=False`, `len == n_gemma` guard) for char offsets,
+  nanochat byte→char offsets via `align.nanochat_char_offsets`, then
+  `align.gemma_to_qwen_map` prefix mode: each nanochat token takes the **last
+  gemma token whose char span ends at or before it** (causal, no future
+  leakage). Unmapped nanochat tokens → **exact zero rows**.
+- **Dequantize + standardize** one layer's columns (`layer` config field,
+  default 8; default all 54 in `columns.json` order, or a `concepts` subset)
+  with the frozen `quant.json` (`raw = int8·scale + zero`) and
+  `corpus_stats.json` (`z = (raw−mean)/std`). Unknown shard / row-out-of-range /
+  tokenizer drift → `None` (loader maps to exact zeros, no noise; counted in
+  `.stats()`). Note: standardized scores are z-scores, so covered tokens carry a
+  nonzero signal on *every* token (unlike the qwen-encoder ring coords, which
+  are zero on no-concept tokens).
+
+All per-doc work runs in the loader worker path, so it overlaps training;
+`--lookup-workers N` runs the per-doc gemma-tokenize+align in an ordered thread
+pool (the `(shard,row)` cursor is assigned serially first, so the parallel work
+is order-independent and byte-identical to serial).
+
+**Live-gemma backend (`LiveProbeScoreSource`, bounded stub).** Same interface;
+its constructor takes a `score_fn(texts) -> [ (n_gemma, L, 54) raw float, … ]`
+callable (tests inject a stub; real gemma wiring is a documented follow-up), then
+slices+standardizes+aligns identically. **Cost math:** a gemma-2-2b forward is
+≈5.2 GFLOP/tok vs ≈11 GFLOP/tok to train d24, and one H100 scores ≈40k tok/s —
+so live scoring at pretraining throughput needs a scorer fleet *larger* than the
+trainer. Intended for small runs, evals, and unscored corpora; for a pre-scored
+corpus the stored backend is free at runtime.
+
+**Ops note (pods):** the score shards are ~8.7 GB each, so a real run wants a
+rolling prefetch-download of `scores_<sid>.npy`/`docs_<sid>.jsonl` alongside
+training (same pattern as the existing shard prefetcher; ~2-shard disk window),
+memmapped lazily. Alignment throughput on the CPU fixture (fake tokenizers) is
+~30k docs/s single-worker; in production the **gemma retokenization dominates**,
+so size `--lookup-workers` to the real per-doc gemma-tokenize cost and confirm
+the loader keeps up with training's doc-consumption rate.
 
 ## Training (`scripts/injection_train.py`)
 
@@ -190,8 +259,7 @@ to base_train (so `diff scripts/base_train.py scripts/injection_train.py`
 shows only the injection hunks — keep it that way when either changes). The
 old `--inject-coords/--inject-beta/...` flag family is gone.
 
-**Single tabular site from a store** (legacy-equivalent v1 run shown — note
-the explicit 0.05 gate):
+**Single tabular site from a store** (the v1 recipe; `--gate` defaults to 0.05):
 
 ```
 python -m scripts.injection_train -- --activation-store <store_dir> \
@@ -200,7 +268,9 @@ python -m scripts.injection_train -- --activation-store <store_dir> \
 
 One site named `"acts"`: frozen direction pinned to the store's `P.npy` when
 present (else seeded orthonormal via the store's `p_seed`), source opened by
-`meta.json` kind. Omitting `--gate` gives the new default **1.0**.
+`meta.json` kind. `--gate` accepts a number OR `auto`/`auto:<target>`
+(per-channel calibration, above); `--gate-k`/`--gate-min-docs` tune it,
+`--lookup-workers N` overlaps runtime scoring with training.
 
 **General multi-site form**:
 
@@ -213,19 +283,27 @@ python -m scripts.injection_train -- --activation-config path/to/config.json
   "sites": [
     {"name": "acts", "r": 14, "after_block": 7, "gate": 0.05,
      "trainable_direction": false, "direction_seed": 1337},
-    {"name": "free", "r": 54, "after_block": 12, "gate": 1.0,
+    {"name": "probes", "r": 54, "after_block": 8, "gate": "auto:0.05",
      "trainable_direction": true, "direction_init": "orthonormal", "optim": "muon"}
   ],
   "sources": {
     "acts": {"kind": "qwen-encoder", "dir": "/workspace/acts_qwen", "noise_sigma": 0.15},
-    "free": {"kind": "probe-scores", "dir": "/workspace/acts_probes", "noise_sigma": 0.15}
+    "probes": {"kind": "probe-scores-runtime",
+               "score_shards_dir_or_repo": "/workspace/climbmix-scored",
+               "shards": "0-184", "layer": 8, "noise_sigma": 0.15}
   }
 }
 ```
 
-Site dicts are `sites.InjectionCfg` fields; `sources` keys must match site
-names; `FnSource` remains programmatic. Exactly one of
-`--activation-store`/`--activation-config` is required.
+Site dicts are `sites.InjectionCfg` fields (`gate` may be a number, a length-r
+list, or `"auto[:target]"`); `sources` keys must match site names; `FnSource`
+and `LiveProbeScoreSource` remain programmatic. The `probe-scores-runtime`
+source takes `score_shards_dir_or_repo` (local dir or HF dataset repo),
+`shards`, `layer`, optional `concepts` subset / `climbmix_dir` /
+`index_path` / `build_hash_index`. Exactly one of
+`--activation-store`/`--activation-config` is required. The startup banner
+prints each site's source kind, doc coverage, and resolved (incl. calibrated)
+gate.
 
 ## Optimizer contract
 
@@ -317,14 +395,22 @@ parallelizes tokenize/align in spawn workers with byte-identical output.
 
 ```bash
 python -m pytest tests/test_injection_sites.py tests/test_activation_lockstep.py \
-                 tests/test_precompute_activations.py
+                 tests/test_precompute_activations.py tests/test_runtime_probe_source.py
 python -m nanochat.injection.smoke
 ```
 
 - `test_injection_sites.py` — site invariants (RMS calibration, exact zero-row
-  no-op, gate-0 no-op + zero direction grad, gate default 1.0, optimizer
+  no-op, gate-0 no-op + zero direction grad, gate default 0.05, scalar-path
+  byte-identity, per-channel gate mute + loudness, all-zero-vector no-op,
+  auto-gate calibration/determinism/checkpoint-meta persistence, optimizer
   split, state-dict keys, v1↔v2 forward equivalence) and the GPT wiring
   (acts=None ≡ vanilla; optimizer contract; step behavior).
+- `test_runtime_probe_source.py` — the runtime probe path: `lookup_by_row`
+  dequant+standardize+prefix-align (hand-checked multi-gemma↔one-nano cases,
+  unmapped→exact-zero, drift/miss→None), positional-join == content-hash-join,
+  the ride-along loader's `(shard,row)` cursor driving `lookup_by_row`,
+  `lookup_workers` threaded == serial, `LiveProbeScoreSource` stub, and
+  single-worker alignment throughput.
 - `test_activation_lockstep.py` — the ride-along loader against the REAL
   packing source (ast-extracted from `nanochat/dataloader.py`): bit-identical
   token stream, activation↔token alignment through best-fit + crops,
@@ -339,8 +425,9 @@ python -m nanochat.injection.smoke
   skips otherwise.
 
 Not validated on CPU (needs a real run): torch.compile + fp8 over the site
-graph, store index throughput at the 27M-doc scale (~2-3 GB/rank), and the
-precompute encoder wiring on a real checkpoint + real tokenizer pair. SMOKE an
-injected launch first (a few steps, nothing saved): step time within ~3% of
-baseline and the per-site banner must print the expected `r` / `after_block` /
-`gate` / docs count.
+graph, the runtime probe path's real gemma-tokenize throughput vs training
+consumption (fixture only so far), the qwen-encoder store index throughput at
+the 27M-doc scale, and the precompute encoder wiring on a real checkpoint + real
+tokenizer pair. SMOKE an injected launch first (a few steps, nothing saved):
+step time within ~3% of baseline and the per-site banner must print the expected
+`r` / `after_block` / `gate` / docs count.
