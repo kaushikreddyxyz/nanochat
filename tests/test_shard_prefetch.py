@@ -142,6 +142,56 @@ rf = repo_for_factory(["r0", "r1", "r2"], 25)
 check(rf(0) == "r0" and rf(24) == "r0" and rf(25) == "r1" and rf(74) == "r2" and rf(999) == "r2",
       "sid // per_repo picks the repo (clamped to last)")
 
+print("\n[F] multi-stream: concurrent fetches bounded by streams, ordering preserved, no dup")
+STREAMS = 3
+NF = 16
+mlock = threading.Lock()
+live = [0]
+peak = [0]
+mfetched = []
+
+
+def mfetch(sid):
+    with mlock:
+        live[0] += 1
+        peak[0] = max(peak[0], live[0])
+        mfetched.append(sid)
+    time.sleep(0.02)                  # hold the stream so siblings overlap
+    with mlock:
+        live[0] -= 1
+    return f"/stage/{sid}"
+
+
+pm = ShardPrefetcher(list(range(NF)), mfetch, ahead=STREAMS + 2, keep_behind=1, streams=STREAMS).start()
+order_ok = True
+for sid in range(NF):
+    if pm.ensure(sid) != f"/stage/{sid}":     # ensure returns THIS shard's staged path (order preserved)
+        order_ok = False
+    time.sleep(0.01)
+time.sleep(0.1)
+pm.stop()
+check(order_ok, "ensure returned the correct staged path for every shard in consumption order")
+# worker fetches are bounded by streams; ensure adds at most ONE inline catch-up
+# fetch (single consumer thread) when the window is briefly behind at startup.
+check(peak[0] <= STREAMS + 1, f"concurrent fetches bounded by streams+1 inline (peak {peak[0]} <= {STREAMS + 1})")
+check(peak[0] >= 2, f"streams actually ran concurrently (peak {peak[0]} >= 2, not serialized)")
+check(len(mfetched) == len(set(mfetched)), f"no shard fetched twice across streams ({sorted(mfetched)})")
+check(set(range(NF)) <= set(mfetched) | set(range(pm.stats()['frontier'] + 1)),
+      "all consumed shards were staged")
+check(pm.stats()["fetches"] > 0 and pm.stats()["mean_fetch_seconds"] > 0,
+      f"fetch timing recorded for bandwidth sizing ({pm.stats()['fetches']} fetches, "
+      f"{pm.stats()['mean_fetch_seconds']}s mean)")
+
+print("\n[G] set_streams grows the worker pool (auto-sizing after the prefill measurement)")
+ps = ShardPrefetcher(list(range(8)), lambda s: f"/stage/{s}", ahead=4, keep_behind=1, streams=1).start()
+before = ps.stats()["streams"]
+ps.set_streams(4)
+after = ps.stats()["streams"]
+ps.ensure(0)
+time.sleep(0.05)
+ps.stop()
+check(before == 1 and after == 4, f"set_streams raised the stream count {before} -> {after}")
+
 print("\n" + ("ALL CHECKS PASSED" if not fails else f"{len(fails)} FAILURES: {fails}"))
 if __name__ == "__main__":
     sys.exit(1 if fails else 0)

@@ -1,20 +1,23 @@
-"""Rolling shard prefetcher (Amendment 3): download score/parquet shards in a
-background thread WHILE training runs, keeping a small window ahead and deleting
+"""Rolling shard prefetcher (Amendment 3): download score/parquet shards in
+background threads WHILE training runs, keeping a small window ahead and deleting
 consumed shards behind so disk stays minimal — never a bulk pre-download, never a
 hard block at a shard boundary (the window absorbs download latency; if the next
 shard still isn't ready the consumer blocks and the Amendment-2 starvation
 machinery fires via ``on_wait``).
 
 Consumption is monotonic (the ride-along loader enumerates shards in corpus
-order), so the prefetcher tracks a single frontier position. The background
-thread stages shards ``ahead`` beyond the frontier and deletes shards more than
+order), so the prefetcher tracks a single frontier position. ``streams`` worker
+threads stage shards ``ahead`` beyond the frontier and delete shards more than
 ``keep_behind`` positions behind it; ``ensure(sid)`` blocks until ``sid`` is
-staged (falling back to an inline fetch if the worker is behind) and advances the
-frontier. Fetches are idempotent and race-free (worker and ``ensure`` never
-double-download the same shard).
+staged (falling back to an inline fetch if the workers are behind) and advances
+the frontier. Fetches are idempotent and race-free — a shard is reserved in
+``_inflight`` under the lock before its fetch starts, so sibling streams and the
+inline ``ensure`` fallback never double-download it. An 8.7GB shard covers ~50s
+of full-speed training but takes ~45-210s to fetch depending on NIC, so multiple
+streams are what keep the window ahead (size with ``buffering.size_prefetch_streams``).
 
 Local dirs = no-op passthrough (``fetch_fn=None``): ``ensure`` returns
-immediately, no thread, no deletes. The real HF fetcher must set
+immediately, no threads, no deletes. The real HF fetcher must set
 ``HF_HUB_DISABLE_XET=1`` (xet stalls on pods). CPU-tested with a fake fetcher.
 """
 import os
@@ -70,7 +73,7 @@ def make_local_deleter(staging_dir, *, files=SCORE_FILES, climbmix_dir=None,
 
 class ShardPrefetcher:
     def __init__(self, shard_ids, fetch_fn, *, delete_fn=None, ahead=2, keep_behind=1,
-                 on_wait=None, on_delete=None):
+                 on_wait=None, on_delete=None, streams=1):
         self.order = list(shard_ids)
         self._pos = {sid: i for i, sid in enumerate(self.order)}
         self.fetch_fn = fetch_fn
@@ -79,26 +82,44 @@ class ShardPrefetcher:
         self.keep_behind = int(keep_behind)
         self.on_wait = on_wait
         self.on_delete = on_delete
+        self.streams = max(1, int(streams))
         self._staged = {}          # sid -> fetch_fn result
         self._inflight = set()
         self._frontier = -1        # highest consumed position
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
-        self._thread = None
+        self._threads = []
         self._stop = False
         self._waits = 0
         self._wait_seconds = 0.0
         self._deleted = 0
+        self._fetch_count = 0      # completed fetches (bandwidth numerator)
+        self._fetch_seconds = 0.0
 
     @property
     def enabled(self):
         return self.fetch_fn is not None
 
     def start(self):
-        if self.enabled and self._thread is None:
-            self._thread = threading.Thread(target=self._run, name="shard-prefetch", daemon=True)
-            self._thread.start()
+        if self.enabled:
+            self._spawn(self.streams)
         return self
+
+    def _spawn(self, target):
+        """Bring the live worker count up to ``target`` (idempotent; only grows —
+        auto-sizing raises streams after the prefill bandwidth measurement)."""
+        with self._cv:
+            self.streams = max(self.streams, int(target))
+            need = self.streams - len(self._threads)
+            base = len(self._threads)
+            for k in range(max(need, 0)):
+                th = threading.Thread(target=self._run, name=f"shard-prefetch-{base + k}", daemon=True)
+                self._threads.append(th)
+                th.start()
+
+    def set_streams(self, target):
+        if self.enabled:
+            self._spawn(target)
 
     def stop(self):
         with self._cv:
@@ -148,6 +169,9 @@ class ShardPrefetcher:
         return res
 
     def _run(self):
+        # One stream worker. Reserves the nearest un-staged in-window shard under
+        # the lock (so sibling streams pick DIFFERENT shards, never the same one),
+        # fetches it outside the lock, then re-windows.
         while True:
             with self._cv:
                 while not self._stop and self._frontier < 0:
@@ -158,21 +182,35 @@ class ShardPrefetcher:
                 window = [self.order[i] for i in range(max(frontier, 0),
                                                        min(frontier + self.ahead + 1, len(self.order)))]
                 todo = [s for s in window if s not in self._staged and s not in self._inflight]
-                drop = [s for s, _ in self._staged.items()
+                drop = [s for s in list(self._staged)
                         if self._pos.get(s, 0) < frontier - self.keep_behind and s not in self._inflight]
-            for sid in drop:
-                self._evict(sid)
-            if todo:
-                try:
-                    self._fetch(todo[0])   # stage nearest-ahead first, then loop re-windows
-                except Exception:          # transient (network): back off and retry from the loop;
-                    with self._cv:          # a persistent failure surfaces via ensure's inline fetch
-                        if not self._stop:
-                            self._cv.wait(timeout=2.0)
-            else:
+                sid = todo[0] if todo else None
+                if sid is not None:
+                    self._inflight.add(sid)    # reserve before releasing the lock
+            for d in drop:
+                self._evict(d)
+            if sid is None:
                 with self._cv:
                     if not self._stop and self._frontier == frontier:
                         self._cv.wait(timeout=0.5)
+                continue
+            t0 = time.time()
+            try:
+                res = self.fetch_fn(sid)       # nearest-ahead first, then the loop re-windows
+            except Exception:                  # transient (network): drop the reservation, back off;
+                with self._cv:                 # a persistent failure surfaces via ensure's inline fetch
+                    self._inflight.discard(sid)
+                    self._cv.notify_all()
+                    if not self._stop:
+                        self._cv.wait(timeout=2.0)
+                continue
+            with self._cv:
+                self._inflight.discard(sid)
+                if not self._stop:
+                    self._staged[sid] = res
+                    self._fetch_count += 1
+                    self._fetch_seconds += time.time() - t0
+                self._cv.notify_all()
 
     def _evict(self, sid):
         with self._cv:
@@ -188,6 +226,9 @@ class ShardPrefetcher:
 
     def stats(self):
         with self._cv:
+            mean_fetch = (self._fetch_seconds / self._fetch_count) if self._fetch_count else 0.0
             return {"staged": sorted(self._staged), "frontier": self._frontier,
                     "deleted": self._deleted, "waits": self._waits,
-                    "wait_seconds": round(self._wait_seconds, 3)}
+                    "wait_seconds": round(self._wait_seconds, 3),
+                    "streams": self.streams, "fetches": self._fetch_count,
+                    "mean_fetch_seconds": round(mean_fetch, 3)}
