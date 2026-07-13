@@ -115,12 +115,16 @@ class ShardPrefetcher:
             self._inflight.add(sid)
         try:
             res = self.fetch_fn(sid)
-        finally:
+        except BaseException:                 # failed fetch: never stage, re-raise as-is
             with self._cv:
                 self._inflight.discard(sid)
-                if not self._stop:
-                    self._staged[sid] = res
                 self._cv.notify_all()
+            raise
+        with self._cv:
+            self._inflight.discard(sid)
+            if not self._stop:
+                self._staged[sid] = res
+            self._cv.notify_all()
         return res
 
     def ensure(self, sid):
@@ -159,7 +163,12 @@ class ShardPrefetcher:
             for sid in drop:
                 self._evict(sid)
             if todo:
-                self._fetch(todo[0])       # stage nearest-ahead first, then loop re-windows
+                try:
+                    self._fetch(todo[0])   # stage nearest-ahead first, then loop re-windows
+                except Exception:          # transient (network): back off and retry from the loop;
+                    with self._cv:          # a persistent failure surfaces via ensure's inline fetch
+                        if not self._stop:
+                            self._cv.wait(timeout=2.0)
             else:
                 with self._cv:
                     if not self._stop and self._frontier == frontier:

@@ -104,6 +104,39 @@ p2.stop()
 check(res == "/stage/0" and 0 in waited, f"ensure blocked, fired on_wait, then returned (waited={waited})")
 check(time.time() - t0 >= 0.04, "ensure actually waited on the gated fetch (not a spurious pass)")
 
+print("\n[E] transient fetch failure: real error surfaces, worker survives and retries")
+attempts = []
+
+
+def flaky_fetch(sid):
+    attempts.append(sid)
+    if len(attempts) <= 2:
+        raise IOError(f"transient network error on shard {sid}")
+    return f"/stage/{sid}"
+
+
+p3 = ShardPrefetcher([0, 1, 2, 3], flaky_fetch, ahead=2, keep_behind=1).start()
+try:
+    r0 = p3.ensure(0)                # first attempts fail: inline fetch must see the REAL error
+    inline_err = None
+except Exception as e:               # noqa: BLE001
+    inline_err = e
+    r0 = None
+check(r0 == "/stage/0" or isinstance(inline_err, IOError),
+      f"failed fetch raises the real error (not UnboundLocalError): {type(inline_err).__name__ if inline_err else r0}")
+deadline = time.time() + 8.0
+ok_rest = False
+while time.time() < deadline:        # worker must survive the failures and stage the rest
+    try:
+        if p3.ensure(1) == "/stage/1" and p3.ensure(2) == "/stage/2":
+            ok_rest = True
+            break
+    except IOError:                  # a remaining transient attempt — keep retrying
+        pass
+    time.sleep(0.05)
+p3.stop()
+check(ok_rest, f"worker survived transient fetch failures and kept staging (attempts={attempts})")
+
 print("\n[D] repo_for_factory: count-based shard->repo assignment")
 rf = repo_for_factory(["r0", "r1", "r2"], 25)
 check(rf(0) == "r0" and rf(24) == "r0" and rf(25) == "r1" and rf(74) == "r2" and rf(999) == "r2",
