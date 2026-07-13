@@ -212,16 +212,8 @@ if args.no_value_embeds:
 # Absent --inject-coords this whole block is skipped: byte-identical vanilla run.
 coord_source = None
 if args.inject_coords:
-    import sys
     import numpy as np
-    _patch_dir = os.environ.get("STAGE7_PATCH_DIR") or os.path.join(
-        os.path.dirname(__file__), "..", "..",
-        "concept_probes", "stage7_oracle", "code", "nanochat_patch")
-    assert os.path.isdir(_patch_dir), (
-        f"stage7 nanochat_patch dir not found at {_patch_dir}; set STAGE7_PATCH_DIR "
-        f"(needed for coords_store.py / coord_dataloader.py when nanochat is cloned standalone)")
-    sys.path.insert(0, _patch_dir)
-    from coords_store import CoordSource
+    from nanochat.oracle.coords_store import CoordSource
     P = np.load(os.path.join(args.inject_coords, "P.npy"))  # (n_embd, r) float32 orthonormal
     assert P.shape[0] == model_config.n_embd, (P.shape, model_config.n_embd)
     assert 0 <= args.inject_after_block < model_config.n_layer, args.inject_after_block
@@ -405,7 +397,7 @@ dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_s
 # the stock best-fit loader 1:1; adds a (B, T, r) coord tensor in lockstep). The
 # val loader stays stock: val bpb is evaluated coords-off (z=None) by design.
 if coord_source is not None:
-    from coord_dataloader import coord_data_loader_with_state
+    from nanochat.oracle.coord_dataloader import coord_data_loader_with_state
     train_loader = coord_data_loader_with_state(tokenizer, coord_source, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
 else:
     train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
