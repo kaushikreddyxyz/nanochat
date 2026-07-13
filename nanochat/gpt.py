@@ -412,7 +412,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', coords=None):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -466,10 +466,28 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
+        # Stage-7 oracle coord injection (concept_probes/stage7_oracle): after the
+        # chosen mid-band block, add an isometric embedding (fixed orthonormal P,
+        # a non-trainable non-persistent buffer set up by base_train) of the
+        # per-token coord vector, scaled so its per-token RMS over n_embd is
+        # exactly `inject_beta` * per-token RMS(residual). Convention:
+        # rms(v) = sqrt(mean_j v_j^2) per token (keepdim over the last dim).
+        # Zero-coord tokens (BOS / doc missing from the precompute) have zc == 0,
+        # so the added term is exactly 0 via the rms_z clamp (no NaN, no branch).
+        # `coords is None` and `inject_after_block` are trace-time constants for
+        # a given run, and the body is pure matmul/elementwise, so torch.compile
+        # sees no data-dependent control flow (no graph break). Absent injection
+        # (coords=None, attribute unset) this is a no-op with zero extra compute.
+        inject_block = getattr(self, "inject_after_block", -1)
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            if coords is not None and i == inject_block:
+                zc = coords.to(x.dtype) @ self.inject_P.to(x.dtype).t()  # (B, T, n_embd)
+                rms_x = x.pow(2).mean(-1, keepdim=True).clamp_min(1e-8).sqrt()
+                rms_z = zc.pow(2).mean(-1, keepdim=True).clamp_min(1e-8).sqrt()
+                x = x + self.inject_beta * (rms_x / rms_z) * zc
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection

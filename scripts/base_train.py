@@ -84,6 +84,11 @@ parser.add_argument("--compress-checkpoints", type=int, default=1, help="gzip-co
 parser.add_argument("--checkpoint-compress-level", type=int, default=4, help="gzip level 1-9 for checkpoint compression (higher = smaller files, slower)")
 # Model ablations
 parser.add_argument("--no-value-embeds", action="store_true", help="zero and freeze the ResFormer value-embedding tables so they neither contribute nor learn (matched no-value-embeds control; identical to the default run in every other respect given --seed)")
+# Stage-7 oracle coord injection (absent => vanilla nanochat: no behavior change, no extra RNG draws)
+parser.add_argument("--inject-coords", type=str, default="", help="path to a Stage-7 coords dir (coords.int8/index.npy/P.npy/meta.json); enables contextual coord injection")
+parser.add_argument("--inject-after-block", type=int, default=7, help="0-based block index; coords are added to the residual right AFTER transformer.h[N] runs (default 7 = after 8 completed blocks of 24, depth fraction 8/24 ~= gemma's causal band 8/26)")
+parser.add_argument("--inject-beta", type=float, default=0.05, help="injected per-token RMS as a fraction of the residual per-token RMS at the injection site")
+parser.add_argument("--inject-noise-sigma", type=float, default=0.15, help="gaussian noise std added to standardized coords at load time (anti-memorization); deterministic per doc-content hash; 0 disables")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -194,6 +199,40 @@ if args.no_value_embeds:
             ve.weight.zero_()
             ve.weight.requires_grad_(False)
     print0(f"--no-value-embeds: zeroed + froze {len(model.value_embeds)} value-embedding table(s)")
+
+# Stage-7 oracle coord injection: load the FIXED orthonormal P and register it as
+# a non-trainable, NON-PERSISTENT buffer -- it is not an nn.Parameter, so it is
+# invisible to setup_optimizer's param groups (no LR, no weight decay, and the
+# parameter-count assert in gpt.py is unaffected), and persistent=False keeps it
+# out of state_dict, so checkpoints stay loadable by vanilla code. nanochat uses
+# no DDP module wrapper (grads are all-reduced by DistMuonAdamW only), so there is
+# no buffer broadcast to worry about: every rank loads the same P.npy from disk.
+# Done AFTER init_weights/resume/no-value-embeds (this block draws NO RNG, so the
+# vanilla init stream is untouched) and BEFORE fp8 conversion + torch.compile.
+# Absent --inject-coords this whole block is skipped: byte-identical vanilla run.
+coord_source = None
+if args.inject_coords:
+    import sys
+    import numpy as np
+    _patch_dir = os.environ.get("STAGE7_PATCH_DIR") or os.path.join(
+        os.path.dirname(__file__), "..", "..",
+        "concept_probes", "stage7_oracle", "code", "nanochat_patch")
+    assert os.path.isdir(_patch_dir), (
+        f"stage7 nanochat_patch dir not found at {_patch_dir}; set STAGE7_PATCH_DIR "
+        f"(needed for coords_store.py / coord_dataloader.py when nanochat is cloned standalone)")
+    sys.path.insert(0, _patch_dir)
+    from coords_store import CoordSource
+    P = np.load(os.path.join(args.inject_coords, "P.npy"))  # (n_embd, r) float32 orthonormal
+    assert P.shape[0] == model_config.n_embd, (P.shape, model_config.n_embd)
+    assert 0 <= args.inject_after_block < model_config.n_layer, args.inject_after_block
+    model.register_buffer("inject_P", torch.from_numpy(P).to(device), persistent=False)
+    model.inject_after_block = int(args.inject_after_block)
+    model.inject_beta = float(args.inject_beta)
+    coord_source = CoordSource(args.inject_coords, noise_sigma=args.inject_noise_sigma, seed=args.seed)
+    assert P.shape[1] == coord_source.r, (P.shape, coord_source.r)
+    print0(f"--inject-coords: r={coord_source.r} after_block={args.inject_after_block} "
+           f"beta={args.inject_beta} noise={args.inject_noise_sigma} P={tuple(P.shape)} "
+           f"docs={len(coord_source):,}")
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
@@ -362,9 +401,20 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+# Stage-7: with --inject-coords, swap in the ride-along loader (token path mirrors
+# the stock best-fit loader 1:1; adds a (B, T, r) coord tensor in lockstep). The
+# val loader stays stock: val bpb is evaluated coords-off (z=None) by design.
+if coord_source is not None:
+    from coord_dataloader import coord_data_loader_with_state
+    train_loader = coord_data_loader_with_state(tokenizer, coord_source, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+else:
+    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
-x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+z = None  # per-batch coords; stays None on the vanilla path
+if coord_source is not None:
+    x, y, z, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+else:
+    x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
@@ -559,14 +609,18 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        loss = model(x, y, coords=z)  # z is None on the vanilla path (identical to model(x, y))
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        # prefetch the next batch while the GPU is busy with forward/backward
+        if coord_source is not None:
+            x, y, z, dataloader_state_dict = next(train_loader)
+        else:
+            x, y, dataloader_state_dict = next(train_loader)
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
