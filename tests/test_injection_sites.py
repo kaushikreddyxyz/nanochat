@@ -1,10 +1,12 @@
 """CPU tests for nanochat.injection.sites and their wiring into GPT: v1/v2
 forward-value equivalence, RMS calibration, exact zero-row no-op, gate=0
-no-op + blocked direction grads (gate still gets its want-signal), the
-optimizer contract (gates in no group, frozen skipped, trainable bucketed
-adamw/muon), state-dict keys, and acts=None == vanilla."""
+no-op + blocked direction grads (gate still gets its want-signal), per-channel
+(vector) gate invariants, auto-gate calibration + determinism + checkpoint-meta
+persistence, the optimizer contract (gates in no group, frozen skipped, trainable
+bucketed adamw/muon), state-dict keys, and acts=None == vanilla."""
 import os
 import sys
+from dataclasses import asdict
 
 import numpy as np
 import torch
@@ -18,8 +20,10 @@ from nanochat.injection.sites import (  # noqa: E402
     InjectionCfg,
     InjectionSite,
     build_sites,
+    calibrate_auto_gate,
     optimizer_param_split,
     orthonormal_direction,
+    parse_gate_spec,
     reassert_optimizability,
     sites_by_block,
 )
@@ -27,10 +31,9 @@ from nanochat.injection.sites import (  # noqa: E402
 B, T, N_EMBD, R = 2, 8, 64, 14
 
 
-def test_gate_default_is_full_loudness():
-    # Default gate is 1.0 (injected RMS == residual RMS). Reproducing the v1
-    # run requires passing gate=0.05 explicitly.
-    assert InjectionCfg(name="d", r=R, after_block=0).gate == 1.0
+def test_gate_default_is_005():
+    # Default gate back to 0.05 (injected RMS = 0.05 * residual RMS).
+    assert InjectionCfg(name="d", r=R, after_block=0).gate == 0.05
 
 
 def _v1_inject(x, coords, P, beta):
@@ -148,22 +151,115 @@ def test_gate_grads_assigned_but_never_in_optimizer_split():
 
 def test_state_dict_keys():
     site = _tabular_site()
-    assert set(site.state_dict().keys()) == {"gate", "direction", "channel_weights"}
+    assert set(site.state_dict().keys()) == {"gate", "direction"}
     sites = build_sites([InjectionCfg(name="a", r=3, after_block=0)], N_EMBD)
-    assert set(sites.state_dict().keys()) == {"a.gate", "a.direction", "a.channel_weights"}
+    assert set(sites.state_dict().keys()) == {"a.gate", "a.direction"}
 
 
-def test_channel_weights_mute():
+def test_scalar_gate_path_byte_identical_to_old_forward():
+    # The scalar-gate path must equal the retired channel_weights=ones forward
+    # bit-for-bit (channel_weights folded into the gate; scalar path unchanged).
+    torch.manual_seed(9)
+    x = torch.randn(B, T, N_EMBD)
+    a = torch.randn(B, T, R)
+    site = _tabular_site(beta=0.05)
+    z = a @ site.direction
+    z_hat = z / z.pow(2).mean(-1, keepdim=True).clamp_min(1e-8).sqrt()
+    rms_x = x.pow(2).mean(-1, keepdim=True).clamp_min(1e-8).sqrt()
+    old = x + 0.05 * rms_x * z_hat
+    assert torch.equal(site(x, a), old)
+
+
+def test_per_channel_gate_mute_and_loudness():
     torch.manual_seed(5)
     x = torch.randn(B, T, N_EMBD)
-    cfg = InjectionCfg(name="m", r=3, after_block=0, gate=0.2,
-                       channel_weights=[0.0, 1.0, 1.0])
-    site = InjectionSite(cfg, N_EMBD)
+    # gate[0]=0 mutes channel 0: an activation with ONLY channel 0 active is a no-op
+    site = InjectionSite(InjectionCfg(name="m", r=3, after_block=0, gate=[0.0, 0.2, 0.2]), N_EMBD)
     a = torch.zeros(B, T, 3)
-    a[..., 0] = torch.randn(B, T)                # only the muted channel is active
-    assert torch.equal(site(x, a), x), "muted channel must contribute exactly nothing"
+    a[..., 0] = torch.randn(B, T)
+    assert torch.equal(site(x, a), x), "gate=0 channel must contribute exactly nothing"
     a[..., 1] = torch.randn(B, T)
     assert not torch.equal(site(x, a), x)
+    # overall injected RMS of a vector gate == rms(gate) * rms(x)
+    g = [0.02, 0.1, 0.2]
+    sv = InjectionSite(InjectionCfg(name="v", r=3, after_block=0, gate=g), N_EMBD)
+    a2 = torch.randn(B, T, 3)
+    out = sv(x, a2)
+    ratio = (out - x).pow(2).mean(-1).sqrt() / x.pow(2).mean(-1).sqrt()
+    want = float(np.sqrt(np.mean(np.square(g))))
+    assert torch.allclose(ratio, torch.full_like(ratio, want), rtol=1e-4), (ratio, want)
+
+
+def test_all_zero_vector_gate_exact_noop():
+    torch.manual_seed(6)
+    x = torch.randn(B, T, N_EMBD)
+    site = InjectionSite(InjectionCfg(name="z", r=4, after_block=0, gate=[0.0, 0.0, 0.0, 0.0]), N_EMBD)
+    assert torch.equal(site(x, torch.randn(B, T, 4)), x), "all-zero gate vector must be an EXACT no-op"
+
+
+def test_vector_gate_state_and_never_optimize():
+    site = InjectionSite(InjectionCfg(name="v", r=3, after_block=0, gate=[0.1, 0.2, 0.3]), N_EMBD)
+    assert tuple(site.gate.shape) == (3,)
+    assert getattr(site.gate, "_never_optimize", False) is True
+    adamw, muon = optimizer_param_split(build_sites(
+        [InjectionCfg(name="v", r=3, after_block=0, gate=[0.1, 0.2, 0.3])], N_EMBD))
+    assert adamw == [] and muon == []              # gate never optimized, direction frozen
+
+
+class _FakeGateSource:
+    """Deterministic per-channel activation stats for auto-gate calibration:
+    channel c fires on a fixed fraction of tokens with a fixed magnitude."""
+    name = "fake"
+
+    def __init__(self, r=4, n_docs=64):
+        self.r, self._n = r, n_docs
+
+    def sample_activation_stats(self, k, seed):
+        rng = np.random.default_rng(seed)
+        rows = []
+        for _ in range(min(k, self._n)):
+            m = rng.integers(20, 40)
+            z = np.zeros((m, self.r), np.float32)
+            for c in range(self.r):
+                fire = rng.random(m) < (0.2 * (c + 1))     # denser channels fire more
+                z[fire, c] = (c + 1) * 1.0
+            rows.append(z)
+        pooled = np.concatenate(rows)
+        rms = np.sqrt((pooled ** 2).mean(0)).astype(np.float32)
+        nz = (pooled != 0).mean(0).astype(np.float32)
+        return rms, nz, len(rows), pooled.shape[0]
+
+
+def test_auto_gate_calibration_and_determinism():
+    src = _FakeGateSource(r=4, n_docs=64)
+    g1, meta1 = calibrate_auto_gate(src, target=0.05, k=32, seed=0, min_docs=8)
+    g2, _ = calibrate_auto_gate(src, target=0.05, k=32, seed=0, min_docs=8)
+    assert g1 == g2, "auto-gate must be deterministic in (source, seed)"
+    assert abs(float(np.sqrt(np.mean(np.square(g1)))) - 0.05) < 1e-5, "rms(gate) must equal the target"
+    # equalized contribution: gate_c * rms_c ~ const on active channels
+    rms = np.asarray(meta1["channel_rms"])
+    contrib = np.asarray(g1) * rms
+    active = contrib > 0
+    assert active.sum() >= 2 and np.allclose(contrib[active], contrib[active][0], rtol=1e-4)
+    # too few docs -> loud failure
+    try:
+        calibrate_auto_gate(_FakeGateSource(n_docs=3), target=0.05, k=32, seed=0, min_docs=8)
+        raise AssertionError("auto-gate must fail loudly with too few docs")
+    except RuntimeError:
+        pass
+
+
+def test_auto_gate_persists_through_cfg_roundtrip():
+    # The calibrated vector rides in cfg.gate -> asdict -> checkpoint meta, so a
+    # resume rebuilds the same site without recalibrating.
+    gate_vec, _ = calibrate_auto_gate(_FakeGateSource(r=4), target=0.05, k=32, seed=1, min_docs=8)
+    cfg = InjectionCfg(name="v", r=4, after_block=0, gate=gate_vec)
+    rebuilt = InjectionCfg(**asdict(cfg))
+    assert rebuilt.gate == gate_vec
+    site = InjectionSite(rebuilt, N_EMBD)
+    assert torch.equal(site.gate.detach(), torch.tensor(gate_vec))
+    assert parse_gate_spec("auto:0.1") == (True, 0.1)
+    assert parse_gate_spec(gate_vec) == (False, gate_vec)
 
 
 def test_freeze_unfreeze_and_reassert():
