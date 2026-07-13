@@ -262,6 +262,37 @@ def test_auto_gate_persists_through_cfg_roundtrip():
     assert parse_gate_spec(gate_vec) == (False, gate_vec)
 
 
+def test_vector_gate_checkpoint_resume_roundtrip():
+    # Resume contract behind injection_train's auto-gate fix: the calibrated
+    # VECTOR must be back in the cfg (from checkpoint meta) BEFORE the sites are
+    # built — load_state_dict(assign=True) enforces shapes, so a scalar
+    # placeholder site cannot load a vector-gate checkpoint.
+    gate_vec, _ = calibrate_auto_gate(_FakeGateSource(r=4), target=0.05, k=32, seed=1, min_docs=8)
+    saved_cfg = InjectionCfg(name="v", r=4, after_block=0, gate=gate_vec)
+
+    class Holder(torch.nn.Module):
+        def __init__(self, cfgs):
+            super().__init__()
+            self.injection_sites = build_sites(cfgs, N_EMBD)
+
+    ckpt = Holder([saved_cfg]).state_dict()
+    meta_gate = [float(g) for g in asdict(saved_cfg)["gate"]]    # json meta round trip
+    resumed = Holder([InjectionCfg(name="v", r=4, after_block=0, gate=meta_gate)])
+    missing, unexpected = resumed.load_state_dict(ckpt, strict=False, assign=True)
+    assert not missing and not unexpected
+    reassert_optimizability(resumed.injection_sites)
+    g = resumed.injection_sites["v"].gate
+    assert torch.equal(g.detach(), torch.tensor(gate_vec)), "calibrated gate must survive resume exactly"
+    assert g._never_optimize is True and g.requires_grad
+    # the failure mode the fix removes: a scalar-placeholder site MUST refuse the vector checkpoint
+    placeholder = Holder([InjectionCfg(name="v", r=4, after_block=0, gate=0.05)])
+    try:
+        placeholder.load_state_dict(ckpt, strict=False, assign=True)
+        raise AssertionError("scalar-placeholder site silently loaded a vector gate")
+    except RuntimeError as e:
+        assert "size mismatch" in str(e)
+
+
 def test_freeze_unfreeze_and_reassert():
     site = _tabular_site(trainable=True)
     assert site.direction.requires_grad

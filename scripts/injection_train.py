@@ -256,8 +256,8 @@ resuming = args.resume_from_step != -1
 
 # Resolve gate: numeric strings -> float; "auto[:target]" -> placeholder now,
 # calibrated per-channel from the source below (fresh runs) or reused from the
-# resumed checkpoint (no recalibration). Sources open BEFORE the sites so auto
-# can sample them; they are loader-side data plumbing, never model state.
+# resumed checkpoint's meta (no recalibration). Sources open BEFORE the sites so
+# auto can sample them; they are loader-side data plumbing, never model state.
 _auto_targets = {}
 for _cfg in injection_cfgs:
     _is_auto, _val = parse_gate_spec(_cfg.gate)
@@ -266,6 +266,23 @@ for _cfg in injection_cfgs:
         _cfg.gate = float(_val)                 # placeholder until calibration/load
     elif isinstance(_cfg.gate, str):
         _cfg.gate = float(_cfg.gate)
+
+# Resuming an auto-gate run: the calibrated per-channel vector must be in the
+# cfg BEFORE the sites are built — load_state_dict(assign=True) enforces shapes,
+# so a scalar-placeholder site cannot load a vector-gate checkpoint. Read it
+# from the checkpoint meta (injection_sites_config); a site absent there (warm
+# start from a vanilla checkpoint) calibrates fresh below.
+_auto_pending = dict(_auto_targets)
+if resuming and _auto_pending:
+    with open(os.path.join(checkpoint_dir, f"meta_{args.resume_from_step:06d}.json")) as f:
+        _ckpt_sites = {c["name"]: c for c in json.load(f).get("injection_sites_config", [])}
+    for _name in list(_auto_pending):
+        _saved_gate = _ckpt_sites.get(_name, {}).get("gate")
+        if isinstance(_saved_gate, (list, tuple)):
+            _cfg = next(c for c in injection_cfgs if c.name == _name)
+            _cfg.gate = [float(g) for g in _saved_gate]
+            del _auto_pending[_name]
+            print0(f"[auto-gate] {_name!r}: reusing calibrated gate from checkpoint meta (no recalibration)")
 
 # Compact-tokens mode (opt-in): a gemma-boundary-respecting tokenizer used for
 # BOTH the training token stream (loader) and the runtime source alignment. OFF
@@ -297,15 +314,14 @@ for _name, _spec in injection_source_specs.items():
     assert _src.r == _cfg.r, f"site {_name!r}: source r={_src.r} != cfg r={_cfg.r}"
     injection_sources[_name] = _src
 
-if _auto_targets and not resuming:
-    for _name, _target in _auto_targets.items():
-        _cfg = next(c for c in injection_cfgs if c.name == _name)
-        _gate_vec, _cal = calibrate_auto_gate(injection_sources[_name], target=_target,
-                                              k=args.gate_k, seed=args.seed, min_docs=args.gate_min_docs)
-        _cfg.gate = _gate_vec
-        print0(f"[auto-gate] {_name!r}: target={_target} active={_cal['n_active']}/{_cfg.r} "
-               f"rms(gate)={_cal['rms_gate']:.4f} ({_cal['n_docs']} docs, {_cal['n_tokens']} tokens); "
-               f"gate={[round(g, 4) for g in _gate_vec]}")
+for _name, _target in _auto_pending.items():
+    _cfg = next(c for c in injection_cfgs if c.name == _name)
+    _gate_vec, _cal = calibrate_auto_gate(injection_sources[_name], target=_target,
+                                          k=args.gate_k, seed=args.seed, min_docs=args.gate_min_docs)
+    _cfg.gate = _gate_vec
+    print0(f"[auto-gate] {_name!r}: target={_target} active={_cal['n_active']}/{_cfg.r} "
+           f"rms(gate)={_cal['rms_gate']:.4f} ({_cal['n_docs']} docs, {_cal['n_tokens']} tokens); "
+           f"gate={[round(g, 4) for g in _gate_vec]}")
 
 model.setup_injection_sites(injection_cfgs)
 if args.activation_store:
@@ -335,10 +351,10 @@ if resuming:
     if missing:
         print0(f"warm-start: checkpoint has no injection sites; {len(missing)} site tensors keep their fresh init")
     reassert_optimizability(model.injection_sites)
-    for _name in _auto_targets:  # record the loaded (already-calibrated) gate in cfg -> saved meta
+    for _name in _auto_targets:  # keep cfg (-> saved meta) in sync with the gate actually in the model
         _cfg = next(c for c in injection_cfgs if c.name == _name)
-        _cfg.gate = model.injection_sites[_name].gate.detach().float().cpu().tolist()
-        print0(f"[auto-gate] {_name!r}: reusing calibrated gate from checkpoint (no recalibration)")
+        _g = model.injection_sites[_name].gate.detach().float().cpu()
+        _cfg.gate = _g.tolist() if _g.ndim else float(_g)
     del model_data # free up this memory after the copy
 
 # Startup banner: source kind, doc coverage, resolved gates.
@@ -586,12 +602,16 @@ def _startup_throughput_verdict():
                f"< --startup-throughput-docs={args.startup_throughput_docs}); relying on live monitor")
         return
     src_tok_s = pt / ps
-    req_tok_s = total_batch_size / max(args.target_step_time, 1e-9)
+    # per-rank comparison: this loader (and its counters) feed ONE rank, which
+    # consumes total_batch_size/world tokens per step. Best-fit cropping discards
+    # ~35% of produced tokens, so ratios below ~1.5 are already marginal — the
+    # verdict bands account for that.
+    req_tok_s = total_batch_size / ddp_world_size / max(args.target_step_time, 1e-9)
     ratio = src_tok_s / max(req_tok_s, 1e-9)
     verdict = "OK" if ratio >= 1.5 else ("MARGINAL" if ratio >= 1.0 else "WILL STARVE")
-    print0(f"[staying-ahead] source ~{src_tok_s:,.0f} tok/s ({pd} docs, {ps:.2f}s) vs training "
-           f"~{req_tok_s:,.0f} tok/s (total_batch_size={total_batch_size:,} @ {args.target_step_time}s/step, "
-           f"workers={args.lookup_workers}) => {ratio:.2f}x — {verdict}")
+    print0(f"[staying-ahead] source ~{src_tok_s:,.0f} tok/s ({pd} docs, {ps:.2f}s) vs this rank "
+           f"~{req_tok_s:,.0f} tok/s (total_batch_size={total_batch_size:,} / {ddp_world_size} ranks "
+           f"@ {args.target_step_time}s/step, workers={args.lookup_workers}) => {ratio:.2f}x — {verdict}")
     if verdict == "WILL STARVE" and args.starvation_abort:
         raise SystemExit("[staying-ahead] --starvation-abort: startup verdict WILL STARVE")
 _startup_throughput_verdict()
