@@ -84,12 +84,6 @@ parser.add_argument("--compress-checkpoints", type=int, default=1, help="gzip-co
 parser.add_argument("--checkpoint-compress-level", type=int, default=4, help="gzip level 1-9 for checkpoint compression (higher = smaller files, slower)")
 # Model ablations
 parser.add_argument("--no-value-embeds", action="store_true", help="zero and freeze the ResFormer value-embedding tables so they neither contribute nor learn (matched no-value-embeds control; identical to the default run in every other respect given --seed)")
-# Oracle coord injection (nanochat.oracle; absent => vanilla nanochat: no behavior change, no extra RNG draws)
-parser.add_argument("--inject-coords", type=str, default="", help="path to a coords store dir (coords.int8/index.npy/P.npy/meta.json from scripts/precompute_coords.py); enables contextual coord injection as ONE tabular site (the v2 single-site special case: gate=--inject-beta, frozen direction=the store's P, source=the store)")
-parser.add_argument("--inject-after-block", type=int, default=7, help="0-based block index; coords are added to the residual right AFTER transformer.h[N] runs (default 7 = after 8 completed blocks of 24, depth fraction 8/24 ~= gemma's causal band 8/26)")
-parser.add_argument("--inject-beta", type=float, default=0.05, help="injected per-token RMS as a fraction of the residual per-token RMS at the injection site (the site's gate)")
-parser.add_argument("--inject-noise-sigma", type=float, default=0.15, help="gaussian noise std added to standardized coords at load time (anti-memorization); deterministic per doc-content hash; 0 disables")
-parser.add_argument("--inject-config", type=str, default="", help="path to a JSON injection config for the general multi-site form: {\"sites\": [InjectionCfg dicts], \"sources\": {site_name: {\"kind\": \"coords\", \"dir\": <store>, \"noise_sigma\": 0.15}}}; mutually exclusive with --inject-coords. See nanochat/oracle/README.md")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -177,51 +171,6 @@ print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
 
-# -----------------------------------------------------------------------------
-# Oracle coord injection (nanochat.oracle): build the injection sites BEFORE any
-# checkpoint load, so state_dicts saved by injected runs (which carry
-# injection_sites.* keys) load cleanly. Absent both flags this whole block is
-# skipped: byte-identical vanilla run (site inits draw NO RNG from the global
-# stream either way, so the vanilla init stream is untouched). The legacy flags
-# (--inject-coords/--inject-after-block/--inject-beta/--inject-noise-sigma) are
-# exactly the v2 single-site special case: one tabular site named "coords"
-# (gate=beta, frozen direction = the store's fixed orthonormal P, Qwen coord
-# store as the never-optimizable activation source).
-assert not (args.inject_coords and args.inject_config), "--inject-coords and --inject-config are mutually exclusive"
-injection_cfgs = None            # list[InjectionCfg] when injection is enabled
-injection_source_specs = None    # dict site-name -> activation-source spec
-if args.inject_coords or args.inject_config:
-    import numpy as np
-    from nanochat.oracle.injections import InjectionCfg, reassert_optimizability
-    if args.inject_coords:
-        with open(os.path.join(args.inject_coords, "meta.json")) as f:
-            _store_meta = json.load(f)
-        injection_cfgs = [InjectionCfg(
-            name="coords", r=int(_store_meta["r"]), after_block=args.inject_after_block,
-            gate=args.inject_beta, trainable_direction=False,
-            direction_seed=int(_store_meta.get("p_seed", 1337)))]
-        injection_source_specs = {"coords": {"kind": "coords", "dir": args.inject_coords,
-                                             "noise_sigma": args.inject_noise_sigma}}
-    else:
-        with open(args.inject_config) as f:
-            _inj_spec = json.load(f)
-        injection_cfgs = [InjectionCfg(**d) for d in _inj_spec["sites"]]
-        injection_source_specs = dict(_inj_spec["sources"])
-        assert set(injection_source_specs) == {c.name for c in injection_cfgs}, \
-            "--inject-config: 'sources' keys must match the site names exactly"
-    model.setup_injection_sites(injection_cfgs)
-    if args.inject_coords:
-        # Pin the legacy site's frozen direction to the store's own P.npy
-        # (bit-exact v1 forward even if the store was built with a p_seed that
-        # differs from the cfg default; with matching seeds the fresh init is
-        # already identical -- orthonormal_direction == make_orthonormal_P.T).
-        P = np.load(os.path.join(args.inject_coords, "P.npy"))  # (n_embd, r) float32 orthonormal
-        assert P.shape[0] == model_config.n_embd, (P.shape, model_config.n_embd)
-        assert P.shape[1] == injection_cfgs[0].r, (P.shape, injection_cfgs[0].r)
-        with torch.no_grad():
-            model.injection_sites["coords"].direction.copy_(
-                torch.from_numpy(np.ascontiguousarray(P.T)).to(device))
-
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
@@ -230,22 +179,7 @@ resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
-    if injection_cfgs is not None:
-        # Injected run: a checkpoint saved by an injected run carries
-        # injection_sites.* keys (loaded into the sites built above). A VANILLA
-        # checkpoint may also be warm-started into an injected run: the only
-        # keys allowed to be missing are the sites' own, which then keep their
-        # fresh init. load_state_dict(assign=True) replaces Parameter objects,
-        # so re-stamp the optimizability contract (gate never / direction per
-        # cfg) afterwards, before setup_optimizer.
-        missing, unexpected = model.load_state_dict(model_data, strict=False, assign=True)
-        assert not unexpected, f"unexpected keys in checkpoint: {unexpected}"
-        assert all(k.startswith("injection_sites.") for k in missing), f"missing non-injection keys: {missing}"
-        if missing:
-            print0(f"warm-start: checkpoint has no injection sites; {len(missing)} site tensors keep their fresh init")
-        reassert_optimizability(model.injection_sites)
-    else:
-        model.load_state_dict(model_data, strict=True, assign=True)
+    model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
 # Optional ablation: disable the ResFormer value embeddings. We zero the value-embedding
@@ -260,31 +194,6 @@ if args.no_value_embeds:
             ve.weight.zero_()
             ve.weight.requires_grad_(False)
     print0(f"--no-value-embeds: zeroed + froze {len(model.value_embeds)} value-embedding table(s)")
-
-# Oracle coord injection: construct the activation sources the ride-along
-# dataloader reads (the sites themselves were attached to the model above,
-# before any checkpoint load). Sources are data plumbing, never model state:
-# activations reach the site through a detach, so they are unoptimizable by
-# construction. nanochat uses no DDP module wrapper (grads are all-reduced by
-# DistMuonAdamW only), so there is no param/buffer broadcast to worry about:
-# every rank builds identical sites (seeded init or checkpoint) and reads the
-# same store from disk. Done BEFORE fp8 conversion + torch.compile.
-injection_sources = None
-if injection_cfgs is not None:
-    from nanochat.oracle.coords_store import CoordSource
-    injection_sources = {}
-    for _name, _spec in injection_source_specs.items():
-        _kind = _spec.get("kind", "coords")
-        assert _kind == "coords", (
-            f"unknown activation-source kind {_kind!r} for site {_name!r} "
-            f"(the JSON config supports 'coords'; FnActivation and other sources are programmatic)")
-        _src = CoordSource(_spec["dir"], noise_sigma=float(_spec.get("noise_sigma", 0.15)), seed=args.seed)
-        _cfg = next(c for c in injection_cfgs if c.name == _name)
-        assert _src.r == _cfg.r, f"site {_name!r}: store r={_src.r} != cfg r={_cfg.r}"
-        injection_sources[_name] = _src
-        print0(f"injection site {_name!r}: r={_src.r} after_block={_cfg.after_block} gate={_cfg.gate} "
-               f"trainable_direction={_cfg.trainable_direction} optim={_cfg.optim} "
-               f"noise={float(_spec.get('noise_sigma', 0.15))} docs={len(_src):,}")
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
@@ -453,21 +362,9 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-# Oracle injection: with sites enabled, swap in the ride-along loader (token
-# path mirrors the stock best-fit loader 1:1; adds per-site (B, T, r) activation
-# tensors in lockstep). The val loader stays stock: val bpb is evaluated
-# acts-off (coords-off) by design.
-if injection_sources is not None:
-    from nanochat.oracle.coord_dataloader import acts_data_loader_with_state
-    train_loader = acts_data_loader_with_state(tokenizer, injection_sources, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-else:
-    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
-acts = None  # per-batch dict site-name -> (B, T, r) activations; stays None on the vanilla path
-if injection_sources is not None:
-    x, y, acts, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
-else:
-    x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
@@ -637,11 +534,6 @@ while True:
                 "val_bpb": val_bpb, # loss at last step
                 "model_config": model_config_kwargs,
                 "user_config": user_config, # inputs to the training script
-                # injection provenance (only when enabled; vanilla meta unchanged):
-                # checkpoint_manager.build_model uses injection_sites_config to
-                # rebuild the sites so injection_sites.* state-dict keys load.
-                **({"injection_sites_config": [asdict(c) for c in injection_cfgs],
-                    "injection_source_specs": injection_source_specs} if injection_cfgs is not None else {}),
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,
                 "total_batch_size": total_batch_size,
@@ -667,18 +559,14 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y, acts=acts)  # acts is None on the vanilla path (identical to model(x, y))
+        loss = model(x, y)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        # prefetch the next batch while the GPU is busy with forward/backward
-        if injection_sources is not None:
-            x, y, acts, dataloader_state_dict = next(train_loader)
-        else:
-            x, y, dataloader_state_dict = next(train_loader)
+        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -687,8 +575,7 @@ while True:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
-            if not group.get('injection'):
-                group["weight_decay"] = muon_weight_decay  # injection directions keep wd=0.0 (their scale is normalized away by the site)
+            group["weight_decay"] = muon_weight_decay
     if scaler is not None:
         scaler.unscale_(optimizer)
         # In distributed training, all ranks must agree on whether to skip the step.
