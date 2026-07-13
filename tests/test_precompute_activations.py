@@ -1,37 +1,15 @@
-"""CPU unit tests for scripts/precompute_coords.py (oracle coord precompute producer).
+"""CPU unit tests for scripts/precompute_activations.py (Qwen-encoder flavor).
 
 Script-style on purpose (checks run at import, collected into `fails`; the
-trailing test_* shim asserts none failed under pytest). Standalone run:
-`python tests/test_precompute_coords.py`.
+trailing test_* shim asserts none failed under pytest). Standalone:
+`python tests/test_precompute_activations.py`.
 
-Needs a real probe_set.json (54 concepts / 7 families): resolved from
-$ORACLE_PROBE_SET or the superproject's attribution/out/probe_set.json; the
-whole module SKIPS if neither exists (standalone nanochat checkout).
-
-No GPU / tiktoken / rustbpe / expA checkpoint required. Where the real
-dependencies are unavailable locally we use DOCUMENTED stand-ins:
-  * FakeNanoEnc  -- mimics the tiktoken.Encoding surface precompute uses
-                    (encode_ordinary + decode_single_token_bytes), tokenizing
-                    into byte-exact word/space tokens so byte->char offset
-                    reconstruction (nanochat_char_offsets) partitions the doc
-                    bytes exactly, just like real byte-level BPE.
-  * fake_qwen_encode -- (substr)->(ids,offsets); precompute takes the qwen
-                    tokenizer purely as an injectable callable, so alignment +
-                    build_coords + windowing are exercised without transformers.
-  * tiny Qwen2 model (or a documented stub if Qwen2Model is unavailable) + a
-                    tiny 3K head returning (preds, None) like EncoderHead(expA).
-
-Covered (task item 6):
-  [1] phase-angle mapping spot-checks (3 specific months)
-  [2] one-hot main-block prediction -> correct family ring coordinate (all 54)
-  [3] PCA determinism across two runs
-  [4] int8 round-trip (zero-preserving) within one quant step
-  [5] store-format compatibility: assemble per-shard files, READ with
-      coords_store.CoordSource.lookup -> identical dequantized coords
-  [6] pod-sharding disjointness + coverage
-  [7] char-offset reconstruction partitions bytes incl. multibyte/mid-char
-  [8] end-to-end CoordEngine: batched forward, unmapped tokens -> zero coords,
-      windowing reconstructs full (n,r) in order
+Needs a real probe_set.json (54 concepts / 7 families): $ORACLE_PROBE_SET or
+the superproject's attribution/out/probe_set.json; SKIPS if neither exists.
+No GPU / tiktoken / rustbpe / expA checkpoint required — documented stand-ins
+(FakeNanoEnc*, fake_qwen_encode, tiny Qwen2 or StubModel + TinyHead) exercise
+offsets, alignment, windowing, batching, quantization, store assemble/read,
+sharding, preflight, and merge-stats.
 """
 import json
 import math
@@ -46,8 +24,8 @@ TESTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(TESTS, ".."))          # nanochat repo root
 sys.path.insert(0, REPO)
 
-from scripts import precompute_coords as pc  # noqa: E402
-from nanochat.oracle.coords_store import CoordSource, doc_hash, CYCLIC_ORDER  # noqa: E402
+from scripts import precompute_activations as pc  # noqa: E402
+from nanochat.injection.sources import QwenEncoderSource, doc_hash, CYCLIC_ORDER  # noqa: E402
 
 # The real probe set lives in the superproject (nanochat is its submodule);
 # override with ORACLE_PROBE_SET for any other layout.
@@ -229,8 +207,8 @@ print("\n[0] L8 block column slice")
 check(ps["layers"] == [6, 8, 14], "probe layers == [6,8,14]")
 check(block == 1 and (block * K, (block + 1) * K) == (54, 108),
       f"L8 is block index 1 -> columns [54:108] (got block={block}, K={K})")
-check(len(legend) == 14, "build_coords legend length == r == 14")
-from nanochat.oracle.coords_store import build_coords as _bc  # noqa: E402
+check(len(legend) == 14, "legend length == r == 14")
+from nanochat.injection.sources import build_structured_activations as _bc  # noqa: E402
 _, leg2 = _bc(np.zeros((1, K), np.float32), concepts, families,
               pca=pc._zero_pca(concepts, families), pred_order=pred_order)
 check(leg2 == legend, "legend deterministic")
@@ -372,9 +350,9 @@ except AssertionError:
 
 
 # --------------------------------------------------------------------------- #
-# [8] end-to-end CoordEngine + store-format compatibility with CoordSource
+# [8] end-to-end ActivationEngine + store-format compatibility with the reader
 # --------------------------------------------------------------------------- #
-print("\n[8] CoordEngine forward + assemble + CoordSource read-back")
+print("\n[8] ActivationEngine forward + assemble + store read-back")
 import torch  # noqa: E402
 
 hidden, vocab = 32, 256
@@ -389,7 +367,7 @@ docs.append("word " * 90)   # ~90 nano tokens -> forces windowing at max_doc_tok
 qwen_encode = lambda s: fake_qwen_encode(s, add_special=False)  # noqa: E731
 pad_id = vocab - 1
 
-engine = pc.CoordEngine(model, head, block, K, concepts, families, pca, pred_order,
+engine = pc.ActivationEngine(model, head, block, K, concepts, families, pca, pred_order,
                         r=14, device="cpu", dtype=torch.float32, pad_id=pad_id, batch_seqs=4)
 produced = {}
 for d_i, text in enumerate(docs):
@@ -432,15 +410,15 @@ for text in docs:
     recs.append((np.uint64(doc_hash(text)), np.int64(off), np.int32(n)))
     off += n
 allq = np.concatenate(rows, axis=0)
-allq.tofile(os.path.join(shards_dir, "coords_00000.int8"))
+allq.tofile(os.path.join(shards_dir, "activations_00000.int8"))
 np.save(os.path.join(shards_dir, "index_00000.npy"), np.array(recs, dtype=pc.INDEX_DTYPE))
 json.dump({"sid": 0, "n_docs": len(recs), "n_tokens": int(off), "n_zero_tokens": 0,
            "zero_frac": 0.0, "scale": scale8},
           open(os.path.join(shards_dir, "meta_00000.json"), "w"))
-# a coord_fit.npz so assemble can read scale/legend/stats
-np.savez(os.path.join(STORE, "coord_fit.npz"),
-         pca_components=comp, coord_mean=np.zeros(14, np.float32),
-         coord_std=np.ones(14, np.float32), scale=np.float32(scale8),
+# an encoder_fit.npz so assemble can read scale/legend/stats
+np.savez(os.path.join(STORE, "encoder_fit.npz"),
+         pca_components=comp, act_mean=np.zeros(14, np.float32),
+         act_std=np.ones(14, np.float32), scale=np.float32(scale8),
          clip_sigma=np.float32(6.0), legend=np.array(legend),
          pred_order=np.array(pred_order), block=np.int64(block), n_fit=np.int64(1))
 
@@ -449,7 +427,7 @@ A = types.SimpleNamespace(out=STORE, shards="0-0", probe_set=PROBE_SET, layer8_b
 pc.run_assemble(A)
 
 # READ back with the real consumer
-cs = CoordSource(STORE, noise_sigma=0.0)
+cs = QwenEncoderSource(STORE, noise_sigma=0.0)
 meta = json.load(open(os.path.join(STORE, "meta.json")))
 check(meta["r"] == 14 and abs(meta["scale"] - scale8) < 1e-6, "meta.json has r=14 + fit scale")
 check(meta["block_columns"] == [54, 108], "meta records L8 block columns [54,108]")
@@ -468,7 +446,7 @@ for text in docs:
     want = pc.quantize(cc, scale8).astype(np.float32) * scale8
     if got is None or not np.array_equal(got, want):
         roundtrip_ok = False
-check(roundtrip_ok, "CoordSource.lookup returns exactly the assembled+dequantized coords")
+check(roundtrip_ok, "store lookup returns exactly the assembled+dequantized activations")
 # length-mismatch + missing fall back to None (consumer contract)
 some = docs[0]
 check(cs.lookup(some, len(enc8.encode_ordinary(some)) + 1)[0] is None, "n mismatch -> None")
@@ -479,7 +457,7 @@ check(cs.lookup("a document never stored anywhere", 5)[0] is None, "missing doc 
 ws = "   \n  \t "
 hshw, nw, segsw = pc.iter_doc_segments(ws, enc8, qwen_encode, max_nano=40, max_qwen=4096)
 if nw > 0:
-    engine2 = pc.CoordEngine(model, head, block, K, concepts, families, pca, pred_order,
+    engine2 = pc.ActivationEngine(model, head, block, K, concepts, families, pca, pred_order,
                              14, "cpu", torch.float32, pad_id, batch_seqs=4)
     engine2.add_doc(("w", 0), hshw, nw, segsw)
     outw = list(engine2.drain())
@@ -495,7 +473,7 @@ else:
 print("\n[9] chunked flush equivalence (batch_seqs=1 vs 4)")
 prod_by_bs = {}
 for bs in (1, 4):
-    eng = pc.CoordEngine(model, head, block, K, concepts, families, pca, pred_order,
+    eng = pc.ActivationEngine(model, head, block, K, concepts, families, pca, pred_order,
                          14, "cpu", torch.float32, pad_id, batch_seqs=bs)
     got = {}
     for d_i, text in enumerate(docs):
@@ -511,7 +489,7 @@ ok9 = set(prod_by_bs[1]) == set(prod_by_bs[4]) and all(
 check(ok9, "coords identical across flush chunk sizes (long doc spans >1 chunk)")
 
 # _RawPredEngine (fit mode) through the same chunked-flush path: raw L8 preds,
-# per-doc row counts, and consistency with CoordEngine's build_coords output.
+# per-doc row counts, and consistency with ActivationEngine's output.
 raw_eng = pc._RawPredEngine(model, head, block, K, "cpu", torch.float32, pad_id, batch_seqs=2)
 raw_rows = []
 for text in docs:
@@ -525,12 +503,12 @@ n_expected = sum(len(enc8.encode_ordinary(t)) for t in docs)
 raw_all = np.concatenate(raw_rows, axis=0)
 check(raw_all.shape == (n_expected, K),
       f"_RawPredEngine emits raw preds [{n_expected},{K}] across all docs (got {raw_all.shape})")
-# building coords from one raw doc's preds must equal the CoordEngine output
+# building activations from one raw doc's preds must equal the engine output
 h0 = int(doc_hash(docs[0]))
 raw0 = next(rr for rr in raw_rows if rr.shape[0] == len(enc8.encode_ordinary(docs[0]))
-            and np.allclose(pc.build_coords(rr, concepts, families, pca=pca,
+            and np.allclose(pc.build_structured_activations(rr, concepts, families, pca=pca,
                                             pred_order=pred_order)[0], prod_by_bs[4][h0], atol=1e-4))
-check(raw0 is not None, "build_coords(_RawPredEngine preds) == CoordEngine coords (fit/sweep parity)")
+check(raw0 is not None, "build on raw preds == ActivationEngine output (fit/sweep parity)")
 
 
 # --------------------------------------------------------------------------- #
@@ -549,7 +527,7 @@ def _run_ff(fast, mbt=48, sb=6):
     # path accumulates a full seg_buffer before a bucketed flush, then a final
     # drain() to flush the tail. (A per-doc final=True drain would collapse fast
     # batches to one doc and never exercise real cross-doc bucketing.)
-    eng = pc.CoordEngine(model, head, block, K, concepts, families, pca, pred_order,
+    eng = pc.ActivationEngine(model, head, block, K, concepts, families, pca, pred_order,
                          14, "cpu", torch.float32, pad_id, batch_seqs=4,
                          fast_forward=fast, max_batch_tokens=mbt, seg_buffer=sb)
     out = {}
@@ -654,11 +632,11 @@ json.dump({"sid": 0, "welford": wa.to_dict()}, open(os.path.join(STATS, "shards"
 json.dump({"sid": 1, "welford": wb.to_dict()}, open(os.path.join(STATS, "shards", "meta_00001.json"), "w"))
 json.dump({"sid": 2}, open(os.path.join(STATS, "shards", "meta_00002.json"), "w"))  # no welford: tolerated
 pc.run_merge_stats(types.SimpleNamespace(out=STATS))
-cst = json.load(open(os.path.join(STATS, "corpus_coord_stats.json")))
+cst = json.load(open(os.path.join(STATS, "corpus_activation_stats.json")))
 xall = np.concatenate([xa, xb], axis=0)
 check(cst["n"] == 1300
-      and np.allclose(cst["coord_mean_observed"], xall.mean(0), atol=1e-9)
-      and np.allclose(cst["coord_std_observed"], xall.std(0), atol=1e-9),
+      and np.allclose(cst["activation_mean_observed"], xall.mean(0), atol=1e-9)
+      and np.allclose(cst["activation_std_observed"], xall.std(0), atol=1e-9),
       "merged per-shard Welford == direct mean/std over the union")
 
 
@@ -668,6 +646,6 @@ if __name__ == "__main__":
     sys.exit(1 if fails else 0)
 
 
-def test_precompute_coords():
+def test_precompute_activations():
     """All checks above ran at module import, collecting into `fails`."""
     assert not fails, f"{len(fails)} failures: {fails}"

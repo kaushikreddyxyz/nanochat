@@ -1,29 +1,14 @@
-"""Oracle plumbing smoke test (CPU) — geometric-manifold injection in nanochat.
+"""Smoke test (CPU) for the geometric-manifold injection: reproducibility,
+manifold geometry, inject on/off gating, frozenness, and end-to-end uptake
+(with wte + value_embeds zeroed/frozen the injected ring is the only per-token
+signal; training must use it and ablating it must spike CE).
 
-The nanochat-side analogue of ``modular_addition/oracle/experiments/exp00_smoke``:
-validates the whole oracle path end-to-end on a laptop (fp32, CPU, tiny model,
-no wandb / no data downloads). NOT a real pretraining run.
-
-Sub-tests
-  1. reproducibility — same seed builds the same model.
-  2. geometry — ring/sphere coords are unit-norm & evenly spaced; the table is
-     ``amp`` on the chosen ids, exactly zero elsewhere.
-  3. inject gate / ablation identity — the oracle changes the forward when on;
-     ``inject=False`` is bit-identical to having no oracle at all.
-  4. frozen oracle — the table is not a Parameter, takes no grad, and is
-     unchanged by an optimizer step.
-  5. end-to-end uptake — on a ring-rotation task with the token-identity
-     embeddings (wte + value_embeds) zeroed and frozen, the oracle is the ONLY
-     per-token signal; training drives loss down and ablating the oracle at eval
-     spikes cross-entropy back to ~uniform (large ΔCE) — i.e. the model learned
-     to USE the injected geometry.
-
-Run:  cd nanochat && python -m nanochat.oracle.smoke
+Run:  cd nanochat && python -m nanochat.injection.smoke
 """
 import torch
 
 from nanochat.gpt import GPT, GPTConfig
-from nanochat.oracle import inject
+from nanochat.injection import inject
 
 
 # --------------------------------------------------------------------------- #
@@ -197,7 +182,7 @@ def test_end_to_end_uptake(steps=600, lr=1e-2, batch=128):
 
 def main():
     torch.use_deterministic_algorithms(False)   # SDPA fallback has non-deterministic kernels; fine for a smoke test
-    print(f"oracle smoke test — device={DEVICE}, N_RING={N_RING}, T={T}")
+    print(f"injection smoke test — device={DEVICE}, N_RING={N_RING}, T={T}")
     test_reproducibility()
     test_geometry()
     test_inject_gate()

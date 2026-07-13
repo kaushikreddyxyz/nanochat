@@ -1,19 +1,11 @@
-"""CPU validation of the oracle coord ride-along loader.
-
-Checks, against the REAL nanochat packing source (extracted by ast from
-nanochat/dataloader.py, so the reference cannot drift from what trains):
-  1. token lockstep: inputs/targets from coord_data_loader_with_state are
-     bit-identical to the stock bos_bestfit loader on the same doc stream;
-  2. coord correctness: every packed position's coord equals the store's coord
-     for exactly that (doc, body-token-index), through best-fit picks AND crops;
-  3. BOS rows and docs missing from the store get EXACTLY zero coords, even
-     with noise_sigma > 0 (the injection-no-op fallback);
-  4. noise is deterministic per (seed, doc-hash) and reproducible;
-  5. CoordSource int8 round-trip is exact for on-grid values;
-  6. loader determinism: a second instantiation yields identical batches.
+"""CPU validation of the ride-along activation loader against the REAL
+nanochat packing source (ast-extracted from nanochat/dataloader.py so the
+reference cannot drift): bit-identical token stream, activation<->token
+alignment through best-fit + crops, exact-zero BOS / missing-doc rows even
+with noise on, deterministic noise, store int8 round-trip, injection math.
 
 Script-style on purpose (runs at import; the trailing test_* shim makes pytest
-report it): `python tests/test_coord_lockstep.py` also works standalone.
+report it): `python tests/test_activation_lockstep.py` also works standalone.
 ``nanochat.dataloader`` is stubbed in sys.modules (it needs pyarrow + real
 parquet shards); the stub is removed again at the end of the module.
 """
@@ -29,7 +21,7 @@ import torch
 
 TESTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(TESTS, ".."))          # nanochat repo root
-STORE = tempfile.mkdtemp(prefix="oracle_coord_store_test_")
+STORE = tempfile.mkdtemp(prefix="activation_store_test_")
 sys.path.insert(0, REPO)
 
 # ---------------------------------------------------------------- fake corpus
@@ -87,17 +79,16 @@ def fake_batches_factory(tokenizer_batch_size):
 
 # ---------------------------------------------- stub nanochat.dataloader ONLY
 # (the real module imports pyarrow and lists real parquet shards; the loader
-# under test only needs _document_batches). The real nanochat package stays
-# importable -- coord_dataloader now lives inside it.
+# under test only needs _document_batches)
 fake_dl_mod = types.ModuleType("nanochat.dataloader")
 _batch_stream = {"it": None}
 fake_dl_mod._document_batches = lambda split, resume, tbs: _batch_stream["it"]
 _prev_dl_mod = sys.modules.get("nanochat.dataloader")
 sys.modules["nanochat.dataloader"] = fake_dl_mod
-sys.modules.pop("nanochat.oracle.coord_dataloader", None)  # force rebind to the stub
+sys.modules.pop("nanochat.injection.activation_dataloader", None)  # force rebind to the stub
 
-from nanochat.oracle.coords_store import CoordSource, doc_hash  # noqa: E402
-from nanochat.oracle.coord_dataloader import coord_data_loader_with_state  # noqa: E402
+from nanochat.injection.sources import QwenEncoderSource, doc_hash  # noqa: E402
+from nanochat.injection.activation_dataloader import acts_data_loader_with_state  # noqa: E402
 
 # ------------------------------------------------- extract REAL stock loader by ast
 src_path = os.path.join(REPO, "nanochat", "dataloader.py")
@@ -108,7 +99,7 @@ ns = {"torch": torch, "_document_batches": fake_dl_mod._document_batches}
 exec(compile(ast.Module(body=[fn], type_ignores=[]), src_path, "exec"), ns)
 stock_loader_fn = ns["tokenizing_distributed_data_loader_with_state_bos_bestfit"]
 
-# ------------------------------------------------- build the coord store on disk
+# ------------------------------------------------- build the activation store on disk
 os.makedirs(STORE, exist_ok=True)
 rows, recs, off = [], [], 0
 for i in range(N_DOCS):
@@ -121,24 +112,25 @@ for i in range(N_DOCS):
     recs.append((doc_hash(doc_text(i)), off, stored_n))
     off += stored_n
 allq = np.concatenate(rows, axis=0)
-allq.tofile(os.path.join(STORE, "coords.int8"))
+allq.tofile(os.path.join(STORE, "activations.int8"))
 index = np.array(recs, dtype=[("hash", "<u8"), ("off", "<i8"), ("n", "<i4")])
 np.save(os.path.join(STORE, "index.npy"), index)
-json.dump({"r": R, "scale": SCALE}, open(os.path.join(STORE, "meta.json"), "w"))
+json.dump({"format": "activation-store-v2", "source_kind": "qwen-encoder",
+           "r": R, "scale": SCALE}, open(os.path.join(STORE, "meta.json"), "w"))
 
 B, T, NB = 2, 16, 40  # NB batches ~ 2*17*2*40 tokens >> one epoch of docs
 
 
-def run_coord_loader(noise_sigma, seed=1337):
+def run_acts_loader(noise_sigma, seed=1337):
     _batch_stream["it"] = fake_batches_factory(128)
-    cs = CoordSource(STORE, noise_sigma=noise_sigma, seed=seed)
-    it = coord_data_loader_with_state(FakeTok(), cs, B, T, split="train",
-                                      device="cpu", buffer_size=8)
+    src = QwenEncoderSource(STORE, noise_sigma=noise_sigma, seed=seed, name="acts")
+    it = acts_data_loader_with_state(FakeTok(), {"acts": src}, B, T, split="train",
+                                     device="cpu", buffer_size=8)
     out = []
     for _ in range(NB):
-        x, y, z, st = next(it)
-        out.append((x.clone(), y.clone(), z.clone(), dict(st)))
-    return out, cs
+        x, y, acts, st = next(it)
+        out.append((x.clone(), y.clone(), acts["acts"].clone(), dict(st)))
+    return out, src
 
 
 def run_stock_loader():
@@ -151,16 +143,16 @@ def run_stock_loader():
     return out
 
 
-def expected_coord(v, cs):
-    """Expected coord row for packed token value v under CoordSource cs."""
+def expected_act(v, src):
+    """Expected activation row for packed token value v under source src."""
     if v == BOS:
         return np.zeros(R, np.float32)
     i, j = (v - 1) // 10000, (v - 1) % 10000
     if i in MISSING or i in MISMATCH:
         return np.zeros(R, np.float32)
     base = int8_vals(i, int(DOC_LENS[i])).astype(np.float32) * SCALE
-    if cs.noise_sigma > 0:
-        base = cs.add_noise(base, int(doc_hash(doc_text(i))))
+    if src.noise_sigma > 0:
+        base = src.add_noise(base, int(doc_hash(doc_text(i))))
     return base[j]
 
 
@@ -168,8 +160,8 @@ fails = 0
 
 # --- 1. token lockstep vs the real packing code ---
 stock = run_stock_loader()
-coord0, cs0 = run_coord_loader(noise_sigma=0.0)
-for k, ((sx, sy, sst), (cx, cy, cz, cst)) in enumerate(zip(stock, coord0)):
+acts0, src0 = run_acts_loader(noise_sigma=0.0)
+for k, ((sx, sy, sst), (cx, cy, cz, cst)) in enumerate(zip(stock, acts0)):
     assert torch.equal(sx, cx) and torch.equal(sy, cy), f"token desync at batch {k}"
     assert sst == cst, f"state desync at batch {k}: {sst} vs {cst}"
 print(f"[1] token lockstep vs real bos_bestfit source: OK ({NB} batches, B={B}, T={T})")
@@ -178,64 +170,85 @@ print(f"[1] token lockstep vs real bos_bestfit source: OK ({NB} batches, B={B}, 
 n_bos = sum(int((x == BOS).sum()) for x, _, _ in stock)
 print(f"    (packed {NB*B*T} positions, {n_bos} BOS rows; doc lens 3..40 vs capacity 17 -> crops exercised)")
 
-# --- 2/3. coord correctness incl. crops, BOS, missing docs (noise=0) ---
+# --- 2/3. activation correctness incl. crops, BOS, missing docs (noise=0) ---
 checked = 0
-for x, y, z, _ in coord0:
+for x, y, z, _ in acts0:
     xn, zn = x.numpy(), z.numpy()
     for b in range(B):
         for t in range(T):
-            exp = expected_coord(int(xn[b, t]), cs0)
+            exp = expected_act(int(xn[b, t]), src0)
             if not np.allclose(zn[b, t], exp, atol=0, rtol=0):
                 fails += 1
                 if fails < 5:
                     print(f"MISMATCH b={b} t={t} tok={xn[b,t]} got={zn[b,t][:3]} exp={exp[:3]}")
             checked += 1
-assert fails == 0, f"{fails} coord mismatches (noise=0)"
-print(f"[2] coord<->token alignment exact through best-fit+crop: OK ({checked} positions)")
-miss_seen = sum(int(((x.numpy() != BOS) & ((x.numpy() - 1) // 10000 % 9 == 0)).sum()) for x, _, _, _ in coord0)
-print(f"[3] BOS + missing/mismatch docs -> exact zero coords: OK ({n_bos} BOS, {miss_seen} missing-doc positions)")
+assert fails == 0, f"{fails} activation mismatches (noise=0)"
+print(f"[2] activation<->token alignment exact through best-fit+crop: OK ({checked} positions)")
+miss_seen = sum(int(((x.numpy() != BOS) & ((x.numpy() - 1) // 10000 % 9 == 0)).sum()) for x, _, _, _ in acts0)
+print(f"[3] BOS + missing/mismatch docs -> exact zero activations: OK ({n_bos} BOS, {miss_seen} missing-doc positions)")
 
 # --- 3b/4. noise path: missing docs still EXACT zero; noise deterministic ---
-coordN, csN = run_coord_loader(noise_sigma=0.15)
-coordN2, _ = run_coord_loader(noise_sigma=0.15)
+actsN, srcN = run_acts_loader(noise_sigma=0.15)
+actsN2, _ = run_acts_loader(noise_sigma=0.15)
 nz_checked = zero_checked = 0
-for (x, y, z, _), (x2, y2, z2, _) in zip(coordN, coordN2):
+for (x, y, z, _), (x2, y2, z2, _) in zip(actsN, actsN2):
     assert torch.equal(z, z2), "noise not deterministic across loader instantiations"
     xn, zn = x.numpy(), z.numpy()
     for b in range(B):
         for t in range(T):
             v = int(xn[b, t])
-            exp = expected_coord(v, csN)
-            assert np.allclose(zn[b, t], exp, atol=1e-6), f"noisy coord mismatch tok={v}"
+            exp = expected_act(v, srcN)
+            assert np.allclose(zn[b, t], exp, atol=1e-6), f"noisy activation mismatch tok={v}"
             if v != BOS and ((v - 1) // 10000 in MISSING or (v - 1) // 10000 in MISMATCH):
-                assert np.all(zn[b, t] == 0.0), "missing doc got NOISED coords (injection would fire!)"
+                assert np.all(zn[b, t] == 0.0), "missing doc got NOISED activations (injection would fire!)"
                 zero_checked += 1
             elif v != BOS:
                 nz_checked += 1
-assert torch.equal(coordN[0][0], coord0[0][0]), "noise changed the TOKEN stream"
+assert torch.equal(actsN[0][0], acts0[0][0]), "noise changed the TOKEN stream"
 print(f"[4] noise=0.15: per-doc-hash deterministic, tokens unchanged, "
       f"missing docs exactly zero: OK ({nz_checked} noised, {zero_checked} zero-fallback positions)")
 
-# --- 5. CoordSource round-trip ---
+# --- 5. store round-trip ---
 i_ok = next(i for i in range(N_DOCS) if i not in MISSING and i not in MISMATCH)
-z, h = cs0.lookup(doc_text(i_ok), int(DOC_LENS[i_ok]))
+z, h = src0.lookup(doc_text(i_ok), int(DOC_LENS[i_ok]))
 assert z is not None and np.array_equal(z, int8_vals(i_ok, int(DOC_LENS[i_ok])).astype(np.float32) * SCALE)
-assert cs0.lookup(doc_text(list(MISSING)[1]), int(DOC_LENS[list(MISSING)[1]]))[0] is None
-assert cs0.lookup(doc_text(5), int(DOC_LENS[5]))[0] is None  # stored-n mismatch
-assert cs0.lookup(doc_text(i_ok), int(DOC_LENS[i_ok]) + 1)[0] is None  # queried-n mismatch
-print(f"[5] CoordSource int8 round-trip exact; miss/length-mismatch -> None: OK (docs={len(cs0)})")
+assert src0.lookup(doc_text(list(MISSING)[1]), int(DOC_LENS[list(MISSING)[1]]))[0] is None
+assert src0.lookup(doc_text(5), int(DOC_LENS[5]))[0] is None  # stored-n mismatch
+assert src0.lookup(doc_text(i_ok), int(DOC_LENS[i_ok]) + 1)[0] is None  # queried-n mismatch
+print(f"[5] store int8 round-trip exact; miss/length-mismatch -> None: OK (docs={len(src0)})")
 
-# --- 6. injection math on CPU (zero coords -> exact no-op; beta convention) ---
+# --- 5b. reader validates format + source_kind ---
+BAD = tempfile.mkdtemp(prefix="activation_store_bad_")
+allq.tofile(os.path.join(BAD, "activations.int8"))
+np.save(os.path.join(BAD, "index.npy"), index)
+json.dump({"r": R, "scale": SCALE}, open(os.path.join(BAD, "meta.json"), "w"))  # pre-v2 meta
+try:
+    QwenEncoderSource(BAD)
+    raise AssertionError("reader must reject a store without format=activation-store-v2")
+except ValueError:
+    pass
+json.dump({"format": "activation-store-v2", "source_kind": "probe-scores",
+           "r": R, "scale": SCALE}, open(os.path.join(BAD, "meta.json"), "w"))
+try:
+    QwenEncoderSource(BAD)
+    raise AssertionError("QwenEncoderSource must reject a probe-scores store")
+except ValueError:
+    pass
+from nanochat.injection.sources import ProbeScoreSource, open_store  # noqa: E402
+assert isinstance(open_store(BAD), ProbeScoreSource), "open_store must dispatch on source_kind"
+print("[5b] reader enforces format/source_kind; open_store dispatches: OK")
+
+# --- 6. injection math on CPU (zero activations -> exact no-op; gate convention) ---
 x = torch.randn(2, 8, 32, dtype=torch.float32)
 P = torch.linalg.qr(torch.randn(32, R, dtype=torch.float64))[0].to(torch.float32)
 beta = 0.05
-def inject(x, coords):
-    zc = coords.to(x.dtype) @ P.t()
+def inject(x, acts):
+    zc = acts.to(x.dtype) @ P.t()
     rms_x = x.pow(2).mean(-1, keepdim=True).clamp_min(1e-8).sqrt()
     rms_z = zc.pow(2).mean(-1, keepdim=True).clamp_min(1e-8).sqrt()
     return x + beta * (rms_x / rms_z) * zc
 out0 = inject(x, torch.zeros(2, 8, R))
-assert torch.equal(out0, x), "zero coords must be an EXACT no-op"
+assert torch.equal(out0, x), "zero activations must be an EXACT no-op"
 zr = torch.randn(2, 8, R)
 outr = inject(x, zr)
 d = outr - x
@@ -245,21 +258,20 @@ assert torch.isfinite(outr).all()
 mixed = zr.clone(); mixed[0, :4] = 0.0
 outm = inject(x, mixed)
 assert torch.equal(outm[0, :4], x[0, :4]) and torch.isfinite(outm).all()
-print(f"[6] injection math: zero rows exact no-op; per-token injected RMS == beta*RMS(x) "
+print(f"[6] injection math: zero rows exact no-op; per-token injected RMS == gate*RMS(x) "
       f"(max dev {float((ratio-beta).abs().max()):.2e}); mixed zero/nonzero rows no NaN: OK")
 
 print("\nALL CHECKS PASSED")
 
 # ---------------------------------------------- un-stub nanochat.dataloader
-# so later imports in the same process/pytest session get the real module
-# (coord_dataloader is popped too: it holds a binding to the stub).
+# (activation_dataloader is popped too: it holds a binding to the stub)
 if _prev_dl_mod is not None:
     sys.modules["nanochat.dataloader"] = _prev_dl_mod
 else:
     sys.modules.pop("nanochat.dataloader", None)
-sys.modules.pop("nanochat.oracle.coord_dataloader", None)
+sys.modules.pop("nanochat.injection.activation_dataloader", None)
 
 
-def test_coord_lockstep():
+def test_activation_lockstep():
     """All checks above ran (assert-based) at module import; reaching this
     no-op test means every one of them passed."""

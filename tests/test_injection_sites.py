@@ -1,23 +1,8 @@
-"""CPU tests for nanochat.oracle.injections (v2 injection sites) and their
-wiring into GPT.
-
-Pins the invariants the injection design depends on:
-  * v1/v2 forward-value equivalence: the retired inline v1 math
-    ``x + beta*(rms_x/rms_z)*zc`` (fixed orthonormal P) equals the
-    InjectionSite forward ``x + gate*rms_x.detach()*z/rms_z`` with
-    direction = P.T and gate = beta -- identical forward values; the detach
-    only changes gradients, deliberately.
-  * RMS calibration: injected per-token RMS == gate * per-token RMS(x).
-  * zero activation rows are an EXACT no-op (bitwise).
-  * gate=0 is an exact forward no-op AND blocks all gradient to the direction,
-    while the gate itself still receives a gradient (loggable want-signal).
-  * optimizer contract: gates never appear in the split; frozen directions
-    excluded; trainable directions bucketed adamw/muon per cfg.
-  * state_dict carries exactly {gate, direction, channel_weights} per site.
-  * GPT integration: acts=None forward is bit-identical to a vanilla model,
-    setup_optimizer covers/excludes the right params, optimizer steps leave
-    gates + frozen directions untouched.
-"""
+"""CPU tests for nanochat.injection.sites and their wiring into GPT: v1/v2
+forward-value equivalence, RMS calibration, exact zero-row no-op, gate=0
+no-op + blocked direction grads (gate still gets its want-signal), the
+optimizer contract (gates in no group, frozen skipped, trainable bucketed
+adamw/muon), state-dict keys, and acts=None == vanilla."""
 import os
 import sys
 
@@ -28,8 +13,8 @@ TESTS = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(TESTS, ".."))
 sys.path.insert(0, REPO)
 
-from nanochat.oracle.coords_store import make_orthonormal_P  # noqa: E402
-from nanochat.oracle.injections import (  # noqa: E402
+from nanochat.injection.sources import make_orthonormal_P  # noqa: E402
+from nanochat.injection.sites import (  # noqa: E402
     InjectionCfg,
     InjectionSite,
     build_sites,
@@ -40,6 +25,12 @@ from nanochat.oracle.injections import (  # noqa: E402
 )
 
 B, T, N_EMBD, R = 2, 8, 64, 14
+
+
+def test_gate_default_is_full_loudness():
+    # Default gate is 1.0 (injected RMS == residual RMS). Reproducing the v1
+    # run requires passing gate=0.05 explicitly.
+    assert InjectionCfg(name="d", r=R, after_block=0).gate == 1.0
 
 
 def _v1_inject(x, coords, P, beta):

@@ -21,7 +21,7 @@ import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW, DistMuonAdamW
-from nanochat.oracle.injections import build_sites, sites_by_block, optimizer_param_split
+from nanochat.injection.sites import build_sites, sites_by_block, optimizer_param_split
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
@@ -315,17 +315,11 @@ class GPT(nn.Module):
         return self.transformer.wte.weight.device
 
     def setup_injection_sites(self, cfgs):
-        """Build the oracle injection sites (nanochat.oracle.injections) and
-        attach them as ``self.injection_sites`` (nn.ModuleDict, so trainable
-        directions are registered for the optimizer and checkpoints).
-
-        ``cfgs`` is a list of InjectionCfg (or plain dicts). Call AFTER the
-        model is materialized (to_empty + init_weights) and BEFORE any
-        state-dict load, setup_optimizer, or torch.compile. Draws NO RNG from
-        the global stream (site inits use their own seeded generators), so the
-        vanilla init stream is untouched. Absent this call the model is
-        byte-identical to vanilla: no extra params, no forward change.
-        """
+        """Attach injection sites (nanochat.injection.sites) as
+        ``self.injection_sites``. cfgs: list[InjectionCfg | dict]. Call AFTER
+        materialization (to_empty + init_weights), BEFORE any state-dict load /
+        setup_optimizer / torch.compile. Draws no RNG from the global stream;
+        absent this call the model is byte-identical to vanilla."""
         assert self.transformer.wte.weight.device.type != "meta", \
             "setup_injection_sites: materialize the model first (to_empty + init_weights)"
         sites = build_sites(cfgs, self.config.n_embd)
@@ -355,10 +349,8 @@ class GPT(nn.Module):
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
                           self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
-        # Oracle injection sites (when attached) are excluded like the other
-        # non-scaling params: the per-site (r, n_embd) direction matmul is
-        # negligible next to the trunk, and eval/vanilla forwards (acts=None)
-        # never execute it — keeping reported FLOPs comparable to the baseline.
+        # Injection sites (when attached) excluded too: keeps reported FLOPs
+        # comparable to the baseline (eval/vanilla forwards never run them).
         if hasattr(self, "injection_sites"):
             nparams_exclude += sum(p.numel() for p in self.injection_sites.parameters())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
@@ -389,8 +381,7 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        # Oracle injection sites (when attached): counted separately so the
-        # scaling-law groups above stay comparable to vanilla runs.
+        # Injection sites counted separately so the groups above stay comparable to vanilla runs
         injection = sum(p.numel() for p in self.injection_sites.parameters()) if hasattr(self, "injection_sites") else 0
         total = wte + value_embeds + lm_head + transformer_matrices + scalars + injection
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
@@ -403,7 +394,7 @@ class GPT(nn.Module):
             'total': total,
         }
         if injection:
-            out['injection'] = injection  # only present when sites are attached (vanilla output unchanged)
+            out['injection'] = injection  # key only present when sites are attached
         return out
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
@@ -418,11 +409,9 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        # Oracle injection sites (when attached): the optimizer contract from
-        # nanochat.oracle.injections — gates (_never_optimize) go in NO group
-        # (grads are assigned every backward as a loggable want-signal but never
-        # stepped); frozen directions are skipped; trainable directions join the
-        # AdamW group by default, or Muon per-site via cfg.optim="muon".
+        # Injection-site optimizer contract: gates (_never_optimize) go in NO
+        # group (grads assigned but never stepped); frozen directions skipped;
+        # trainable directions join AdamW by default or Muon via cfg.optim.
         injection_sites = getattr(self, "injection_sites", None)
         injection_params = list(injection_sites.parameters()) if injection_sites is not None else []
         inj_adamw, inj_muon = optimizer_param_split(injection_sites) if injection_sites is not None else ([], [])
@@ -449,11 +438,10 @@ class GPT(nn.Module):
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
             ))
-        # Trainable injection directions. Weight decay is 0.0 in both flavors:
-        # the site normalizes the direction's scale away (z / rms(z)), so decay
-        # is a pure no-op on the forward that only shrinks the matrix toward the
-        # rms clamp — never decay it. The `injection` tag lets base_train's
-        # scheduler loop skip its weight-decay override for these muon groups.
+        # Trainable injection directions: weight decay MUST stay 0.0 — the site
+        # normalizes the direction's scale away (z / rms(z)), so decay only
+        # shrinks the matrix toward the rms clamp. The `injection` tag lets the
+        # training script's wd scheduler skip these muon groups.
         if inj_adamw:
             param_groups.append(dict(
                 kind='adamw', params=inj_adamw, lr=embedding_lr * dmodel_lr_scale,
@@ -507,16 +495,10 @@ class GPT(nn.Module):
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
                 x = x + gate * x_pre_smear
 
-        # Oracle injection (oracle-encodings): a frozen, per-token-id additive
-        # feature placed in the residual stream right before the trunk -- the
-        # RoPE-era analogue of adding a positional encoding to the embedding.
-        # Added *after* norm (so its amplitude is controllable, not normed away)
-        # and *after* smear (so it stays an exact per-token signal), and folded
-        # into x0 below so it persists via the x0 residual. No-op unless an
-        # oracle is attached (see nanochat.oracle.inject.attach_oracle); the
-        # self.inject gate flips it off for ablation (ΔCE) / delayed injection.
-        # The same path serves training and kv-cache decode: oracle_fn(idx)
-        # returns the rows for whatever tokens are in idx.
+        # Geometric-manifold injection (nanochat.injection.inject): frozen
+        # per-token-id feature, added after norm + smear (amplitude must not be
+        # normed away; must stay an exact per-token signal) and folded into x0.
+        # No-op unless attached; self.inject gates it off for ablation.
         oracle_fn = getattr(self, "oracle_fn", None)
         if oracle_fn is not None and getattr(self, "inject", True):
             x = x + oracle_fn(idx).to(x.dtype)
@@ -526,19 +508,12 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
-        # Oracle coord-injection sites (nanochat.oracle.injections): after each
-        # site's block, add the site's activation, mapped into the residual by
-        # its direction and scaled so the injected per-token RMS over n_embd is
-        # exactly `gate` * per-token RMS(residual) (rms(v) = sqrt(mean_j v_j^2),
-        # keepdim over the last dim). `acts` is a dict site-name -> (B, T, r)
-        # no-grad tensor produced by the ride-along dataloader (base_train);
-        # eval/inference passes acts=None (coords-off by design). Zero
-        # activation rows (BOS / doc missing from the precompute) inject
-        # exactly 0 via the rms clamp (no NaN, no branch). `acts is None` and
-        # the by-block site map are trace-time constants for a given run, and
-        # the site body is pure matmul/elementwise, so torch.compile sees no
-        # data-dependent control flow (no graph break). Absent injection
-        # (acts=None, no sites attached) this is a no-op with zero extra compute.
+        # Injection sites (nanochat.injection.sites): each site fires after its
+        # block; `acts` is a dict site-name -> (B, T, r) no-grad tensor from the
+        # ride-along dataloader. acts=None (eval/inference/vanilla) is
+        # bit-identical to a model without sites, with zero extra compute; both
+        # `acts is None` and the by-block map are trace-time constants, so
+        # torch.compile sees no data-dependent control flow.
         inject_by_block = getattr(self, "_injection_by_block", None) if acts is not None else None
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0

@@ -2,7 +2,7 @@
 
 Vendored verbatim from the oracle-encodings superproject (stage-7 oracle
 ``align.py``, prefix mode validated at 7.08% gemma->qwen crossing) so that
-``scripts/precompute_coords.py`` -- which aligns the frozen-encoder (qwen)
+``scripts/precompute_activations.py`` -- which aligns the frozen-encoder (qwen)
 tokenization onto nanochat tokens -- is self-contained in this repo. The API
 is frozen; if the upstream module changes, re-vendor deliberately.
 

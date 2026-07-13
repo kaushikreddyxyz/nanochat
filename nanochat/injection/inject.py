@@ -1,33 +1,14 @@
-"""Oracle-feature injection mechanism (geometric-manifold features).
+"""Geometric-manifold feature injection (sibling of
+``modular_addition/oracle/inject.py``): a frozen vector, a pure function of the
+token id, ADDED into the residual right before the trunk (see the guarded hook
+in ``GPT.forward``). Token ids sit on a ring/line/sphere/helix in a few
+reserved residual dims; generators return unit-norm rows so ``amp`` is exactly
+the per-token feature norm.
 
-Mirrors ``modular_addition/oracle/inject.py``: a *frozen* (non-trainable) vector
-that is linearly ADDED into the residual stream as a fixed function of the token
-id. In the RoPE-era nanochat ``GPT`` there is no additive positional encoding to
-piggyback on, so the injection is itself the positional-encoding-style hook —
-added in ``GPT.forward`` after the post-embedding norm and smear, just before the
-``x0`` residual is saved (see the guarded block there).
-
-What it carries here are *geometric* features: a chosen set of token ids placed
-at points sampled from a manifold (ring, line, sphere, helix) embedded in a few
-reserved residual dimensions. This is the natural-language analogue of the
-modular-addition Fourier oracle (which is literally a ring at frequency k).
-
-Design notes
-------------
-* The oracle is held OUTSIDE ``nn.Parameter`` (a plain tensor on a small carrier
-  object), so it never receives gradient, is untouched by weight decay, and
-  stays out of ``GPT.setup_optimizer``'s param-group partition (which asserts it
-  covers every ``Parameter``). It is a true fixed feature.
-* Attach AFTER the model is materialized (``to_empty`` + ``init_weights``): the
-  table is real data and must live on the model's device, not on meta.
-* ``attach_oracle(model, fn)`` sets ``model.oracle_fn`` and ``model.inject=True``.
-  ``model.inject`` gates injection on/off — used for (a) ablation (turn off,
-  measure ΔCE) and (b) delayed injection (turn on at step T).
-
-Coordinate convention: each manifold generator returns ``(n, k)`` coordinates
-that are unit-norm per row (each point sits on the unit sphere of its
-``k``-dim subspace), so ``amp`` is exactly the per-token oracle norm — the
-direct analogue of the Fourier oracle's per-frequency amplitude.
+Constraints: the table lives OUTSIDE ``nn.Parameter`` (no grad, no weight
+decay, invisible to ``setup_optimizer``'s partition assert); attach AFTER the
+model is materialized (``to_empty`` + ``init_weights``). ``model.inject`` gates
+it on/off (ablation ΔCE / delayed injection).
 """
 import math
 

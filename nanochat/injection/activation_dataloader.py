@@ -1,30 +1,13 @@
-"""Ride-along coord dataloader: nanochat's BOS-aligned best-fit packing, with
-parallel (B, T, r) activation tensors carried in lockstep with the tokens.
-
+"""Ride-along activation dataloader: nanochat's BOS-aligned best-fit packing
+with parallel (B, T, r) activation tensors carried in lockstep with the tokens.
 Mirrors ``nanochat.dataloader.tokenizing_distributed_data_loader_with_state_bos_bestfit``
-1:1 for the token path (so token order / crop / DDP sharding are byte-identical
-to the baseline given the same shard set + seed policy), and places each doc's
-precomputed activation rows wherever that doc's tokens go -- same best-fit pick,
-same crop. Activations for the BOS token (and any doc missing from the
-precompute) are zero, so the injection is a no-op there.
+1:1 on the token path (same best-fit pick, same crop, same DDP sharding), and
+places each doc's activation rows wherever that doc's tokens go.
 
-Two entry points:
-  * ``acts_data_loader_with_state(tokenizer, sources, ...)`` -- the general
-    multi-site form. ``sources`` is a dict name -> activation source (anything
-    with ``.r``, ``.lookup(text, n_tokens) -> (arr|None, key)`` and
-    ``.add_noise(arr, key)``: ``coords_store.CoordSource``,
-    ``injections.FnActivation``, ...). Yields
-    ``(inputs, targets, acts, state_dict)`` with ``acts`` a dict
-    name -> (B, T, r_name) float32 on ``device`` -- exactly what
-    ``GPT.forward(acts=...)`` consumes.
-  * ``coord_data_loader_with_state(tokenizer, coord_source, ...)`` -- the
-    original single-source form, a thin wrapper yielding the bare
-    (B, T, r) tensor.
-
-Yields (inputs, targets, acts/coords, state_dict):
-  inputs/targets : (B, T) long   -- identical to the stock loader
-  acts           : per-source (B, T, r) float32 on `device` -- standardized
-                   activations + per-source noise
+``sources`` is a dict name -> ActivationSource. Yields
+``(inputs, targets, acts, state_dict)`` with ``acts`` a dict
+name -> (B, T, r_name) float32 on ``device`` — what ``GPT.forward(acts=...)``
+consumes.
 """
 import numpy as np
 import torch
@@ -45,8 +28,8 @@ def acts_data_loader_with_state(
     batches = _document_batches(split, resume_state_dict, tokenizer_batch_size)
     bos = tokenizer.get_bos_token_id()
 
-    tok_buffer = []                        # list[list[int]]  token ids per doc (incl. BOS)
-    act_buffer = {name: [] for name in names}  # per source: list[(n_doc_tokens+1, r)] arrays, BOS row = 0
+    tok_buffer = []                            # token ids per doc (incl. BOS)
+    act_buffer = {name: [] for name in names}  # per source: (n_doc_tokens+1, r) arrays, BOS row = 0
     pq_idx = rg_idx = 0
     epoch = 1
 
@@ -61,13 +44,12 @@ def acts_data_loader_with_state(
                 r = rs[name]
                 z, key = src.lookup(text, n_body)      # (n_body, r) or None
                 if z is None:
-                    # doc missing from precompute (or token-count drift): EXACT zeros,
-                    # NO noise -- the injection site renormalizes any nonzero coord to
-                    # full gate amplitude, so noised zeros would inject pure noise.
-                    # Exact zeros make the injection a strict no-op for this doc.
+                    # Unknown doc: EXACT zeros, NO noise (ActivationSource
+                    # contract — noised zeros would inject pure noise at full
+                    # gate amplitude; exact zeros keep the site a strict no-op).
                     z = np.zeros((n_body, r), np.float32)
                 else:
-                    z = src.add_noise(z, key)          # deterministic per doc content
+                    z = src.add_noise(z, key)
                 z = np.concatenate([np.zeros((1, r), np.float32), z], axis=0)  # BOS row = 0
                 act_buffer[name].append(z)
             tok_buffer.append(t)
@@ -125,15 +107,3 @@ def acts_data_loader_with_state(
             cpu_act[name].view(B, T, rs[name]).copy_(row_act[name][:, :-1])  # acts align to INPUTS
             gpu_act[name].copy_(cpu_act[name], non_blocking=use_cuda)
         yield inputs, targets, acts, {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
-
-
-def coord_data_loader_with_state(tokenizer, coord_source, B, T, split, **kwargs):
-    """Single-source form: yields (inputs, targets, (B,T,r) coords, state_dict)."""
-    it = acts_data_loader_with_state(tokenizer, {"coords": coord_source}, B, T, split, **kwargs)
-    for inp, tgt, acts, st in it:
-        yield inp, tgt, acts["coords"], st
-
-
-def coord_data_loader(*args, **kwargs):
-    for inp, tgt, crd, _ in coord_data_loader_with_state(*args, **kwargs):
-        yield inp, tgt, crd
