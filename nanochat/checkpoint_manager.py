@@ -130,7 +130,16 @@ def build_model(checkpoint_dir, step, device, phase):
     # Load the model state
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
+    # Injected checkpoints (nanochat.oracle): rebuild the injection sites from the
+    # saved config so the checkpoint's injection_sites.* keys load. The sites stay
+    # dormant unless forward is called with acts=... (eval is coords-off by design).
+    injection_sites_config = meta_data.get("injection_sites_config")
+    if injection_sites_config:
+        model.setup_injection_sites(injection_sites_config)
     model.load_state_dict(model_data, strict=True, assign=True)
+    if injection_sites_config:
+        from nanochat.oracle.injections import reassert_optimizability
+        reassert_optimizability(model.injection_sites)  # assign=True replaced the Parameter objects
     # Put the model in the right training phase / mode
     if phase == "eval":
         model.eval()
