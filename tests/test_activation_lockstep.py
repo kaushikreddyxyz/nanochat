@@ -33,6 +33,8 @@ rng = np.random.default_rng(7)
 DOC_LENS = rng.integers(3, 41, size=N_DOCS)      # body lengths; capacity=T+1=17 -> crops happen
 MISSING = set(range(0, N_DOCS, 9))               # every 9th doc absent from the store
 MISMATCH = {5}                                   # stored with wrong n -> must also fall back to zero
+ZERO_ROW_DOCS = {7, 16}                          # stored docs whose row 1 is all-zero (unmapped/
+                                                 # concept-free token): must stay EXACT zero under noise
 
 
 def doc_text(i):
@@ -46,7 +48,10 @@ def body_ids(i):
 def int8_vals(i, L):
     j = np.arange(L)[:, None]
     d = np.arange(R)[None, :]
-    return (((i * 7 + j * 13 + d * 29) % 250) - 125).astype(np.int8)
+    q = (((i * 7 + j * 13 + d * 29) % 250) - 125).astype(np.int8)
+    if i in ZERO_ROW_DOCS and L > 1:
+        q[1] = 0
+    return q
 
 
 class FakeTok:
@@ -152,7 +157,9 @@ def expected_act(v, src):
         return np.zeros(R, np.float32)
     base = int8_vals(i, int(DOC_LENS[i])).astype(np.float32) * SCALE
     if src.noise_sigma > 0:
+        zero_rows = ~np.any(base != 0.0, axis=1)
         base = src.add_noise(base, int(doc_hash(doc_text(i))))
+        base[zero_rows] = 0.0            # exact-zero rows stay zero through the noise
     return base[j]
 
 
@@ -190,7 +197,7 @@ print(f"[3] BOS + missing/mismatch docs -> exact zero activations: OK ({n_bos} B
 # --- 3b/4. noise path: missing docs still EXACT zero; noise deterministic ---
 actsN, srcN = run_acts_loader(noise_sigma=0.15)
 actsN2, _ = run_acts_loader(noise_sigma=0.15)
-nz_checked = zero_checked = 0
+nz_checked = zero_checked = zero_row_checked = 0
 for (x, y, z, _), (x2, y2, z2, _) in zip(actsN, actsN2):
     assert torch.equal(z, z2), "noise not deterministic across loader instantiations"
     xn, zn = x.numpy(), z.numpy()
@@ -202,11 +209,17 @@ for (x, y, z, _), (x2, y2, z2, _) in zip(actsN, actsN2):
             if v != BOS and ((v - 1) // 10000 in MISSING or (v - 1) // 10000 in MISMATCH):
                 assert np.all(zn[b, t] == 0.0), "missing doc got NOISED activations (injection would fire!)"
                 zero_checked += 1
+            elif v != BOS and (v - 1) // 10000 in ZERO_ROW_DOCS and (v - 1) % 10000 == 1:
+                assert np.all(zn[b, t] == 0.0), \
+                    "exact-zero row in a KNOWN doc got NOISED (site would inject pure noise at full gate)"
+                zero_row_checked += 1
             elif v != BOS:
                 nz_checked += 1
 assert torch.equal(actsN[0][0], acts0[0][0]), "noise changed the TOKEN stream"
-print(f"[4] noise=0.15: per-doc-hash deterministic, tokens unchanged, "
-      f"missing docs exactly zero: OK ({nz_checked} noised, {zero_checked} zero-fallback positions)")
+assert zero_row_checked > 0, "fixture never exercised an all-zero stored row"
+print(f"[4] noise=0.15: per-doc-hash deterministic, tokens unchanged, missing docs exactly zero, "
+      f"in-doc zero rows stay zero: OK ({nz_checked} noised, {zero_checked} zero-fallback, "
+      f"{zero_row_checked} in-doc-zero positions)")
 
 # --- 5. store round-trip ---
 i_ok = next(i for i in range(N_DOCS) if i not in MISSING and i not in MISMATCH)

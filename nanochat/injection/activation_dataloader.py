@@ -83,16 +83,25 @@ def acts_data_loader_with_state(
 
     def one_doc(text, t, sid, abs_row):
         """Per-doc activation rows for every source (BOS row prepended = 0).
-        Unknown doc (None) -> EXACT zeros with NO noise (ActivationSource
-        contract — noised zeros would inject full-gate noise on docs we know
-        nothing about; exact zeros keep the site a strict no-op)."""
+        Unknown doc (None) -> EXACT zeros with NO noise, and exact-zero rows
+        inside a known doc (unmapped/concept-free tokens) stay exactly zero
+        through the noise (ActivationSource contract — the site renormalizes
+        any nonzero row to full gate amplitude, so a noised zero row would
+        inject pure noise at full strength; exact zeros keep the site a
+        strict no-op there)."""
         n_body = len(t) - 1
         out = {}
         for name in names:
             src = sources[name]
             z, key = (src.lookup_by_row(sid, abs_row, text, n_body) if name in pos_names
                       else src.lookup(text, n_body))
-            z = np.zeros((n_body, rs[name]), np.float32) if z is None else src.add_noise(z, key)
+            if z is None:
+                z = np.zeros((n_body, rs[name]), np.float32)
+            else:
+                zero_rows = ~np.any(z != 0.0, axis=1)
+                z = src.add_noise(z, key)
+                if zero_rows.any():
+                    z[zero_rows] = 0.0
             out[name] = np.concatenate([np.zeros((1, rs[name]), np.float32), z], axis=0)
         return t, out
 
