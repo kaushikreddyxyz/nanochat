@@ -102,7 +102,14 @@ parser.add_argument("--gate-k", type=int, default=256, help="docs sampled (seede
 parser.add_argument("--gate-min-docs", type=int, default=16, help="fail --gate auto if the source yields fewer sample docs than this")
 parser.add_argument("--lookup-workers", type=int, default=0, help="threads for per-doc activation lookups in the ride-along loader (0=serial); overlaps runtime gemma scoring with training")
 parser.add_argument("--noise-sigma", type=float, default=0.15, help="gaussian noise std on standardized activations at load time, deterministic per doc-content hash; 0 disables")
-parser.add_argument("--activation-config", type=str, default="", help="JSON for the multi-site form: {\"sites\": [InjectionCfg dicts], \"sources\": {site: {\"kind\": \"qwen-encoder\"|\"probe-scores\", \"dir\": ..., \"noise_sigma\": ...}}}; mutually exclusive with --activation-store. See nanochat/injection/README.md")
+parser.add_argument("--activation-config", type=str, default="", help="JSON for the multi-site form: {\"sites\": [InjectionCfg dicts], \"sources\": {site: {\"kind\": \"qwen-encoder\"|\"probe-scores\", \"dir\": ..., \"noise_sigma\": ..., \"align_policy\": \"mean\"|\"last\"}}}; mutually exclusive with --activation-store. See nanochat/injection/README.md")
+parser.add_argument("--compact-tokens", action="store_true", help="OPT-IN: cut nanochat tokens at gemma boundaries so each nests in one gemma token (needs a probe-scores-runtime source). CHANGES the training token stream (inflates token count) — not baseline-comparable. Default OFF (standard tokenization + overlap-mean alignment).")
+# Staying-ahead guarantees (Amendment 2): the activation source must keep up with training.
+parser.add_argument("--starvation-threshold", type=float, default=0.15, help="warn if time-blocked-waiting-on-activations exceeds this fraction of step time over the window")
+parser.add_argument("--starvation-window", type=int, default=50, help="rolling window (steps) for the blocked-fraction starvation check")
+parser.add_argument("--starvation-abort", action="store_true", help="hard-fail (instead of warn) when the blocked fraction exceeds --starvation-threshold")
+parser.add_argument("--target-step-time", type=float, default=0.5, help="assumed seconds/step used ONLY for the startup throughput verdict (required tok/s = total_batch_size / this)")
+parser.add_argument("--startup-throughput-docs", type=int, default=64, help="minimum docs the loader must produce at startup before the throughput verdict is reported")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -194,10 +201,12 @@ model.init_weights() # 3) All tensors get initialized
 # Injection sites: built BEFORE any checkpoint load so injected checkpoints
 # (which carry injection_sites.* keys) load cleanly. Site inits draw no RNG
 # from the global stream.
-def _open_injection_source(name, spec, cfg, tok, seed):
+def _open_injection_source(name, spec, cfg, tok, seed, nano_enc=None, gemma_encode=None):
     """Store kinds -> open_store; 'probe-scores-runtime' -> RuntimeProbeScoreSource
     (applies gold gemma scores at runtime, positional join via the ride-along
-    loader). 'probe-scores-live' is programmatic (needs a score_fn), not JSON-wired."""
+    loader). 'probe-scores-live' is programmatic (needs a score_fn), not JSON-wired.
+    ``nano_enc``/``gemma_encode`` override the runtime source's tokenizers (compact
+    mode passes the gemma-boundary-respecting enc + shared gemma tokenizer)."""
     kind = spec.get("kind")
     if kind == "probe-scores-runtime":
         from scripts.precompute_activations import parse_shard_range
@@ -205,8 +214,9 @@ def _open_injection_source(name, spec, cfg, tok, seed):
         shards = parse_shard_range(sh) if isinstance(sh, str) else [int(s) for s in sh]
         return RuntimeProbeScoreSource(
             spec["score_shards_dir_or_repo"], shards, layer=int(spec.get("layer", 8)),
-            nano_enc=tok.enc, concepts=spec.get("concepts"),
+            nano_enc=nano_enc or tok.enc, gemma_encode=gemma_encode, concepts=spec.get("concepts"),
             gemma_model=spec.get("gemma_model", "google/gemma-2-2b"),
+            align_policy=spec.get("align_policy", "mean"),
             climbmix_dir=spec.get("climbmix_dir"), index_path=spec.get("index_path"),
             build_hash_index=bool(spec.get("build_hash_index", False)),
             noise_sigma=float(spec.get("noise_sigma", 0.15)), seed=seed, name=name)
@@ -257,10 +267,33 @@ for _cfg in injection_cfgs:
     elif isinstance(_cfg.gate, str):
         _cfg.gate = float(_cfg.gate)
 
+# Compact-tokens mode (opt-in): a gemma-boundary-respecting tokenizer used for
+# BOTH the training token stream (loader) and the runtime source alignment. OFF
+# by default; when on it CHANGES the token stream (not baseline-comparable).
+loader_tokenizer = tokenizer
+_compact_nano_enc = _compact_gemma_encode = None
+if args.compact_tokens:
+    _runtime_specs = [s for s in injection_source_specs.values() if s.get("kind") == "probe-scores-runtime"]
+    assert _runtime_specs, "--compact-tokens requires a 'probe-scores-runtime' source (gemma boundaries)"
+    _gm = {s.get("gemma_model", "google/gemma-2-2b") for s in _runtime_specs}
+    assert len(_gm) == 1, f"--compact-tokens needs one gemma model across runtime sources, got {_gm}"
+    from nanochat.injection.sources import _default_gemma_encode
+    from nanochat.injection.compact import CompactGemmaTokenizer
+    _compact_gemma_encode = _default_gemma_encode(next(iter(_gm)))
+    _compact_tok = CompactGemmaTokenizer(tokenizer, _compact_gemma_encode)
+    _compact_nano_enc = _compact_tok.enc
+    loader_tokenizer = _compact_tok
+    print0("!" * 80)
+    print0("--compact-tokens ON: nanochat tokens are cut at gemma boundaries. This CHANGES")
+    print0("the training token stream (token-count inflation) — NOT comparable to a standard")
+    print0("baseline. Alignment is 1:1 so mean/last policies coincide. (README: compact mode)")
+    print0("!" * 80)
+
 injection_sources = {}
 for _name, _spec in injection_source_specs.items():
     _cfg = next(c for c in injection_cfgs if c.name == _name)
-    _src = _open_injection_source(_name, _spec, _cfg, tokenizer, args.seed)
+    _src = _open_injection_source(_name, _spec, _cfg, tokenizer, args.seed,
+                                  nano_enc=_compact_nano_enc, gemma_encode=_compact_gemma_encode)
     assert _src.r == _cfg.r, f"site {_name!r}: source r={_src.r} != cfg r={_cfg.r}"
     injection_sources[_name] = _src
 
@@ -494,14 +527,74 @@ if scaler is not None:
     print0("GradScaler enabled for fp16 training")
 
 # -----------------------------------------------------------------------------
+# Rolling shard prefetch (Amendment 3): stage score/parquet shards a small window
+# ahead of consumption and delete consumed shards behind — minimal disk, no bulk
+# pre-download. Config-driven per runtime source ("prefetch": {...}); a plain
+# local score dir with everything present is a no-op passthrough (no prefetcher).
+import threading as _threading
+def _attach_prefetchers():
+    from nanochat.injection.prefetch import (ShardPrefetcher, make_hf_score_fetcher,
+                                             make_local_deleter, repo_for_factory)
+    for _name, _spec in injection_source_specs.items():
+        pf = _spec.get("prefetch")
+        if not pf:
+            continue
+        src = injection_sources[_name]
+        assert hasattr(src, "prefetcher"), f"site {_name!r}: prefetch only supported for runtime probe sources"
+        staging = pf["staging_dir"]
+        climb = pf.get("climbmix_dir")
+        repos, per_repo = pf.get("repos"), pf.get("per_repo")
+        repo_for = (repo_for_factory(repos, per_repo) if repos
+                    else (lambda sid, r=_spec["score_shards_dir_or_repo"]: r))
+        fetch = make_hf_score_fetcher(staging, repo_for, climbmix_dir=climb)
+        delete = make_local_deleter(staging, climbmix_dir=climb)
+        order = sorted(src.shards)
+        def _on_wait(sid, nm=_name):
+            print0(f"[prefetch:{nm}] shard {sid} not staged yet — blocking (window behind; see starvation log)")
+        p = ShardPrefetcher(order, fetch, delete_fn=delete, ahead=int(pf.get("ahead", 2)),
+                            keep_behind=int(pf.get("keep_behind", 1)),
+                            on_wait=_on_wait, on_delete=src.evict_shard)
+        src._mm_lock = _threading.Lock()
+        src.score_loc = staging          # per-shard reads now come from the local staging dir
+        src.prefetcher = p.start()
+        print0(f"[prefetch:{_name}] rolling window ahead={p.ahead} keep_behind={p.keep_behind} "
+               f"staging={staging} ({len(order)} shards)")
+_attach_prefetchers()
+
+# -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
 # Ride-along loader: token path mirrors the stock best-fit loader 1:1, with
 # per-site (B, T, r) activation tensors in lockstep. The val loader stays
-# stock: eval is activations-off by design.
-train_loader = acts_data_loader_with_state(tokenizer, injection_sources, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, lookup_workers=args.lookup_workers)
+# stock: eval is activations-off by design. loader_stats carries the Amendment-2
+# staying-ahead counters (produce time/tokens, queue depth).
+loader_stats = {}
+train_loader = acts_data_loader_with_state(loader_tokenizer, injection_sources, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, lookup_workers=args.lookup_workers, stats=loader_stats)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
 x, y, acts, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+
+# Startup throughput verdict (Amendment 2): the kickoff produced a burst of docs
+# (buffer_size worth); extrapolate the source's real tokens/s vs training's
+# consumption. Assumption: training consumes total_batch_size tokens per step at
+# ~--target-step-time seconds/step. lookup_workers>0 => the burst already reflects
+# the pool. Reported once; the live starvation monitor is the authority thereafter.
+def _startup_throughput_verdict():
+    pd, ps = loader_stats.get("produced_docs", 0), loader_stats.get("produce_seconds", 0.0)
+    pt = loader_stats.get("produced_tokens", 0)
+    if pd < args.startup_throughput_docs or ps <= 0:
+        print0(f"[staying-ahead] startup throughput: inconclusive ({pd} docs in {ps:.3f}s "
+               f"< --startup-throughput-docs={args.startup_throughput_docs}); relying on live monitor")
+        return
+    src_tok_s = pt / ps
+    req_tok_s = total_batch_size / max(args.target_step_time, 1e-9)
+    ratio = src_tok_s / max(req_tok_s, 1e-9)
+    verdict = "OK" if ratio >= 1.5 else ("MARGINAL" if ratio >= 1.0 else "WILL STARVE")
+    print0(f"[staying-ahead] source ~{src_tok_s:,.0f} tok/s ({pd} docs, {ps:.2f}s) vs training "
+           f"~{req_tok_s:,.0f} tok/s (total_batch_size={total_batch_size:,} @ {args.target_step_time}s/step, "
+           f"workers={args.lookup_workers}) => {ratio:.2f}x — {verdict}")
+    if verdict == "WILL STARVE" and args.starvation_abort:
+        raise SystemExit("[staying-ahead] --starvation-abort: startup verdict WILL STARVE")
+_startup_throughput_verdict()
 
 # -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
@@ -573,6 +666,12 @@ else:
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
+
+# Starvation monitor state (Amendment 2): rolling window of (blocked, step) times.
+from collections import deque as _deque
+_starv_wait = _deque(maxlen=args.starvation_window)
+_starv_dt = _deque(maxlen=args.starvation_window)
+_last_starv_warn = -10**9
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -699,6 +798,7 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    act_wait = 0.0  # time-blocked-waiting-on-activations this step (Amendment 2)
     for micro_step in range(grad_accum_steps):
         loss = model(x, y, acts=acts)
         train_loss = loss.detach() # for logging
@@ -707,7 +807,9 @@ while True:
             scaler.scale(loss).backward()
         else:
             loss.backward()
+        _tw = time.time()
         x, y, acts, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        act_wait += time.time() - _tw
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -757,10 +859,27 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    # Staying-ahead (Amendment 2): blocked-time on activations + prefetch queue depth,
+    # with a windowed starvation check (warn loudly, or hard-fail with --starvation-abort).
+    _starv_wait.append(act_wait); _starv_dt.append(dt)
+    q_depth = loader_stats.get("queue_depth", 0)
+    blocked_frac = act_wait / dt if dt > 0 else 0.0
+    win_frac = (sum(_starv_dt) and sum(_starv_wait) / sum(_starv_dt)) or 0.0
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | act_wait: {act_wait*1000:.1f}ms ({blocked_frac*100:.0f}%) | qdepth: {q_depth} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    if len(_starv_dt) >= min(args.starvation_window, 10) and win_frac > args.starvation_threshold:
+        msg = (f"[staying-ahead] STARVATION: activation wait = {win_frac*100:.0f}% of step time over "
+               f"last {len(_starv_dt)} steps (> {args.starvation_threshold*100:.0f}%); qdepth={q_depth}. "
+               f"Source is not keeping up — raise --lookup-workers / widen the prefetch window.")
+        if args.starvation_abort:
+            raise SystemExit(msg)
+        if step - _last_starv_warn >= args.starvation_window:
+            print0("!" * 80); print0(msg); print0("!" * 80); _last_starv_warn = step
     if step % 100 == 0:
         log_data = {
             "step": step,
+            "train/act_wait_ms": act_wait * 1000,
+            "train/act_blocked_frac": win_frac,
+            "train/act_queue_depth": q_depth,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,

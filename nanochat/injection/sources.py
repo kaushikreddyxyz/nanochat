@@ -240,7 +240,7 @@ class _RuntimeProbeBase(ActivationSource):
     onto the nanochat token grid and enforces the unknown-doc/None contract."""
 
     def _init_layout(self, columns, quant, corpus_stats, layer, concepts, name,
-                     noise_sigma, seed):
+                     noise_sigma, seed, align_policy="mean"):
         col_names = list(columns["concepts"])           # score axis-2 order == columns.json
         layers = list(columns["layers"])
         if layer not in layers:
@@ -259,6 +259,9 @@ class _RuntimeProbeBase(ActivationSource):
         self.name = name
         self.noise_sigma = float(noise_sigma)
         self.seed = int(seed)
+        if align_policy not in ("mean", "last"):
+            raise ValueError(f"align_policy must be 'mean' or 'last', got {align_policy!r}")
+        self.align_policy = align_policy
 
     def _standardize(self, raw):
         """raw (n, r) probe scores -> z (n, r); dequant already applied upstream."""
@@ -266,20 +269,43 @@ class _RuntimeProbeBase(ActivationSource):
 
     def _align_and_gather(self, text, n_tokens, z_gemma):
         """z_gemma (n_gemma, r) standardized -> (n_tokens, r) on the nanochat grid,
-        or None (unknown/drift). Unmapped nanochat tokens stay EXACT zero."""
-        from nanochat.injection.align import gemma_to_qwen_map, nanochat_char_offsets
+        or None (unknown/drift). Each nanochat token's covering set is the gemma
+        tokens whose CHAR SPAN OVERLAPS its own — so a big gemma token broadcasts
+        its score to every nanochat token nested inside it, and a big nanochat
+        token pools every gemma token it spans. ``align_policy`` picks the pool op:
+        'mean' (default) averages the covering z-scores (variance shrinks over k
+        covering tokens — intended, NOT re-standardized); 'last' keeps only the
+        last (rightmost) covering gemma token (the historical prefix behavior for
+        the multi-gemma->one-nano direction). A nanochat token with NO overlapping
+        gemma token (a char the gemma tokenizer dropped) stays EXACT zero."""
+        from nanochat.injection.align import nanochat_char_offsets
         nano_ids = self.nano_enc.encode_ordinary(text)
         if len(nano_ids) != n_tokens:            # drift vs the loader's body-token count
             return None
-        nano_off = nanochat_char_offsets(self.nano_enc, nano_ids, text)
+        nano_off = np.asarray(nanochat_char_offsets(self.nano_enc, nano_ids, text), np.int64)
         g_ids, g_off = self.gemma_encode(text)
         if len(g_ids) != z_gemma.shape[0]:       # gemma retokenization disagrees with the scores
             return None
-        amap = gemma_to_qwen_map(text, nano_off, g_off, mode="prefix")  # nano -> last gemma <= it
         out = np.zeros((n_tokens, self.r), np.float32)
-        valid = amap >= 0
-        if valid.any():
-            out[valid] = z_gemma[amap[valid]]
+        g_off = np.asarray(g_off, np.int64).reshape(-1, 2)
+        keep = np.where(g_off[:, 1] > g_off[:, 0])[0]   # non-empty gemma spans only cover chars
+        if keep.size == 0:
+            return out
+        gs, ge = g_off[keep, 0], g_off[keep, 1]         # char-monotonic (left-to-right tokenization)
+        z_keep = z_gemma[keep]
+        ns, ne = nano_off[:, 0], nano_off[:, 1]
+        lo = np.searchsorted(ge, ns, side="right")      # first gemma whose end char > nano start
+        hi = np.searchsorted(gs, ne, side="left") - 1   # last gemma whose start char < nano end
+        has = (lo <= hi) & (ne > ns)                    # >=1 overlapping gemma and non-empty nano span
+        if not has.any():
+            return out
+        if self.align_policy == "last":
+            out[has] = z_keep[hi[has]]
+        else:                                           # mean over the overlapping gemma tokens
+            csum = np.concatenate([np.zeros((1, self.r), np.float32),
+                                   np.cumsum(z_keep, axis=0, dtype=np.float32)], axis=0)
+            s, e = lo[has], hi[has] + 1
+            out[has] = (csum[e] - csum[s]) / (e - s)[:, None]
         return out
 
     def add_noise(self, z, key):
@@ -305,11 +331,13 @@ class RuntimeProbeScoreSource(_RuntimeProbeBase):
     def __init__(self, score_loc, shards, layer=8, *, nano_enc, gemma_encode=None,
                  gemma_model="google/gemma-2-2b", concepts=None, noise_sigma=0.15,
                  seed=0, name="probe-scores-runtime", climbmix_dir=None,
-                 build_hash_index=False, index_path=None, text_column="text"):
+                 build_hash_index=False, index_path=None, text_column="text",
+                 align_policy="mean"):
         columns = _read_store_json(score_loc, "columns.json")
         quant = _read_store_json(score_loc, "quant.json")
         corpus_stats = _read_store_json(score_loc, "corpus_stats.json")
-        self._init_layout(columns, quant, corpus_stats, layer, concepts, name, noise_sigma, seed)
+        self._init_layout(columns, quant, corpus_stats, layer, concepts, name, noise_sigma, seed,
+                          align_policy)
         self.score_loc = score_loc
         self.shards = set(int(s) for s in shards)
         self.climbmix_dir = climbmix_dir
@@ -319,6 +347,8 @@ class RuntimeProbeScoreSource(_RuntimeProbeBase):
         self._score_mm, self._docs_cache = {}, {}
         self._counts = {"ok": 0, "miss_shard": 0, "miss_row": 0, "drift": 0}
         self._index = None
+        self.prefetcher = None   # optional ShardPrefetcher (Amendment 3); set by injection_train
+        self._mm_lock = None     # set alongside prefetcher (guards memmap-cache eviction)
         if index_path and os.path.exists(index_path):
             self._index = _load_index(index_path)
         elif build_hash_index or index_path:
@@ -385,16 +415,25 @@ class RuntimeProbeScoreSource(_RuntimeProbeBase):
     def _docs(self, sid):
         d = self._docs_cache.get(sid)
         if d is None:
-            with open(self._shard_file(sid, f"docs_{sid:05d}.jsonl")) as f:
+            path = self._shard_file(sid, f"docs_{sid:05d}.jsonl")
+            with open(path) as f:
                 d = [(int(x["start"]), int(x["n"])) for x in map(json.loads, f)]
-            self._docs_cache[sid] = d
+            if self._mm_lock is not None:
+                with self._mm_lock:
+                    self._docs_cache[sid] = d
+            else:
+                self._docs_cache[sid] = d
         return d
 
     def _scores(self, sid):
         mm = self._score_mm.get(sid)
         if mm is None:
             mm = np.load(self._shard_file(sid, f"scores_{sid:05d}.npy"), mmap_mode="r")  # int8 [N,L,54]
-            self._score_mm[sid] = mm
+            if self._mm_lock is not None:
+                with self._mm_lock:
+                    self._score_mm[sid] = mm
+            else:
+                self._score_mm[sid] = mm
         return mm
 
     def _gemma_z(self, sid, start, n):
@@ -402,10 +441,27 @@ class RuntimeProbeScoreSource(_RuntimeProbeBase):
         return self._standardize(q * self._scale + self._zero)  # int8 -> raw -> z
 
     def _shard_file(self, sid, name):
+        if self.prefetcher is not None:      # rolling prefetch stages into a local dir
+            self.prefetcher.ensure(sid)      # blocks until sid staged; fires starvation hook if behind
+            return os.path.join(self.score_loc, name)
         if os.path.isdir(self.score_loc):
             return os.path.join(self.score_loc, name)
         from huggingface_hub import hf_hub_download
         return hf_hub_download(self.score_loc, name, repo_type="dataset")
+
+    def evict_shard(self, sid):
+        """Drop cached memmaps for ``sid`` so the prefetcher can delete its files
+        (Amendment 3 on_delete hook). Consumption is monotonic and keep_behind>=1,
+        so an evicted shard is well behind the read frontier."""
+        lock = self._mm_lock
+        if lock is not None:
+            lock.acquire()
+        try:
+            self._score_mm.pop(sid, None)
+            self._docs_cache.pop(sid, None)
+        finally:
+            if lock is not None:
+                lock.release()
 
     def _build_hash_index(self):
         import pyarrow.parquet as pq
@@ -437,11 +493,12 @@ class LiveProbeScoreSource(_RuntimeProbeBase):
 
     def __init__(self, score_fn, score_loc, layer=8, *, nano_enc, gemma_encode=None,
                  gemma_model="google/gemma-2-2b", concepts=None, noise_sigma=0.0,
-                 seed=0, name="probe-scores-live"):
+                 seed=0, name="probe-scores-live", align_policy="mean"):
         columns = _read_store_json(score_loc, "columns.json")
         quant = _read_store_json(score_loc, "quant.json")
         corpus_stats = _read_store_json(score_loc, "corpus_stats.json")
-        self._init_layout(columns, quant, corpus_stats, layer, concepts, name, noise_sigma, seed)
+        self._init_layout(columns, quant, corpus_stats, layer, concepts, name, noise_sigma, seed,
+                          align_policy)
         self.score_fn = score_fn
         self.nano_enc = nano_enc
         self.gemma_encode = gemma_encode or _default_gemma_encode(gemma_model)

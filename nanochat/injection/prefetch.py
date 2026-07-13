@@ -1,0 +1,184 @@
+"""Rolling shard prefetcher (Amendment 3): download score/parquet shards in a
+background thread WHILE training runs, keeping a small window ahead and deleting
+consumed shards behind so disk stays minimal — never a bulk pre-download, never a
+hard block at a shard boundary (the window absorbs download latency; if the next
+shard still isn't ready the consumer blocks and the Amendment-2 starvation
+machinery fires via ``on_wait``).
+
+Consumption is monotonic (the ride-along loader enumerates shards in corpus
+order), so the prefetcher tracks a single frontier position. The background
+thread stages shards ``ahead`` beyond the frontier and deletes shards more than
+``keep_behind`` positions behind it; ``ensure(sid)`` blocks until ``sid`` is
+staged (falling back to an inline fetch if the worker is behind) and advances the
+frontier. Fetches are idempotent and race-free (worker and ``ensure`` never
+double-download the same shard).
+
+Local dirs = no-op passthrough (``fetch_fn=None``): ``ensure`` returns
+immediately, no thread, no deletes. The real HF fetcher must set
+``HF_HUB_DISABLE_XET=1`` (xet stalls on pods). CPU-tested with a fake fetcher.
+"""
+import os
+import threading
+import time
+
+SCORE_FILES = ("scores_{sid:05d}.npy", "docs_{sid:05d}.jsonl")
+
+
+def repo_for_factory(repos, per_repo):
+    """(count-based shard->repo assignment) sid -> repos[sid // per_repo]."""
+    repos = list(repos)
+    return lambda sid: repos[min(int(sid) // int(per_repo), len(repos) - 1)]
+
+
+def make_hf_score_fetcher(staging_dir, repo_for, *, files=SCORE_FILES,
+                          climbmix_dir=None, climbmix_repo="karpathy/climbmix-400b-shuffle",
+                          climbmix_file="shard_{sid:05d}.parquet"):
+    """fetch_fn(sid): download the per-shard score files (+ optional ClimbMix
+    parquet) into ``staging_dir`` with HF_HUB_DISABLE_XET=1 (xet stalls on pods)."""
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    os.makedirs(staging_dir, exist_ok=True)
+    if climbmix_dir:
+        os.makedirs(climbmix_dir, exist_ok=True)
+
+    def fetch(sid):
+        from huggingface_hub import hf_hub_download
+        for f in files:
+            hf_hub_download(repo_for(sid), f.format(sid=sid), repo_type="dataset", local_dir=staging_dir)
+        if climbmix_dir:
+            hf_hub_download(climbmix_repo, climbmix_file.format(sid=sid),
+                            repo_type="dataset", local_dir=climbmix_dir)
+        return staging_dir
+
+    return fetch
+
+
+def make_local_deleter(staging_dir, *, files=SCORE_FILES, climbmix_dir=None,
+                       climbmix_file="shard_{sid:05d}.parquet"):
+    """delete_fn(sid): remove the staged files for ``sid`` (rolling cleanup)."""
+    def delete(sid):
+        names = [os.path.join(staging_dir, f.format(sid=sid)) for f in files]
+        if climbmix_dir:
+            names.append(os.path.join(climbmix_dir, climbmix_file.format(sid=sid)))
+        for p in names:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    return delete
+
+
+class ShardPrefetcher:
+    def __init__(self, shard_ids, fetch_fn, *, delete_fn=None, ahead=2, keep_behind=1,
+                 on_wait=None, on_delete=None):
+        self.order = list(shard_ids)
+        self._pos = {sid: i for i, sid in enumerate(self.order)}
+        self.fetch_fn = fetch_fn
+        self.delete_fn = delete_fn
+        self.ahead = int(ahead)
+        self.keep_behind = int(keep_behind)
+        self.on_wait = on_wait
+        self.on_delete = on_delete
+        self._staged = {}          # sid -> fetch_fn result
+        self._inflight = set()
+        self._frontier = -1        # highest consumed position
+        self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
+        self._thread = None
+        self._stop = False
+        self._waits = 0
+        self._wait_seconds = 0.0
+        self._deleted = 0
+
+    @property
+    def enabled(self):
+        return self.fetch_fn is not None
+
+    def start(self):
+        if self.enabled and self._thread is None:
+            self._thread = threading.Thread(target=self._run, name="shard-prefetch", daemon=True)
+            self._thread.start()
+        return self
+
+    def stop(self):
+        with self._cv:
+            self._stop = True
+            self._cv.notify_all()
+
+    # -- idempotent, race-free fetch (worker and ensure share this) --
+    def _fetch(self, sid):
+        with self._cv:
+            while sid in self._inflight:      # someone else is fetching it
+                self._cv.wait()
+            if sid in self._staged:
+                return self._staged[sid]
+            self._inflight.add(sid)
+        try:
+            res = self.fetch_fn(sid)
+        finally:
+            with self._cv:
+                self._inflight.discard(sid)
+                if not self._stop:
+                    self._staged[sid] = res
+                self._cv.notify_all()
+        return res
+
+    def ensure(self, sid):
+        """Block until ``sid`` is staged; advance the frontier. No-op passthrough
+        (local dir) returns immediately. Blocks + fires ``on_wait`` only if the
+        background window has not reached ``sid`` yet."""
+        if not self.enabled:
+            return None
+        with self._cv:
+            self._frontier = max(self._frontier, self._pos.get(sid, self._frontier))
+            self._cv.notify_all()          # let the worker re-window / delete behind
+            if sid in self._staged:
+                return self._staged[sid]
+        if self.on_wait is not None:       # window did not cover this shard: starvation
+            self.on_wait(sid)
+        t0 = time.time()
+        res = self._fetch(sid)             # inline fallback so the consumer never deadlocks
+        with self._cv:
+            self._waits += 1
+            self._wait_seconds += time.time() - t0
+        return res
+
+    def _run(self):
+        while True:
+            with self._cv:
+                while not self._stop and self._frontier < 0:
+                    self._cv.wait()
+                if self._stop:
+                    return
+                frontier = self._frontier
+                window = [self.order[i] for i in range(max(frontier, 0),
+                                                       min(frontier + self.ahead + 1, len(self.order)))]
+                todo = [s for s in window if s not in self._staged and s not in self._inflight]
+                drop = [s for s, _ in self._staged.items()
+                        if self._pos.get(s, 0) < frontier - self.keep_behind and s not in self._inflight]
+            for sid in drop:
+                self._evict(sid)
+            if todo:
+                self._fetch(todo[0])       # stage nearest-ahead first, then loop re-windows
+            else:
+                with self._cv:
+                    if not self._stop and self._frontier == frontier:
+                        self._cv.wait(timeout=0.5)
+
+    def _evict(self, sid):
+        with self._cv:
+            if sid not in self._staged or sid in self._inflight:
+                return
+            self._staged.pop(sid, None)
+        if self.on_delete is not None:
+            self.on_delete(sid)
+        if self.delete_fn is not None:
+            self.delete_fn(sid)
+        with self._cv:
+            self._deleted += 1
+
+    def stats(self):
+        with self._cv:
+            return {"staged": sorted(self._staged), "frontier": self._frontier,
+                    "deleted": self._deleted, "waits": self._waits,
+                    "wait_seconds": round(self._wait_seconds, 3)}

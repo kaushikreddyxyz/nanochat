@@ -112,41 +112,84 @@ with open(os.path.join(STORE, "docs_00000.jsonl"), "w") as f:
         _off += n
 
 enc = FakeNanoEnc()
+# Amendment 1: MEAN over covering gemma tokens is the DEFAULT; 'last' is opt-in.
 SRC = RuntimeProbeScoreSource(STORE, shards=[0], layer=8, nano_enc=enc,
                               gemma_encode=char_gemma_encode, noise_sigma=0.0)
+SRC_LAST = RuntimeProbeScoreSource(STORE, shards=[0], layer=8, nano_enc=FakeNanoEnc(),
+                                   gemma_encode=char_gemma_encode, noise_sigma=0.0,
+                                   align_policy="last")
+check(SRC.align_policy == "mean", "default align_policy is 'mean'")
 
 
-def _expected(text):
-    """Reference gemma->nano prefix-aligned standardized activation for a doc."""
+def _expected(text, policy="mean"):
+    """Reference: each nano token's covering set = gemma tokens whose CHAR SPAN
+    OVERLAPS it; 'mean' averages them, 'last' takes the rightmost; no overlap -> 0."""
     nano_ids = enc.encode_ordinary(text)
-    nano_off = nanochat_char_offsets(enc, nano_ids, text)
+    nano_off = np.asarray(nanochat_char_offsets(enc, nano_ids, text), np.int64)
     g_ids, g_off = char_gemma_encode(text)
     gstart = sum(_gemma_counts[:DOCS.index(text)])
     zg = scores[gstart:gstart + len(g_ids), 1, :].astype(np.float32)  # (n_gemma, K)
-    amap = gemma_to_qwen_map(text, nano_off, g_off, mode="prefix")
+    g_off = np.asarray(g_off, np.int64).reshape(-1, 2)
     out = np.zeros((len(nano_ids), K), np.float32)
-    v = amap >= 0
-    out[v] = zg[amap[v]]
+    for i, (ns, ne) in enumerate(nano_off):
+        if ne <= ns:
+            continue
+        cov = [gi for gi, (gs, ge) in enumerate(g_off) if ge > gs and gs < ne and ge > ns]
+        if not cov:
+            continue
+        out[i] = zg[cov[-1]] if policy == "last" else zg[cov].mean(0)
     return out, len(nano_ids)
 
 
 # --------------------------------------------------------------------------- #
-print("\n[A] lookup_by_row alignment + standardization")
+print("\n[A] lookup_by_row overlap alignment + standardization (mean default + last)")
 for di, text in enumerate(DOCS):
-    exp, n_nano = _expected(text)
-    got, key = SRC.lookup_by_row(0, di, text, n_nano)
-    check(got is not None and np.array_equal(got, exp), f"doc {di!r} aligned rows match reference")
+    exp_m, n_nano = _expected(text, "mean")
+    got_m, key = SRC.lookup_by_row(0, di, text, n_nano)
+    check(got_m is not None and np.allclose(got_m, exp_m, atol=1e-6), f"doc {di!r} MEAN rows match reference")
+    exp_l, _ = _expected(text, "last")
+    got_l, _ = SRC_LAST.lookup_by_row(0, di, text, n_nano)
+    check(got_l is not None and np.array_equal(got_l, exp_l), f"doc {di!r} LAST rows match reference")
     check(key == int(doc_hash(text)), f"doc {di!r} noise key == content hash")
 
-# hand-checked: "ab cd" nano ["ab"," ","cd"] -> gemma chars a,b,c,d (z=1,2,3,4)
-# "ab" ends @2 -> last gemma <=2 is b(=2); " " ends @3 -> still b(=2); "cd" ends @5 -> d(=4)
-g0, _ = SRC.lookup_by_row(0, 0, "ab cd", 3)
-check(np.array_equal(g0, np.array([[2] * K, [2] * K, [4] * K], np.float32)),
-      "multi-gemma->one-nano: 'ab'->b, 'cd'->d; and 'ab'+' ' both map to b (one-gemma->multi-nano)")
-# " x" nano [" ","x"]; leading space has NO gemma anchor -> exact zero row
+# hand-checked: "ab cd" nano ["ab"," ","cd"] -> gemma chars a,b,c,d (z=1,2,3,4).
+# overlap sets: "ab"@(0,2) covers {a,b}; " "@(2,3) covers NONE (whitespace char, gemma
+# dropped it) -> zero; "cd"@(3,5) covers {c,d}.
+gm, _ = SRC.lookup_by_row(0, 0, "ab cd", 3)
+check(np.allclose(gm, np.array([[1.5] * K, [0] * K, [3.5] * K], np.float32)),
+      "MEAN: 'ab'->mean(a,b)=1.5, ' '->0 (no overlap), 'cd'->mean(c,d)=3.5")
+gl, _ = SRC_LAST.lookup_by_row(0, 0, "ab cd", 3)
+check(np.array_equal(gl, np.array([[2] * K, [0] * K, [4] * K], np.float32)),
+      "LAST: 'ab'->b=2, ' '->0, 'cd'->d=4 (rightmost overlapping gemma)")
+# " x" nano [" ","x"]; leading space overlaps NO gemma -> exact zero row (both policies)
 gx, _ = SRC.lookup_by_row(0, 1, " x", 2)
 check(np.array_equal(gx[0], np.zeros(K, np.float32)) and not np.array_equal(gx[1], np.zeros(K, np.float32)),
-      "unmapped nanochat token (no gemma anchor) -> EXACT zero row")
+      "unmapped nanochat token (no overlapping gemma) -> EXACT zero row")
+
+# nested broadcast: ONE big gemma token spanning 3 nano tokens -> all three inherit it
+# (both policies). Uses a dedicated single-token gemma stand-in.
+def one_gemma_encode(text):
+    return [1], [(0, len(text))]           # the whole doc is one gemma token
+class WordNano2:                            # 3 nano tokens over "XYZABC": "XY","ZA","BC"
+    _map = {1: b"XY", 2: b"ZA", 3: b"BC"}
+    def encode_ordinary(self, t): return [1, 2, 3]
+    def decode_single_token_bytes(self, i): return self._map[i]
+STORE1 = tempfile.mkdtemp(prefix="runtime_probe_store1_")
+json.dump({"concepts": CONCEPTS, "layers": LAYERS, "families": {c: "fam" for c in CONCEPTS}},
+          open(os.path.join(STORE1, "columns.json"), "w"))
+json.dump({"zero": [[0.0] * K for _ in LAYERS], "scale": [[1.0] * K for _ in LAYERS]},
+          open(os.path.join(STORE1, "quant.json"), "w"))
+json.dump({"mean": [[0.0] * K for _ in LAYERS], "std": [[1.0] * K for _ in LAYERS]},
+          open(os.path.join(STORE1, "corpus_stats.json"), "w"))
+sc1 = np.zeros((1, 3, K), np.int8); sc1[0, 1, :] = 7   # single gemma token, z=7
+np.save(os.path.join(STORE1, "scores_00000.npy"), sc1)
+open(os.path.join(STORE1, "docs_00000.jsonl"), "w").write(json.dumps({"doc": 0, "start": 0, "n": 1}) + "\n")
+for pol in ("mean", "last"):
+    s1 = RuntimeProbeScoreSource(STORE1, shards=[0], layer=8, nano_enc=WordNano2(),
+                                 gemma_encode=one_gemma_encode, noise_sigma=0.0, align_policy=pol)
+    g1, _ = s1.lookup_by_row(0, 0, "XYZABC", 3)
+    check(np.array_equal(g1, np.full((3, K), 7, np.float32)),
+          f"nested: one gemma -> 3 nano tokens all get its score ({pol})")
 
 # drift / miss contracts
 check(SRC.lookup_by_row(0, 0, "ab cd", 99)[0] is None, "nano token-count drift -> None")
@@ -286,10 +329,15 @@ def stub_score_fn(texts):
 
 LIVE = LiveProbeScoreSource(stub_score_fn, STORE, layer=8, nano_enc=FakeNanoEnc(),
                             gemma_encode=char_gemma_encode)
-# "ab cd": live per-doc gemma z = [1,2,3,4]; same alignment -> ['ab'->b=2, ' '->b=2, 'cd'->d=4]
+# "ab cd": live per-doc gemma z = [1,2,3,4]; overlap-mean -> ['ab'->1.5, ' '->0, 'cd'->3.5]
 lv, _ = LIVE.lookup("ab cd", 3)
-check(np.array_equal(lv, np.array([[2] * K, [2] * K, [4] * K], np.float32)),
-      "live backend aligns on-the-fly scores identically to the stored backend")
+check(np.allclose(lv, np.array([[1.5] * K, [0] * K, [3.5] * K], np.float32)),
+      "live backend aligns on-the-fly scores identically to the stored backend (mean)")
+LIVE_L = LiveProbeScoreSource(stub_score_fn, STORE, layer=8, nano_enc=FakeNanoEnc(),
+                              gemma_encode=char_gemma_encode, align_policy="last")
+lvl, _ = LIVE_L.lookup("ab cd", 3)
+check(np.array_equal(lvl, np.array([[2] * K, [0] * K, [4] * K], np.float32)),
+      "live backend honors align_policy='last'")
 try:
     LIVE.sample_activation_stats(8, 0)
     check(False, "live gate='auto' must raise")
@@ -309,6 +357,36 @@ dps = reps * len(DOCS) / dt
 print(f"  fixture: {dps:,.0f} docs/s single-worker alignment (fake tokenizers; real gemma "
       f"tokenization dominates in production — see README cost note)")
 check(dps > 0, "throughput measured")
+
+
+# --------------------------------------------------------------------------- #
+print("\n[F] staying-ahead loader stats (Amendment 2) + simulated slow source")
+
+
+class SlowStub(StubPositionalSource):
+    """Positional stub that sleeps per lookup — simulates a source that starves."""
+    def lookup_by_row(self, sid, row, text, n_tokens):
+        time.sleep(0.003)
+        return super().lookup_by_row(sid, row, text, n_tokens)
+
+
+fast_stats, slow_stats = {}, {}
+it_fast = acts_data_loader_with_state(FakeTok(), {"stub": StubPositionalSource()}, B, T,
+                                      split="train", device="cpu", buffer_size=6, stats=fast_stats)
+it_slow = acts_data_loader_with_state(FakeTok(), {"stub": SlowStub()}, B, T,
+                                      split="train", device="cpu", buffer_size=6, stats=slow_stats)
+for _ in range(8):
+    next(it_fast); next(it_slow)
+check(fast_stats.get("produced_tokens", 0) > 0 and fast_stats.get("batches", 0) == 8,
+      f"loader stats populate produced_tokens/batches ({fast_stats.get('produced_tokens')}t, {fast_stats.get('batches')}b)")
+check("queue_depth" in fast_stats and fast_stats["produce_seconds"] > 0,
+      f"queue_depth + cumulative produce_seconds reported ({fast_stats.get('queue_depth')} depth, {fast_stats['produce_seconds']:.3f}s)")
+check(slow_stats["produce_seconds"] > fast_stats["produce_seconds"],
+      f"slow source spends more time producing ({slow_stats['produce_seconds']:.3f}s > {fast_stats['produce_seconds']:.3f}s) — the starvation signal")
+# throughput extrapolation (tokens/s) is finite and the slow source is measurably slower
+fast_tps = fast_stats["produced_tokens"] / fast_stats["produce_seconds"]
+slow_tps = slow_stats["produced_tokens"] / slow_stats["produce_seconds"]
+check(slow_tps < fast_tps, f"slow source has lower tokens/s ({slow_tps:,.0f} < {fast_tps:,.0f}) — startup verdict input")
 
 
 print("\n" + ("ALL CHECKS PASSED" if not fails else f"{len(fails)} FAILURES: {fails}"))

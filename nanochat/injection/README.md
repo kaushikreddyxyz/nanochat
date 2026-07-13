@@ -20,12 +20,21 @@ pre-injection..HEAD`):
 11. **runtime probe-score injection** (`RuntimeProbeScoreSource` /
     `LiveProbeScoreSource`, positional ride-along join, `probe-scores-runtime`
     wiring; the `repackage-probe-scores` skeleton deleted)
+12. **injection-stack amendments** — (1) alignment default = **overlap MEAN**
+    over covering gemma tokens (`align_policy: "mean"|"last"`) + opt-in
+    **compact-tokens** mode (`compact.py`, `--compact-tokens`); (2) **staying-ahead**
+    metrics + starvation monitor + startup throughput verdict
+    (`activation_dataloader.py` stats, `injection_train.py`); (3) **rolling shard
+    prefetch** (`prefetch.py`, config-driven, window + rollover, minimal disk);
+    stale `nanochat/oracle/` leftover removed.
 
 Suggested review order: `sites.py` (the injection contract + gate/auto) →
-`sources.py` (ActivationSource + store format + runtime probe sources) →
-`gpt.py` (`setup_injection_sites`, forward hook) → `scripts/injection_train.py`
-→ `activation_dataloader.py` (positional join) →
-`scripts/precompute_activations.py` → `tests/`. All 4 test files +
+`sources.py` (ActivationSource + store format + runtime probe sources + overlap
+align + prefetch hook) → `compact.py` (compact-tokens wrapper) → `prefetch.py`
+(rolling shard prefetcher) → `gpt.py` (`setup_injection_sites`, forward hook) →
+`scripts/injection_train.py` (align_policy/compact/prefetch/staying-ahead wiring)
+→ `activation_dataloader.py` (positional join + staying-ahead stats) →
+`scripts/precompute_activations.py` → `tests/`. All 6 test files +
 `python -m nanochat.injection.smoke` pass on CPU.
 
 **Why the package is named `injection`, not `oracle`**: in this project's
@@ -212,12 +221,40 @@ coverage), plus `quant.json`/`corpus_stats.json`/`columns.json`. Per doc:
   text-keyed hash-index fallback exists — `build_hash_index`/`index_path`,
   needs `climbmix_dir` — for callers without the position; it *does* pay the
   parquet-walk startup cost.)
-- **On-the-fly alignment.** Retokenize the doc with the gemma fast tokenizer
-  (`add_special_tokens=False`, `len == n_gemma` guard) for char offsets,
-  nanochat byte→char offsets via `align.nanochat_char_offsets`, then
-  `align.gemma_to_qwen_map` prefix mode: each nanochat token takes the **last
-  gemma token whose char span ends at or before it** (causal, no future
-  leakage). Unmapped nanochat tokens → **exact zero rows**.
+- **On-the-fly alignment (overlap, MEAN by default).** Retokenize the doc with
+  the gemma fast tokenizer (`add_special_tokens=False`, `len == n_gemma` guard)
+  for char offsets, nanochat byte→char offsets via `align.nanochat_char_offsets`,
+  then map each nanochat token to the gemma tokens whose **char span OVERLAPS**
+  it. A nanochat token nested inside one big gemma token inherits that token's
+  score (broadcast); a nanochat token spanning several gemma tokens pools them.
+  `align_policy` (source config, **default `"mean"`**) picks the pool op:
+  - **`"mean"`** (default) averages the covering z-scores. These are standardized
+    scores, so averaging over *k* covering tokens **shrinks variance** — this is
+    the intended semantics (the mean IS the signal); the result is **NOT
+    re-standardized**.
+  - **`"last"`** keeps only the rightmost covering gemma token (the historical
+    behavior for the multi-gemma→one-nano direction), for per-experiment override.
+
+  A nanochat token that overlaps **no** gemma token (a char the gemma tokenizer
+  dropped) stays an **exact zero row**. Overlap is causal except in the genuine
+  broadcast case (a coarse gemma token legitimately covering a finer nanochat
+  token) — there is no finer signal to use there.
+
+- **Compact-tokens mode (opt-in, `--compact-tokens`, OFF by default).** A wrapper
+  tokenizer (`injection/compact.py`, `CompactGemmaTokenizer`) cuts nanochat tokens
+  at gemma boundaries so every nanochat token nests inside exactly one gemma token
+  (gemma `"XYZ ABC"` → `"XY","Z"," ","A","BC"`); alignment is then trivially 1:1
+  (mean ≡ last). **Two loud caveats:** (a) it **CHANGES the training token
+  stream** — breaking BPE merges at gemma edges inflates the token count (measured
+  **1.097×** on the compact-test fixture doc set), so a compact run is **not
+  bit-comparable to a standard baseline**; (b) it needs gemma char-offsets in the
+  hot loader path. **Wiring gap (documented, not a bug):** the wrapper currently
+  gemma-tokenizes for segmentation and the source re-tokenizes for alignment (two
+  gemma passes per doc); sharing the offsets through the loader — and, since
+  compact makes alignment 1:1, skipping the source's gemma retokenize entirely —
+  is a follow-up. The default path stays standard nanochat tokenization +
+  overlap-mean alignment; core nanochat modules are untouched (the ride-along
+  loader already accepts an injected tokenizer).
 - **Dequantize + standardize** one layer's columns (`layer` config field,
   default 8; default all 54 in `columns.json` order, or a `concepts` subset)
   with the frozen `quant.json` (`raw = int8·scale + zero`) and
@@ -241,13 +278,60 @@ so live scoring at pretraining throughput needs a scorer fleet *larger* than the
 trainer. Intended for small runs, evals, and unscored corpora; for a pre-scored
 corpus the stored backend is free at runtime.
 
-**Ops note (pods):** the score shards are ~8.7 GB each, so a real run wants a
-rolling prefetch-download of `scores_<sid>.npy`/`docs_<sid>.jsonl` alongside
-training (same pattern as the existing shard prefetcher; ~2-shard disk window),
-memmapped lazily. Alignment throughput on the CPU fixture (fake tokenizers) is
-~30k docs/s single-worker; in production the **gemma retokenization dominates**,
-so size `--lookup-workers` to the real per-doc gemma-tokenize cost and confirm
-the loader keeps up with training's doc-consumption rate.
+### Rolling shard prefetch (ops, `injection/prefetch.py`)
+
+The score shards are ~8.7 GB each, so a real run downloads them in a background
+routine **while training runs** rather than bulk pre-downloading. `ShardPrefetcher`
+keeps a small window (`ahead`, default 2) of shards staged beyond the consumption
+frontier and **deletes consumed shards behind** (`keep_behind`, default 1) so disk
+stays at ~2 shards. Consumption is monotonic (the loader enumerates shards in
+corpus order), so `ensure(sid)` blocks only if the window has fallen behind — and
+that block is exactly what the staying-ahead machinery below reports. HF downloads
+set `HF_HUB_DISABLE_XET=1` (xet stalls on pods). When a shard is evicted the source
+drops its cached memmap first (the `on_delete` hook), so a delete never races an
+open memmap. A **local score dir with everything present is a no-op passthrough**
+(no prefetcher, no thread).
+
+Wired per runtime source via a `"prefetch"` block in the source spec (else off):
+
+```json
+"probes": {"kind": "probe-scores-runtime",
+           "score_shards_dir_or_repo": "kaushikreddyxyz/climbmix-scored",
+           "shards": "0-184", "layer": 8,
+           "prefetch": {"staging_dir": "/workspace/scores_staging",
+                        "climbmix_dir": "/workspace/climbmix",
+                        "repos": ["kaushikreddyxyz/climbmix-scored",
+                                  "kaushikreddyxyz/climbmix-scored-overflow"],
+                        "per_repo": 25, "ahead": 2, "keep_behind": 1}}
+```
+
+`repos`/`per_repo` give the count-based shard→repo assignment (25 shards/repo, as
+the scorer wrote them); omit them to pull every shard from
+`score_shards_dir_or_repo`. Store metadata (`columns/quant/corpus_stats.json`) is
+read once at init from the repo; only per-shard files roll through `staging_dir`.
+
+### Staying-ahead guarantees (Amendment 2)
+
+The scoring path must provably keep up with training. `acts_data_loader_with_state`
+updates a cheap `stats` dict each batch (no hot-path overhead when unused);
+`injection_train` reads it:
+
+- **Step log** adds `act_wait: <ms> (<%>)` — cumulative time-blocked-waiting-on-
+  activations this step (the wall time inside `next(train_loader)`) as a fraction of
+  step time — and `qdepth: <n>`, the docs buffered ahead of the packer (prefetch
+  depth proxy). wandb logs `train/act_wait_ms`, `train/act_blocked_frac`,
+  `train/act_queue_depth`.
+- **Startup throughput verdict**: the kickoff produces a burst of docs; the script
+  extrapolates the source's real tokens/s (gemma-tokenize + align included) vs
+  training's consumption (`total_batch_size / --target-step-time`, assumptions
+  printed) and prints a one-line verdict — `OK` (≥1.5×) / `MARGINAL` (1–1.5×) /
+  `WILL STARVE` (<1×). Tune with `--startup-throughput-docs`.
+- **Starvation policy**: over `--starvation-window` steps, if the blocked fraction
+  exceeds `--starvation-threshold` (default 0.15) it **warns loudly** (throttled);
+  `--starvation-abort` hard-fails instead (also fails on a `WILL STARVE` startup
+  verdict). Alignment on the CPU fixture (fake tokenizers) is ~20–30k docs/s
+  single-worker; in production the **gemma retokenization dominates**, so size
+  `--lookup-workers` to the real per-doc cost and let the monitor confirm.
 
 ## Training (`scripts/injection_train.py`)
 
@@ -300,7 +384,8 @@ list, or `"auto[:target]"`); `sources` keys must match site names; `FnSource`
 and `LiveProbeScoreSource` remain programmatic. The `probe-scores-runtime`
 source takes `score_shards_dir_or_repo` (local dir or HF dataset repo),
 `shards`, `layer`, optional `concepts` subset / `climbmix_dir` /
-`index_path` / `build_hash_index`. Exactly one of
+`index_path` / `build_hash_index`, `align_policy` (`"mean"` default / `"last"`),
+and a `prefetch` block (rolling shard prefetch, above). Exactly one of
 `--activation-store`/`--activation-config` is required. The startup banner
 prints each site's source kind, doc coverage, and resolved (incl. calibrated)
 gate.
@@ -395,7 +480,8 @@ parallelizes tokenize/align in spawn workers with byte-identical output.
 
 ```bash
 python -m pytest tests/test_injection_sites.py tests/test_activation_lockstep.py \
-                 tests/test_precompute_activations.py tests/test_runtime_probe_source.py
+                 tests/test_precompute_activations.py tests/test_runtime_probe_source.py \
+                 tests/test_compact_tokens.py tests/test_shard_prefetch.py
 python -m nanochat.injection.smoke
 ```
 
@@ -406,11 +492,20 @@ python -m nanochat.injection.smoke
   split, state-dict keys, v1↔v2 forward equivalence) and the GPT wiring
   (acts=None ≡ vanilla; optimizer contract; step behavior).
 - `test_runtime_probe_source.py` — the runtime probe path: `lookup_by_row`
-  dequant+standardize+prefix-align (hand-checked multi-gemma↔one-nano cases,
-  unmapped→exact-zero, drift/miss→None), positional-join == content-hash-join,
+  dequant+standardize+**overlap-align** for BOTH policies (hand-checked
+  multi-gemma→one-nano, one-gemma→multi-nano **broadcast**, unmapped→exact-zero,
+  drift/miss→None; default is `"mean"`), positional-join == content-hash-join,
   the ride-along loader's `(shard,row)` cursor driving `lookup_by_row`,
-  `lookup_workers` threaded == serial, `LiveProbeScoreSource` stub, and
-  single-worker alignment throughput.
+  `lookup_workers` threaded == serial, `LiveProbeScoreSource` stub (mean + last),
+  single-worker alignment throughput, and the **staying-ahead loader stats**
+  (produce time/tokens, queue depth) under a simulated slow source.
+- `test_compact_tokens.py` — compact mode: standard tokenization straddles a
+  gemma boundary but compact never does (nesting), the token-count inflation
+  number, and that compact tokenization makes the overlap alignment 1:1
+  (mean ≡ last).
+- `test_shard_prefetch.py` — the rolling prefetcher with a FAKE fetcher: window
+  stages ahead + deletes behind + stays bounded (not bulk), `on_delete` evict
+  hook, block+`on_wait` when the window is behind, local-dir no-op passthrough.
 - `test_activation_lockstep.py` — the ride-along loader against the REAL
   packing source (ast-extracted from `nanochat/dataloader.py`): bit-identical
   token stream, activation↔token alignment through best-fit + crops,

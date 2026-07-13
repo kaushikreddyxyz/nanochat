@@ -18,6 +18,7 @@ scoring overlaps training; the row cursor is assigned serially first, so the
 parallel work stays order-independent and deterministic.
 """
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -53,7 +54,15 @@ def acts_data_loader_with_state(
     tokenizer, sources, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None, buffer_size=1000, lookup_workers=0,
+    stats=None,
 ):
+    """``stats`` (optional dict) is updated in place each yield with cheap
+    staying-ahead counters (Amendment 2): ``produce_seconds`` (cumulative wall
+    time spent producing = tokenize+lookup+align, the source's own cost),
+    ``produced_docs``/``produced_tokens`` (throughput numerator), ``queue_depth``
+    (docs buffered ahead of the packer at yield time = prefetch depth proxy), and
+    ``batches``. injection_train reads these for the startup throughput verdict and
+    the live starvation monitor. No overhead when ``stats is None``."""
     assert split in ["train", "val"]
     assert len(sources) > 0, "need at least one activation source"
     names = list(sources.keys())
@@ -89,6 +98,7 @@ def acts_data_loader_with_state(
 
     def refill():
         nonlocal pq_idx, rg_idx, epoch
+        t_ref = time.time() if stats is not None else 0.0
         doc_batch, (pq_idx, rg_idx, epoch) = next(batches)
         toks = tokenizer.encode(doc_batch, prepend=bos, num_threads=tokenizer_threads)
         tasks = []
@@ -113,6 +123,10 @@ def acts_data_loader_with_state(
             tok_buffer.append(t)
             for name in names:
                 act_buffer[name].append(per_src[name])
+        if stats is not None:
+            stats["produce_seconds"] = stats.get("produce_seconds", 0.0) + (time.time() - t_ref)
+            stats["produced_docs"] = stats.get("produced_docs", 0) + len(doc_batch)
+            stats["produced_tokens"] = stats.get("produced_tokens", 0) + sum(len(t) - 1 for t in toks)
 
     use_cuda = device == "cuda"
     row_tok = torch.empty((B, row_capacity), dtype=torch.long)
@@ -166,4 +180,7 @@ def acts_data_loader_with_state(
         for name in names:
             cpu_act[name].view(B, T, rs[name]).copy_(row_act[name][:, :-1])  # acts align to INPUTS
             gpu_act[name].copy_(cpu_act[name], non_blocking=use_cuda)
+        if stats is not None:
+            stats["queue_depth"] = len(tok_buffer)   # docs buffered ahead of the packer
+            stats["batches"] = stats.get("batches", 0) + 1
         yield inputs, targets, acts, {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
