@@ -134,6 +134,30 @@ def _normalize_offsets(text: str, raw_offsets: Iterable[Offset]) -> List[Offset]
 
 
 # --------------------------------------------------------------------------
+# nanochat_char_offsets: char spans for tiktoken/RustBPE ids (no fast-tokenizer
+# offset mapping exists for tiktoken, so reconstruct from per-token byte lengths)
+# --------------------------------------------------------------------------
+
+def nanochat_char_offsets(enc, ids, text):
+    """Reconstruct (start, end) CHAR spans for tiktoken/RustBPE ``ids``. ``ids``
+    must come from ``encode_ordinary(text)`` (no BOS): byte-level BPE partitions
+    ``text.encode('utf-8')``, so per-token byte lengths must sum to the doc's
+    byte length (asserted). A char belongs to the token holding its UTF-8 lead
+    byte; pure-continuation-byte tokens get empty spans (align maps them to -1)."""
+    byte_lens = [len(enc.decode_single_token_bytes(int(i))) for i in ids]
+    b = np.concatenate([[0], np.cumsum(byte_lens)]).astype(np.int64)
+    fb = text.encode("utf-8")
+    assert int(b[-1]) == len(fb), (
+        f"token byte lengths do not partition the document bytes "
+        f"({int(b[-1])} != {len(fb)}); ids must come from encode_ordinary(text)")
+    char_at = np.zeros(len(fb) + 1, dtype=np.int64)  # vectorized byte->char map
+    if len(fb):
+        fb_arr = np.frombuffer(fb, dtype=np.uint8)
+        char_at[1:] = np.cumsum((fb_arr & 0xC0) != 0x80)
+    return [(int(char_at[b[i]]), int(char_at[b[i + 1]])) for i in range(len(ids))]
+
+
+# --------------------------------------------------------------------------
 # prefix mode
 # --------------------------------------------------------------------------
 

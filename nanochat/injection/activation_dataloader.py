@@ -8,22 +8,59 @@ places each doc's activation rows wherever that doc's tokens go.
 ``(inputs, targets, acts, state_dict)`` with ``acts`` a dict
 name -> (B, T, r_name) float32 on ``device`` — what ``GPT.forward(acts=...)``
 consumes.
+
+Positional sources (``.positional`` + ``.lookup_by_row``) join by (shard, row):
+this loader re-runs the real corpus enumeration, so it knows each doc's shard and
+absolute row and joins the score store positionally (no hashing, no startup walk).
+Other sources join by doc text (``.lookup``). ``lookup_workers>0`` runs the
+per-doc lookups (gemma tokenize + align) in an ordered thread pool so the CPU
+scoring overlaps training; the row cursor is assigned serially first, so the
+parallel work stays order-independent and deterministic.
 """
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import torch
 
 from nanochat.dataloader import _document_batches
 
 
+def _shard_row_resolver(split):
+    """(pq_idx, rg_idx) -> (climbmix shard id, row index of that row group's first
+    doc). Reads only parquet row-group metadata (cheap), cached per file."""
+    from nanochat.dataset import list_parquet_files
+    import pyarrow.parquet as pq
+    paths = list_parquet_files()
+    paths = paths[:-1] if split == "train" else paths[-1:]  # same train/val split as _document_batches
+    cache = {}
+
+    def resolve(pq_idx, rg_idx):
+        p = paths[pq_idx]
+        sid = int(os.path.basename(p).split("_")[1].split(".")[0])
+        off = cache.get(pq_idx)
+        if off is None:
+            md = pq.ParquetFile(p).metadata
+            off = np.concatenate([[0], np.cumsum([md.row_group(i).num_rows
+                                                  for i in range(md.num_row_groups)])]).astype(np.int64)
+            cache[pq_idx] = off
+        return sid, int(off[rg_idx])
+
+    return resolve
+
+
 def acts_data_loader_with_state(
     tokenizer, sources, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
-    device="cuda", resume_state_dict=None, buffer_size=1000,
+    device="cuda", resume_state_dict=None, buffer_size=1000, lookup_workers=0,
 ):
     assert split in ["train", "val"]
     assert len(sources) > 0, "need at least one activation source"
     names = list(sources.keys())
     rs = {name: int(sources[name].r) for name in names}
+    pos_names = [n for n in names if getattr(sources[n], "positional", False)
+                 and hasattr(sources[n], "lookup_by_row")]
+    resolve_pos = _shard_row_resolver(split) if pos_names else None
     row_capacity = T + 1
     batches = _document_batches(split, resume_state_dict, tokenizer_batch_size)
     bos = tokenizer.get_bos_token_id()
@@ -32,27 +69,50 @@ def acts_data_loader_with_state(
     act_buffer = {name: [] for name in names}  # per source: (n_doc_tokens+1, r) arrays, BOS row = 0
     pq_idx = rg_idx = 0
     epoch = 1
+    cursor = {"key": None, "sid": -1, "row": 0}   # within-shard row cursor for the positional join
+    pool = ThreadPoolExecutor(max_workers=lookup_workers) if lookup_workers > 0 else None
+
+    def one_doc(text, t, sid, abs_row):
+        """Per-doc activation rows for every source (BOS row prepended = 0).
+        Unknown doc (None) -> EXACT zeros with NO noise (ActivationSource
+        contract — noised zeros would inject full-gate noise on docs we know
+        nothing about; exact zeros keep the site a strict no-op)."""
+        n_body = len(t) - 1
+        out = {}
+        for name in names:
+            src = sources[name]
+            z, key = (src.lookup_by_row(sid, abs_row, text, n_body) if name in pos_names
+                      else src.lookup(text, n_body))
+            z = np.zeros((n_body, rs[name]), np.float32) if z is None else src.add_noise(z, key)
+            out[name] = np.concatenate([np.zeros((1, rs[name]), np.float32), z], axis=0)
+        return t, out
 
     def refill():
         nonlocal pq_idx, rg_idx, epoch
         doc_batch, (pq_idx, rg_idx, epoch) = next(batches)
         toks = tokenizer.encode(doc_batch, prepend=bos, num_threads=tokenizer_threads)
+        tasks = []
         for text, t in zip(doc_batch, toks):
-            n_body = len(t) - 1                        # minus prepended BOS
-            for name in names:
-                src = sources[name]
-                r = rs[name]
-                z, key = src.lookup(text, n_body)      # (n_body, r) or None
-                if z is None:
-                    # Unknown doc: EXACT zeros, NO noise (ActivationSource
-                    # contract — noised zeros would inject pure noise at full
-                    # gate amplitude; exact zeros keep the site a strict no-op).
-                    z = np.zeros((n_body, r), np.float32)
-                else:
-                    z = src.add_noise(z, key)
-                z = np.concatenate([np.zeros((1, r), np.float32), z], axis=0)  # BOS row = 0
-                act_buffer[name].append(z)
+            if pos_names:
+                # Assign (shard, row) serially (all chunks of one row group carry
+                # the same (pq,rg,epoch) consecutively, so a per-run cursor is
+                # exact; epoch resets it when a row group is re-read next pass).
+                # The heavy per-doc lookup is order-independent and may run pooled.
+                key = (pq_idx, rg_idx, epoch)
+                if key != cursor["key"]:
+                    cursor["key"] = key
+                    cursor["sid"], cursor["row"] = resolve_pos(pq_idx, rg_idx)
+                sid, abs_row = cursor["sid"], cursor["row"]
+                cursor["row"] += 1
+            else:
+                sid, abs_row = -1, -1
+            tasks.append((text, t, sid, abs_row))
+        results = (pool.map(lambda a: one_doc(*a), tasks) if pool is not None
+                   else (one_doc(*a) for a in tasks))
+        for t, per_src in results:             # ordered: preserves doc order
             tok_buffer.append(t)
+            for name in names:
+                act_buffer[name].append(per_src[name])
 
     use_cuda = device == "cuda"
     row_tok = torch.empty((B, row_capacity), dtype=torch.long)

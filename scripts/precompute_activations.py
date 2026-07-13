@@ -26,9 +26,10 @@ Modes (--mode):
                    drift that would otherwise zero every activation and silently
                    train a baseline.
   measure-crossing prefix-mode crossing rate for the qwen->nanochat pair
-  repackage-probe-scores  NOT IMPLEMENTED yet (see run_repackage_probe_scores
-                   and the README's ProbeScoreSource section for the exact
-                   remaining work); the reader side (ProbeScoreSource) is done.
+
+Gold gemma probe scores are applied at RUNTIME by
+nanochat.injection.sources.RuntimeProbeScoreSource (nothing precomputed offline);
+the retired ``repackage-probe-scores`` mode is gone (see the injection README).
 """
 import argparse
 import glob
@@ -39,34 +40,12 @@ import threading
 
 import numpy as np
 
-from nanochat.injection.align import get_offsets, gemma_to_qwen_map, crossing_rate
+from nanochat.injection.align import (get_offsets, gemma_to_qwen_map, crossing_rate,
+                                      nanochat_char_offsets)
 from nanochat.injection.sources import (build_structured_activations, make_orthonormal_P,
                                         doc_hash, CYCLIC_ORDER, NONCYCLIC_PCA, STORE_FORMAT)
 
 INDEX_DTYPE = np.dtype([("hash", "<u8"), ("off", "<i8"), ("n", "<i4")])
-
-
-# --------------------------------------------------------------------------- #
-# char-offset reconstruction for tiktoken/RustBPE
-# --------------------------------------------------------------------------- #
-def nanochat_char_offsets(enc, ids, text):
-    """Reconstruct (start, end) CHAR spans for tiktoken/RustBPE ids. ``ids``
-    must come from encode_ordinary(text) (no BOS): byte-level BPE partitions
-    text.encode('utf-8'), so per-token byte lengths must sum to the doc's byte
-    length (asserted). A char belongs to the token holding its UTF-8 lead byte;
-    pure-continuation-byte tokens get empty spans (align maps them to -1)."""
-    byte_lens = [len(enc.decode_single_token_bytes(int(i))) for i in ids]
-    b = np.concatenate([[0], np.cumsum(byte_lens)]).astype(np.int64)
-    fb = text.encode("utf-8")
-    assert int(b[-1]) == len(fb), (
-        f"token byte lengths do not partition the document bytes "
-        f"({int(b[-1])} != {len(fb)}); ids must come from encode_ordinary(text)")
-    # vectorized byte->char map (a per-byte python loop stalls the GPU feed)
-    char_at = np.zeros(len(fb) + 1, dtype=np.int64)
-    if len(fb):
-        fb_arr = np.frombuffer(fb, dtype=np.uint8)
-        char_at[1:] = np.cumsum((fb_arr & 0xC0) != 0x80)
-    return [(int(char_at[b[i]]), int(char_at[b[i + 1]])) for i in range(len(ids))]
 
 
 # --------------------------------------------------------------------------- #
@@ -1191,38 +1170,6 @@ def run_preflight(args):
 
 
 # --------------------------------------------------------------------------- #
-# REPACKAGE-PROBE-SCORES: gold gemma probe scores -> activation store
-# --------------------------------------------------------------------------- #
-def run_repackage_probe_scores(args):
-    """NOT IMPLEMENTED (deliberate boundary, not an oversight). Consumer side
-    is DONE: ProbeScoreSource reads any source_kind="probe-scores" v2 store.
-    The alignment core is DONE and tested: nanochat_char_offsets +
-    align.gemma_to_qwen_map(prefix) already bridge any offset-mapped tokenizer
-    pair, gemma included (align.get_offsets works on the gemma fast tokenizer).
-
-    Remaining work, per shard sid of hf.co/kaushikreddyxyz/climbmix-scored(+
-    -overflow..-7): walk shard_<sid>.parquet docs in row order alongside
-    docs_<sid>.jsonl {doc,start,n} spans; gemma-tokenize each doc
-    (add_special_tokens=False; verify len==n and, when tokens_<sid>.npy is
-    local, ids match bit-exact); nanochat-tokenize + char offsets; per nanochat
-    token take the LAST gemma token whose span ends at or before it (prefix
-    mode, causal); gather scores_<sid>.npy[start:start+n, layer_idx, :] for ONE
-    layer (--layer, default 8 — one-layer-per-model is binding), dequantize
-    with quant.json zero/scale and standardize with corpus_stats.json mean/std
-    (both [3][54]; concept axis order = columns.json "concepts", the
-    family-sorted main-block order); unmapped tokens get EXACT zero rows; write
-    per-shard activations_<sid>.int8/index_<sid>.npy/meta_<sid>.json
-    (source_kind "probe-scores", global scale = clip_sigma/127 since scores are
-    standardized) and reuse assemble (probe flavor: no fit/P) + the mandatory
-    preflight."""
-    raise NotImplementedError(
-        "--mode repackage-probe-scores is a documented boundary: the "
-        "ProbeScoreSource reader and the gemma->nanochat alignment core exist; "
-        "the shard-walking repackage pass does not yet. See this function's "
-        "docstring and nanochat/injection/README.md for the exact remaining work.")
-
-
-# --------------------------------------------------------------------------- #
 # MEASURE-CROSSING: prefix-mode crossing rate for the qwen<->nanochat pair
 # --------------------------------------------------------------------------- #
 def run_measure_crossing(args):
@@ -1261,7 +1208,7 @@ def build_argparser():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode", default="sweep",
                     choices=["fit", "sweep", "merge-stats", "assemble", "verify",
-                             "preflight", "measure-crossing", "repackage-probe-scores"])
+                             "preflight", "measure-crossing"])
     ap.add_argument("--encoder-ckpt", help="expA best.pt (Qwen full-FT + 3K head)")
     ap.add_argument("--probe-set", help="probe_set.json file or its dir")
     ap.add_argument("--shards", default="0-190", help="e.g. 0-190 or 0-3,10")
@@ -1355,8 +1302,6 @@ def main():
         run_preflight(args)
     elif args.mode == "measure-crossing":
         run_measure_crossing(args)
-    elif args.mode == "repackage-probe-scores":
-        run_repackage_probe_scores(args)
 
 
 def _require(args, names):
