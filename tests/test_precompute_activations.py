@@ -576,7 +576,7 @@ print("\n[10] preflight consumer-path cross-check")
 
 class FakeFullTok:
     """RustBPETokenizer stand-in: .enc + get_bos_token_id + batch encode with
-    prepend, mirroring exactly the call coord_dataloader makes."""
+    prepend, mirroring exactly the call the activation dataloader makes."""
 
     def __init__(self, enc, bos_id=99991, extra_tail=0):
         self.enc = enc

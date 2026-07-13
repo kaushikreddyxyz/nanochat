@@ -1,62 +1,75 @@
-# nanochat.oracle — oracle-feature injection
+# nanochat.injection — feature injection
 
 ## Status & review guide (2026-07-13)
 
 History reads linearly: `main` → `experimental-setup` (the prior baseline-run
-setup, 3 commits) → the injection work on top (4 commits):
+setup, 3 commits) → the injection work on top (`git log --oneline
+pre-injection..HEAD`):
 
-1. `9f9469b` — the v1 coord-injection diffs applied verbatim (baseline for review)
+1. `9f9469b` — v1 coord-injection diffs applied verbatim (baseline for review)
 2. `29fa9a2` — modules moved in as `nanochat.oracle`, imports normalized, align vendored
-3. `96b79cc` — gpt.py routed through `InjectionSite` (v2), optimizer contract, legacy-flag compat
-4. `197bfdd` — tests + this README
+3. `96b79cc` — gpt.py routed through `InjectionSite` (v2), optimizer contract
+4. `197bfdd` — tests + first README
+5. `3adf4c8` — review-readiness README pass
+6. `9b6129d` — **base_train back to stock** (byte-identical to `pre-injection`)
+7. `c6d8f3d` — **package rename `nanochat.oracle` → `nanochat.injection`**, ActivationSource interface, gate default 1.0, activation-store-v2
+8. `9d38414` — **`scripts/injection_train.py`** (dedicated injection training script)
+9. (tip) — this README
 
-Suggested review order: `injections.py` (the design contract lives in its
-docstring) → `gpt.py` (`setup_injection_sites`, the forward hook) →
-`scripts/base_train.py` (flags, param groups) → `coords_store.py` /
-`coord_dataloader.py` (unchanged v1 semantics) → `scripts/precompute_coords.py`
-→ `tests/`. All 3 test files + `python -m nanochat.oracle.smoke` pass on CPU.
+Suggested review order: `sites.py` (the injection contract) → `sources.py`
+(ActivationSource + store format) → `gpt.py` (`setup_injection_sites`, forward
+hook) → `scripts/injection_train.py` → `activation_dataloader.py` →
+`scripts/precompute_activations.py` → `tests/`. All 3 test files +
+`python -m nanochat.injection.smoke` pass on CPU.
+
+**Why the package is named `injection`, not `oracle`**: in this project's
+terminology "oracle" is reserved for the *reliance failure mode* under study,
+not for the machinery that injects features. Both families (geometric-manifold
+`inject.py` and the contextual activation injection) live here.
 
 **Blockers before any injected training run** (deliberate, not oversights):
 
-- **The coord store does not exist.** The old `oracle-coords`/`-b` HF repos
-  were deleted 2026-07-09; the precompute fleet (below) must run first.
-- **Encoder gap**: the precompute loader implements the legacy Exp-A encoder
-  head, but the Exp-A checkpoint repo (`oracle-encoder`) was also deleted
-  2026-07-09. What exists: the per-layer oracles on
-  `kaushikreddyxyz/oracle-encoders` (`layer06/08/14/best_stripped.pt`,
-  head = `OracleMLPHead` 1024→4096→54 — a *different* head). Before the fleet
-  runs, either point the loader at a per-layer checkpoint via a small adapter
-  (natural choice: `layer08`, since `build_coords` consumes the L8 block), or
-  supply a surviving local Exp-A checkpoint. This is experiment-design work,
-  not a bug.
-- GPU-side validations never run on the real stack (see the end of this file).
-- Open decision: whether to add a **coords-on eval pass** (eval is coords-off
-  by design today).
+- **No activation store exists.** The old `oracle-coords`/`-b` HF repos were
+  deleted 2026-07-09; a store must be precomputed (fleet pipeline below) or
+  repackaged from the probe-score stores (see ProbeScoreSource status).
+- **Encoder gap** (qwen-encoder flavor): the precompute loader implements the
+  legacy Exp-A encoder head, but the Exp-A checkpoint repo (`oracle-encoder`)
+  was deleted 2026-07-09. What exists: per-layer oracles on
+  `kaushikreddyxyz/oracle-encoders` (`layer06/08/14/best_stripped.pt`, head =
+  `OracleMLPHead` 1024→4096→54 — a *different* head). Before a fleet run,
+  point the loader at a per-layer checkpoint via a small adapter (natural
+  choice: `layer08`) or supply a surviving local Exp-A checkpoint.
+  Experiment-design work, not a bug.
+- **ProbeScoreSource repackaging is a NotImplemented boundary**: the reader is
+  complete; the offline `--mode repackage-probe-scores` pass is not (see below).
+- GPU-side validations never ran on the real stack (end of this file).
+- Open decision: whether to add an **activations-on eval pass** (eval is
+  activations-off by design today).
 
 ---
 
-Two feature families live here:
+Two feature families:
 
-1. **Geometric-manifold oracle** (`inject.py`, `smoke.py`): a frozen additive
-   feature that is a pure function of the *token id* (ring / line / sphere /
-   helix in reserved residual dims), added before the trunk.
-   `python -m nanochat.oracle.smoke` validates it end-to-end on CPU.
-2. **Contextual coord injection** (`injections.py`, `coords_store.py`,
-   `coord_dataloader.py`, `align.py`, plus `scripts/precompute_coords.py`):
-   per-token-*occurrence* activations — e.g. probe-score coords produced by a
-   frozen Qwen encoder over each document — added into the residual stream
-   after a chosen block during pretraining. This README documents family 2.
+1. **Geometric-manifold injection** (`inject.py`, `smoke.py`): a frozen
+   additive feature that is a pure function of the *token id* (ring / line /
+   sphere / helix in reserved residual dims), added before the trunk.
+   `python -m nanochat.injection.smoke` validates it end-to-end on CPU.
+2. **Contextual activation injection** (`sites.py`, `sources.py`,
+   `activation_dataloader.py`, `align.py`, `scripts/precompute_activations.py`,
+   `scripts/injection_train.py`): per-token-*occurrence* activations added into
+   the residual stream after a chosen block during pretraining. This README
+   documents family 2.
 
 ## What an injection is
 
-An injection site (`injections.InjectionSite`) decomposes into exactly three
-parts with **fixed optimizability rules**:
+An injection site (`sites.InjectionSite`) decomposes into exactly three parts
+with **fixed optimizability rules**:
 
 | part | what it is | optimizable? |
 |---|---|---|
-| **gate** | loudness dial: injected per-token RMS = `gate` × per-token RMS(residual). `gate=0` is exactly off. | **NEVER.** It is a parameter so autograd *assigns* it a gradient every backward (a loggable want-signal, dL/dgate), but it sits in no optimizer group and is never stepped. |
-| **activation** | the content: a `(B, T, r)` tensor per batch from a pluggable source (Qwen coord store, gold probe scores, any `FnActivation`). | **NEVER.** Produced without grad by the dataloader and additionally `detach()`ed by the site. |
-| **direction** | `(r, n_embd)` map from activation channels into the residual stream. | **The only optionally-trainable part**, controlled purely by freeze/unfreeze (`requires_grad`). Frozen + orthonormal init = the "tabular" injection (the fixed-P v1 behavior); unfrozen = "free" injection (the model learns where the feature lives). |
+| **gate** | loudness dial: injected per-token RMS = `gate` × per-token RMS(residual). `gate=0` is exactly off. **Default 1.0** — as loud as the stream itself. | **NEVER.** A parameter so autograd *assigns* it a gradient every backward (a loggable want-signal, dL/dgate), but it sits in no optimizer group and is never stepped. |
+| **activation** | the content: a `(B, T, r)` tensor per batch from a pluggable `ActivationSource`. | **NEVER.** Produced without grad by the dataloader and additionally `detach()`ed by the site. |
+| **direction** | `(r, n_embd)` map from activation channels into the residual stream. | **The only optionally-trainable part**, controlled purely by freeze/unfreeze. Frozen + orthonormal init = "tabular" injection (the fixed-P v1 behavior); unfrozen = "free" injection. |
 
 Site math (per token):
 
@@ -67,8 +80,8 @@ x     = x + gate * rms(x).detach() * z_hat
 ```
 
 `rms(x)` is detached: it *measures* the stream to calibrate amplitude; it is
-not a path for the injection to shape the stream's own norm gradients.
-Invariants (all pinned by `tests/test_injection_sites.py`):
+not a gradient path into the stream's own norm. Invariants (pinned by
+`tests/test_injection_sites.py`):
 
 - **zero activation rows (BOS / missing doc) are an EXACT no-op** — no NaN, no
   branch (the `rms(z)` clamp), torch.compile-friendly;
@@ -82,46 +95,137 @@ Invariants (all pinned by `tests/test_injection_sites.py`):
 fires each site after its own block. `acts=None` (eval, inference, vanilla
 runs) is bit-identical to a model without sites.
 
-## Training flags (`scripts/base_train.py`)
+### Gate default changed to 1.0
 
-**Legacy single-site form** — exactly the v2 single-site special case (one
-tabular site named `"coords"`: gate = beta, frozen direction = the store's
-fixed orthonormal P, Qwen coord store as source):
+`InjectionCfg.gate` (and `injection_train.py --gate`) default to **1.0**: the
+injected signal is as loud as the residual stream itself. The v1 run used
+0.05 — **anyone reproducing v1 must pass `--gate 0.05` explicitly**.
+
+## Activation sources (`sources.py`)
+
+The per-token content is called **activations** everywhere user-facing.
+`ActivationSource` is the explicit interface:
+
+- `.name` — the site the source feeds; `.r` — channels;
+- `.lookup(doc_text, n_tokens) -> ((n_tokens, r) float32 | None, key)`;
+- `.add_noise(z, key)` — deterministic train-time noise, seeded by
+  `(train seed, doc content hash)` (DDP-rank/resume-independent, not
+  memorizable as a per-position identity).
+
+**Contract (do not "fix" this)**: `lookup` returning `None` (doc missing from
+a store, or stored token count mismatching = tokenizer drift) MUST be mapped to
+**EXACT zeros with NO noise** by the caller. The site renormalizes any nonzero
+row to full gate amplitude, so noised zeros would inject pure noise at full
+strength on exactly the docs we know nothing about; exact zeros keep the
+injection a strict no-op there. The same reasoning makes store quantization
+**zero-preserving with no mean-centering** (raw 0 → int8 0 → dequant 0 → no-op);
+per-column mean/std are recorded in `meta.json` but only the single global
+`scale` is applied by the reader.
+
+Implementations:
+
+- **`QwenEncoderSource`** (`source_kind: "qwen-encoder"`) — precomputed
+  predictions of the frozen Qwen oracle-encoder, structured into r=14
+  ring/PCA activations by `scripts/precompute_activations.py` (fit/sweep/
+  assemble pipeline below). This is the renamed v1 `CoordSource`.
+- **`ProbeScoreSource`** (`source_kind: "probe-scores"`) — gold gemma probe
+  scores (one layer's 54 standardized scores, per the binding
+  one-layer-per-model rule) repackaged per nanochat token. Reader complete;
+  producer is a boundary (status below).
+- **`FnSource`** — arbitrary callable `fn(text, n_tokens) -> (n_tokens, r)`
+  for synthetic/control injections. A future **runtime gold-probe source**
+  (computing gemma probe scores on the fly) plugs in through the same
+  protocol.
+- `open_store(dir, ...)` dispatches on `meta.json["source_kind"]`.
+
+### Activation store format (`activation-store-v2`)
+
+One directory:
 
 ```
---inject-coords <coords_dir>    # store dir: coords.int8 / index.npy / P.npy / meta.json
---inject-after-block 7          # inject right AFTER transformer.h[7] (default: 8 of 24 blocks)
---inject-beta 0.05              # gate: injected RMS as a fraction of residual RMS
---inject-noise-sigma 0.15       # loader-side gaussian noise on coords (deterministic per doc hash)
+activations.int8   memmap int8 [n_doc_tokens, r]   standardized, quantized (zero-preserving)
+index.npy          structured [n_docs] (hash uint64, off int64, n int32)
+meta.json          {"format": "activation-store-v2", "source_kind": ..., "r", "scale", ...}
+P.npy              optional float32 [n_embd, r] fixed orthonormal projection (qwen flavor)
 ```
+
+Activations are stored **per document keyed by content hash** (the training
+loader packs+crops docs in a data-dependent order; hash keying is
+order-/DDP-independent) and ride through the exact same best-fit packing as
+the tokens (`activation_dataloader.py`, pinned bit-identical to the stock
+loader by `tests/test_activation_lockstep.py`). Readers **require** the v2
+format keys; legacy `coords.int8` support was **dropped entirely** (no pre-v2
+store exists anywhere — the old HF stores were deleted).
+
+### ProbeScoreSource repackaging status (NotImplemented boundary)
+
+What exists: the complete reader (`ProbeScoreSource`), and the alignment core
+— `nanochat_char_offsets` (nanochat byte→char offsets) + `align.gemma_to_qwen_map`
+prefix mode, which is tokenizer-agnostic and already tested; gemma offsets come
+from `align.get_offsets` on the (gated) gemma-2-2b fast tokenizer.
+
+What remains (`scripts/precompute_activations.py --mode repackage-probe-scores`
+currently raises NotImplementedError with the same statement): walk each
+ClimbMix shard's parquet docs in row order alongside
+`hf.co/kaushikreddyxyz/climbmix-scored(+overflow…-7)` shard files
+(`scores_<sid>.npy` int8 `[n,3,54]`, `docs_<sid>.jsonl` `{doc,start,n}` spans,
+shards 0–184, full coverage); gemma-tokenize each doc
+(`add_special_tokens=False`, verify `len == n`, bit-check against
+`tokens_<sid>.npy` when local); map each nanochat token to the **last gemma
+token whose char span ends at or before it** (prefix mode — causal, no future
+leakage; this is the chosen policy, not mean-over-span); slice ONE layer's 54
+columns (`--layer 8` default; concept axis order = `columns.json["concepts"]`,
+the family-sorted main-block order — the permutation trap), dequantize with
+`quant.json` and standardize with `corpus_stats.json`; unmapped tokens get
+exact zero rows; write per-shard v2 store files and reuse assemble + the
+mandatory preflight.
+
+## Training (`scripts/injection_train.py`)
+
+**base_train is stock again**: `scripts/base_train.py` was designed for
+non-injection models and is byte-identical to the `pre-injection` tag —
+vanilla runs have zero injection surface. `scripts/injection_train.py` is the
+injection script: a deliberate fork whose shared body is kept byte-identical
+to base_train (so `diff scripts/base_train.py scripts/injection_train.py`
+shows only the injection hunks — keep it that way when either changes). The
+old `--inject-coords/--inject-beta/...` flag family is gone.
+
+**Single tabular site from a store** (legacy-equivalent v1 run shown — note
+the explicit 0.05 gate):
+
+```
+python -m scripts.injection_train -- --activation-store <store_dir> \
+    --after-block 7 --gate 0.05 --noise-sigma 0.15
+```
+
+One site named `"acts"`: frozen direction pinned to the store's `P.npy` when
+present (else seeded orthonormal via the store's `p_seed`), source opened by
+`meta.json` kind. Omitting `--gate` gives the new default **1.0**.
 
 **General multi-site form**:
 
 ```
---inject-config path/to/config.json
+python -m scripts.injection_train -- --activation-config path/to/config.json
 ```
 
 ```json
 {
   "sites": [
-    {"name": "coords", "r": 14, "after_block": 7, "gate": 0.05,
+    {"name": "acts", "r": 14, "after_block": 7, "gate": 0.05,
      "trainable_direction": false, "direction_seed": 1337},
-    {"name": "free",   "r": 14, "after_block": 12, "gate": 0.1,
+    {"name": "free", "r": 54, "after_block": 12, "gate": 1.0,
      "trainable_direction": true, "direction_init": "orthonormal", "optim": "muon"}
   ],
   "sources": {
-    "coords": {"kind": "coords", "dir": "/workspace/coords", "noise_sigma": 0.15},
-    "free":   {"kind": "coords", "dir": "/workspace/coords", "noise_sigma": 0.15}
+    "acts": {"kind": "qwen-encoder", "dir": "/workspace/acts_qwen", "noise_sigma": 0.15},
+    "free": {"kind": "probe-scores", "dir": "/workspace/acts_probes", "noise_sigma": 0.15}
   }
 }
 ```
 
-Site dicts are `injections.InjectionCfg` fields. `sources` keys must match the
-site names; the JSON config supports `kind: "coords"` (a `CoordSource` store
-dir); other sources (`FnActivation` for synthetic/control injections) are
-programmatic. Sites may share a source, block, or neither. Absent both flags,
-base_train is a byte-identical vanilla run (no extra params, no extra RNG
-draws, stock dataloader).
+Site dicts are `sites.InjectionCfg` fields; `sources` keys must match site
+names; `FnSource` remains programmatic. Exactly one of
+`--activation-store`/`--activation-config` is required.
 
 ## Optimizer contract
 
@@ -129,147 +233,114 @@ Wired in `GPT.setup_optimizer` (asserted by the param-count check there):
 
 - **gates** (`_never_optimize`) go in **no** param group;
 - **frozen directions** are skipped;
-- **trainable directions** join an AdamW group by default (embedding-like map;
-  betas `(0.8, 0.995)`), or a Muon group with `"optim": "muon"` per site;
+- **trainable directions** join an AdamW group by default, or Muon with
+  `"optim": "muon"` per site;
 - **weight decay is 0.0 for directions in both flavors** — the site normalizes
-  the direction's scale away (`z / rms(z)`), so decay is a forward no-op that
-  only shrinks the matrix toward the rms clamp. base_train's weight-decay
-  scheduler skips the `injection`-tagged muon groups for the same reason.
+  the direction's scale away (`z / rms(z)`), so decay only shrinks the matrix
+  toward the rms clamp. injection_train's wd scheduler skips the
+  `injection`-tagged muon groups for the same reason.
 
 After any `load_state_dict(..., assign=True)` (resume, eval load), call
-`injections.reassert_optimizability(model.injection_sites)` — assign-loads
-replace the Parameter objects and drop the gate's `_never_optimize` stamp.
-base_train and `checkpoint_manager.build_model` already do this.
+`sites.reassert_optimizability(model.injection_sites)` — assign-loads replace
+the Parameter objects and drop the gate's `_never_optimize` stamp.
+injection_train and `checkpoint_manager.build_model` already do this.
 
 ## Checkpoints
 
-- Injected checkpoints carry `injection_sites.*` keys and an
-  `injection_sites_config` (+ `injection_source_specs`) entry in the meta json;
-  `checkpoint_manager.build_model` rebuilds the sites from meta so eval scripts
-  load them (sites stay dormant — see below).
+- Injected checkpoints carry `injection_sites.*` keys and
+  `injection_sites_config` (+ `injection_source_specs`) in the meta json;
+  `checkpoint_manager.build_model` rebuilds the sites from meta so eval
+  scripts load them (sites stay dormant — eval is activations-off).
 - **Warm-start from a vanilla checkpoint** into an injected run is allowed:
-  only the `injection_sites.*` keys may be missing (they keep their fresh
-  init). With frozen directions the optimizer param groups are identical to
-  vanilla, so the optimizer state resumes too; trainable directions change the
-  group structure and cannot resume a vanilla optimizer state.
+  only `injection_sites.*` keys may be missing (they keep their fresh init).
+  Frozen directions leave the optimizer groups identical to vanilla, so the
+  optimizer state resumes too; trainable directions change the group
+  structure and cannot resume a vanilla optimizer state.
 - A vanilla model strict-loading an injected checkpoint fails loudly (by
-  design — use `build_model`, which reattaches the sites first).
+  design — use `build_model`).
 
-## Eval runs coords-off
+## Eval runs activations-off
 
 Val bpb, CORE, and sampling all call the model with `acts=None`: **evaluation
-is coords-off by design** (the model must not need the oracle to function).
-Whether to add a coords-on eval pass is a separate, deliberate decision.
+is activations-off by design** (the model must not need the injected signal to
+function). An activations-on eval pass is a separate, deliberate decision.
 
-## Precompute pipeline (`scripts/precompute_coords.py`)
+## Precompute pipeline (`scripts/precompute_activations.py`, qwen flavor)
 
-Produces the doc-hash-keyed int8 coord store the loader reads. Prereqs on
-every pod: the **baseline run's tokenizer** at `$NANOCHAT_BASE_DIR/tokenizer`
-(coord/token alignment is keyed to its exact merges) and the ClimbMix shards
-at `$NANOCHAT_BASE_DIR/base_data_climbmix` (`python -m nanochat.dataset`).
-The probe set json lives in the superproject (e.g.
-`attribution/out/probe_set.json`). The encoder checkpoint: historically the
-frozen Exp-A Qwen encoder (`best.pt`) — **its HF repo was deleted 2026-07-09**;
-see the encoder-gap blocker in the status section for the per-layer-oracle
-replacement path.
+Produces the doc-hash-keyed int8 activation store. Prereqs on every pod: the
+**baseline run's tokenizer** at `$NANOCHAT_BASE_DIR/tokenizer` (alignment is
+keyed to its exact merges) and the ClimbMix shards at
+`$NANOCHAT_BASE_DIR/base_data_climbmix` (`python -m nanochat.dataset`). The
+probe set json lives in the superproject (`attribution/out/probe_set.json`).
+Encoder checkpoint: see the encoder-gap blocker above.
 
 ```bash
-# 1) pod 0 fits continents PCA + the global coord scale ONCE (shared by all pods)
-python -m scripts.precompute_coords --mode fit --encoder-ckpt <expA.pt> \
+# 1) pod 0 fits continents PCA + the global scale ONCE (shared by all pods)
+python -m scripts.precompute_activations --mode fit --encoder-ckpt <expA.pt> \
     --probe-set <superproject>/attribution/out/probe_set.json \
-    --shards 0-3 --out /workspace/coords
+    --shards 0-3 --out /workspace/acts
 
 # 2) every pod sweeps its round-robin shard slice (resumable, atomic per shard)
-python -m scripts.precompute_coords --mode sweep --encoder-ckpt <expA.pt> \
+python -m scripts.precompute_activations --mode sweep --encoder-ckpt <expA.pt> \
     --probe-set <superproject>/attribution/out/probe_set.json \
-    --shards 0-190 --out /workspace/coords --pod-index $P --n-pods $NP \
-    --fast-forward --feeder-workers 8          # ~3.2x throughput, see below
+    --shards 0-190 --out /workspace/acts --pod-index $P --n-pods $NP \
+    --fast-forward --feeder-workers 8          # ~3.2x throughput
 
-# 3) after the fleet finishes, on ONE node with all per-shard files present:
-python -m scripts.precompute_coords --mode merge-stats --out /workspace/coords
-python -m scripts.precompute_coords --mode assemble --encoder-ckpt <expA.pt> \
+# 3) after the fleet, on ONE node with all per-shard files present:
+python -m scripts.precompute_activations --mode merge-stats --out /workspace/acts
+python -m scripts.precompute_activations --mode assemble --encoder-ckpt <expA.pt> \
     --probe-set <superproject>/attribution/out/probe_set.json \
-    --shards 0-190 --out /workspace/coords
-    # -> coords.int8 / index.npy / meta.json / P.npy
-    # assemble HARD-FAILS on missing shards (--allow-missing-shards to override):
-    # a partial store silently zero-coords the missing shards' docs.
+    --shards 0-190 --out /workspace/acts
+    # -> activations.int8 / index.npy / meta.json / P.npy
+    # assemble HARD-FAILS on missing shards (--allow-missing-shards to override)
 
 # 4) *** MANDATORY pre-launch gate — never skip this ***
-python -m scripts.precompute_coords --mode preflight \
-    --shards 0-190 --out /workspace/coords --preflight-docs 1024
+python -m scripts.precompute_activations --mode preflight \
+    --shards 0-190 --out /workspace/acts --preflight-docs 1024
 ```
 
 **Why preflight is mandatory**: it cross-checks the CONSUMER token path
-(`RustBPETokenizer.encode(batch, prepend=bos)`, exactly as `coord_dataloader`)
-against the assembled store, and hard-fails on tokenizer-contract drift or
-token coverage < 99.9%. The failure it catches is the one that otherwise
-**silently trains a baseline**: every lookup misses → all coords fall back to
-zero → the injection no-ops on every token and nothing tells you.
+(`RustBPETokenizer.encode(batch, prepend=bos)`, exactly as the activation
+dataloader) against the assembled store and hard-fails on tokenizer-contract
+drift or token coverage < 99.9%. The failure it catches otherwise **silently
+trains a baseline**: every lookup misses → all activations fall back to zero →
+the injection no-ops on every token and nothing tells you. It is
+source-kind-agnostic (works for probe-scores stores too).
 
 Optional QA: `--mode verify` (recompute K docs live, assert int8 round-trip
-within one quant step), `--mode measure-crossing` (prefix-mode crossing rate
-for the qwen→nanochat tokenizer pair).
-
-### Zero-fallback design note (do not "fix" this)
-
-A doc missing from the store (or with a stored token count that mismatches —
-tokenizer drift) gets **EXACT zero coords with NO noise**. The injection site
-renormalizes any nonzero activation to full gate amplitude, so noised zeros
-would inject pure noise at full strength on exactly the docs we know nothing
-about. Exact zeros keep the injection a strict no-op there. The same reasoning
-makes quantization **zero-preserving with no mean-centering**: a concept-free
-token (raw coord 0) must stay int8 0 → dequant 0 → no-op. Per-column mean/std
-ARE recorded in `meta.json` (required artifact), but only the single global
-`scale` is applied by the loader.
-
-### Noise design
-
-`--inject-noise-sigma` gaussian noise is added by the **loader at train time**
-(never baked into the store), seeded by `(train seed, doc content hash)`:
-DDP-rank- and resume-independent, reproducible, and not memorizable as a
-per-position identity.
-
-### Fast-forward sweep (consumers of a mixed store, read this)
-
-`--fast-forward` length-buckets segments **across docs** and packs each padded
-forward to a token budget (`--max-batch-tokens`, `--seg-buffer`); with
-`--feeder-workers N` the CPU-side tokenize/align runs in worker processes
-(order-preserving, byte-identical output). bf16 GEMM results vary with batch
-*shape*, so fast vs serial coords differ by fp noise: measured p99.9 of the
-perturbation is **below** the sigma=0.15 training noise, and ≥99.9% of int8
-values are within one quant step. The **zero-fallback positions are
-bit-identical** on both paths (set structurally in `_gather`, independent of
-batching). Stores mixing serial- and fast-swept shards are therefore fine;
-the store format/index/meta are identical.
+within one quant step), `--mode measure-crossing` (prefix-mode crossing rate).
+`--fast-forward` (length-bucketed cross-doc batching) equals the serial path
+within one int8 step with bit-identical zero-fallback; `--feeder-workers`
+parallelizes tokenize/align in spawn workers with byte-identical output.
 
 ## Tests (CPU, no GPU / tokenizer / checkpoint needed)
 
 ```bash
-python -m pytest tests/test_injection_sites.py tests/test_coord_lockstep.py \
-                 tests/test_precompute_coords.py
-# or standalone: python tests/test_coord_lockstep.py  etc.
+python -m pytest tests/test_injection_sites.py tests/test_activation_lockstep.py \
+                 tests/test_precompute_activations.py
+python -m nanochat.injection.smoke
 ```
 
 - `test_injection_sites.py` — site invariants (RMS calibration, exact zero-row
-  no-op, gate-0 no-op + zero direction grad, gate grads assigned but excluded
-  from the optimizer split, state-dict keys, v1↔v2 forward equivalence) and the
-  GPT wiring (acts=None ≡ vanilla; optimizer contract; step behavior).
-- `test_coord_lockstep.py` — the ride-along loader against the REAL packing
-  source (ast-extracted from `nanochat/dataloader.py`): bit-identical token
-  stream, coord↔token alignment through best-fit + crops, exact-zero BOS /
-  missing-doc rows even with noise on, deterministic noise, int8 round-trip.
-- `test_precompute_coords.py` — the producer: phase-angle mapping (all 54
+  no-op, gate-0 no-op + zero direction grad, gate default 1.0, optimizer
+  split, state-dict keys, v1↔v2 forward equivalence) and the GPT wiring
+  (acts=None ≡ vanilla; optimizer contract; step behavior).
+- `test_activation_lockstep.py` — the ride-along loader against the REAL
+  packing source (ast-extracted from `nanochat/dataloader.py`): bit-identical
+  token stream, activation↔token alignment through best-fit + crops,
+  exact-zero BOS / missing-doc rows even with noise on, deterministic noise,
+  store round-trip, format/source_kind enforcement + `open_store` dispatch.
+- `test_precompute_activations.py` — the producer: phase-angle mapping (all 54
   one-hot concepts), PCA determinism, zero-preserving quantization, store
-  assemble/read-back through the real `CoordSource`, pod-sharding coverage,
-  byte→char offset reconstruction under adversarial UTF-8 splits, chunked +
-  fast-forward flush equivalence, preflight drift detection, Welford
-  merge-stats. Needs the superproject's `probe_set.json`
-  (`$ORACLE_PROBE_SET` or `../attribution/out/probe_set.json`); skips
-  otherwise.
+  assemble/read-back through the real reader, pod-sharding coverage, byte→char
+  offsets under adversarial UTF-8, chunked + fast-forward flush equivalence,
+  preflight drift detection, Welford merge-stats. Needs the superproject's
+  `probe_set.json` (`$ORACLE_PROBE_SET` or `../attribution/out/probe_set.json`);
+  skips otherwise.
 
 Not validated on CPU (needs a real run): torch.compile + fp8 over the site
-graph, CoordSource index throughput at the 27M-doc scale (~2-3 GB/rank), and
-the precompute encoder wiring on the real Exp-A checkpoint + real
-tiktoken/qwen tokenizer pair. SMOKE an injected launch first (3 steps, nothing
-saved): step time should stay within ~3% of baseline and the per-site banner
-must print the expected `r` / `after_block` / `gate` / docs count.
+graph, store index throughput at the 27M-doc scale (~2-3 GB/rank), and the
+precompute encoder wiring on a real checkpoint + real tokenizer pair. SMOKE an
+injected launch first (a few steps, nothing saved): step time within ~3% of
+baseline and the per-site banner must print the expected `r` / `after_block` /
+`gate` / docs count.

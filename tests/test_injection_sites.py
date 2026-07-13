@@ -49,7 +49,7 @@ def _tabular_site(beta=0.05, seed=1337, trainable=False, r=R, n_embd=N_EMBD):
 
 def test_orthonormal_direction_matches_v1_P():
     """orthonormal_direction == make_orthonormal_P transposed, bitwise: the
-    legacy --inject-coords path reproduces the store's P from the same seed."""
+    single-store training path reproduces the store's P from the same seed."""
     P = make_orthonormal_P(N_EMBD, R, seed=1337)                # (n_embd, r) numpy
     D = orthonormal_direction(R, N_EMBD, seed=1337)             # (r, n_embd) torch
     assert np.array_equal(P.T, D.numpy())
