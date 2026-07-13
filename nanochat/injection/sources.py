@@ -217,8 +217,10 @@ class FnSource(ActivationSource):
 # --------------------------------------------------------------------------- #
 # Runtime probe-score sources: apply the gold gemma probe scores per nanochat
 # token AT RUNTIME, nothing stored offline. Both backends share the same
-# gemma->nanochat alignment (prefix mode: each nanochat token takes the LAST
-# gemma token whose char span ends at or before it — causal, no future leakage)
+# gemma->nanochat alignment (char-span OVERLAP; default mean over covering
+# gemma tokens, "last" = last overlapping. A boundary-straddling gemma token
+# leaks sub-token future-char content into position t; compact-tokens mode is
+# the leak-free variant)
 # and the same dequant/standardize with the frozen quant/corpus_stats constants;
 # they differ only in where the per-doc gemma scores come from (a pre-scored HF
 # store, or a live gemma scorer). Columns default to one layer's 54 concepts in
