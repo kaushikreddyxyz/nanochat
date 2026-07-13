@@ -197,12 +197,14 @@ class ShardPrefetcher:
             t0 = time.time()
             try:
                 res = self.fetch_fn(sid)       # nearest-ahead first, then the loop re-windows
-            except Exception:                  # transient (network): drop the reservation, back off;
+            except BaseException as e:         # transient (network): drop the reservation, back off;
                 with self._cv:                 # a persistent failure surfaces via ensure's inline fetch
                     self._inflight.discard(sid)
                     self._cv.notify_all()
-                    if not self._stop:
+                    if not self._stop and isinstance(e, Exception):
                         self._cv.wait(timeout=2.0)
+                if not isinstance(e, Exception):
+                    raise                      # non-Exception kills the worker, but never holds the reservation (ensure would hang on it)
                 continue
             with self._cv:
                 self._inflight.discard(sid)

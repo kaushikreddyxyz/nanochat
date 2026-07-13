@@ -76,6 +76,10 @@ def duty_cycle_forecast(production_tok_s, consumption_tok_s):
            f"forecast duty cycle ~{duty * 100:.0f}%")
     if ratio < 1.0:
         msg += ", consider more --lookup-workers / download streams"
+    elif ratio < 1.5:
+        # production is pre-packing, consumption post-packing: best-fit cropping
+        # discards ~35% of produced tokens, so <1.5x actually starves.
+        msg += " (MARGINAL: best-fit packing crops ~35% of produced tokens)"
     return ratio, duty, msg
 
 
@@ -92,6 +96,15 @@ def rebuffer_progress(depth_tokens, target_tokens, tok_per_s, activity=None):
     tail = f" — {activity}" if activity else ""
     msg = f"buffering {frac * 100:.0f}% ({eta_str}){tail}"
     return frac * 100.0, eta, msg
+
+
+def shard_cover_seconds(tokens_per_shard, per_rank_consumption_tok_s, world_size):
+    """Wall seconds one score shard lasts in training. DDP ranks stride row
+    groups WITHIN each shard (``_document_batches``), so every rank crosses
+    shard boundaries at the GLOBAL consumption pace — and every rank downloads
+    every shard: cover = tokens_per_shard / (per_rank_consumption * world)."""
+    world_cons = float(per_rank_consumption_tok_s) * max(int(world_size), 1)
+    return float(tokens_per_shard) / max(world_cons, 1e-9)
 
 
 def size_prefetch_streams(shard_bytes, download_bytes_per_s, cover_seconds,

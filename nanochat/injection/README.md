@@ -307,9 +307,12 @@ before fetching (so siblings pick different shards, never the same one), and the
 inline `ensure` fallback adds at most one catch-up fetch. If `streams` isn't set
 explicitly, `injection_train` **sizes it from the prefill bandwidth measurement**:
 `buffering.size_prefetch_streams(shard_bytes, measured_MB/s, cover_seconds)` where
-`cover_seconds = --tokens-per-shard / consumption`, logging the one-line arithmetic
+`cover_seconds = --tokens-per-shard / (per-rank consumption × world)` — ranks
+stride row groups *within* a shard, so every rank crosses shard boundaries at the
+**global** pace and each rank downloads every shard — logging the one-line arithmetic
 (`prefetch sizing: 8.7GB / 90MB/s = 97s download vs 50s/shard training (~1.9x) =>
-2 streams, ahead=3`) and calling `set_streams` (workers only grow). Omit
+2 streams, ahead=3`), calling `set_streams` (workers only grow) and widening
+`ahead` to match. Omit
 `--tokens-per-shard` to skip auto-sizing and honor `--download-streams` / a
 configured `streams`.
 

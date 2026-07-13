@@ -69,7 +69,7 @@ p.stop()
 with lock:
     fetched_snapshot = list(fetched)
     deleted_snapshot = set(deleted)
-    evicted_snapshot = set(deleted)  # on_delete fires just before delete_fn
+    evicted_snapshot = set(evicted)
 check(sorted(set(fetched_snapshot)) == order, f"every shard fetched (got {sorted(set(fetched_snapshot))})")
 check(len(fetched_snapshot) == len(set(fetched_snapshot)), f"no shard fetched twice (idempotent): {fetched_snapshot}")
 check(max_staged <= AHEAD + KEEP + 2, f"staged window stayed bounded (max {max_staged} <= {AHEAD + KEEP + 2}, not bulk {N})")
@@ -77,7 +77,9 @@ check(max_staged <= AHEAD + KEEP + 2, f"staged window stayed bounded (max {max_s
 expected_deleted = set(range(0, N - 1 - KEEP))
 check(expected_deleted <= deleted_snapshot,
       f"consumed shards deleted behind the window (expected superset of {sorted(expected_deleted)}, got {sorted(deleted_snapshot)})")
-check(evicted_snapshot == deleted_snapshot, "on_delete (memmap-evict hook) fired for exactly the deleted shards")
+# on_delete fires just before delete_fn, so deleted ⊆ evicted at any snapshot
+check(deleted_snapshot and deleted_snapshot <= evicted_snapshot,
+      f"on_delete (memmap-evict hook) fired before every delete (evicted={sorted(evicted_snapshot)})")
 check(len(p.stats()["staged"]) <= KEEP + 2, f"final staged set is small ({p.stats()['staged']})")
 
 print("\n[C] behind window -> ensure blocks + fires on_wait (starvation hook)")
@@ -191,6 +193,46 @@ ps.ensure(0)
 time.sleep(0.05)
 ps.stop()
 check(before == 1 and after == 4, f"set_streams raised the stream count {before} -> {after}")
+
+print("\n[H] widening `ahead` on a live prefetcher is honored (auto-sizing grows the window)")
+ph = ShardPrefetcher(list(range(10)), lambda s: (time.sleep(0.005), f"/stage/{s}")[1],
+                     ahead=1, keep_behind=1, streams=1).start()
+ph.ensure(0)
+time.sleep(0.2)
+narrow = max(ph.stats()["staged"], default=-1)
+ph.ahead = 4                                      # what injection_train's auto-sizing does
+ph.set_streams(2)
+time.sleep(0.6)                                   # workers re-window (idle wait <= 0.5s)
+wide = max(ph.stats()["staged"], default=-1)
+ph.stop()
+check(narrow <= 1, f"ahead=1 window stayed at frontier+1 before widening (max staged {narrow})")
+check(wide >= 3, f"raising .ahead mid-run widened the staged window (max staged {wide} >= 3)")
+
+print("\n[I] a BaseException in a worker releases the reservation (ensure never hangs on it)")
+batt = []
+block = threading.Lock()
+
+
+def base_exc_fetch(sid):
+    with block:
+        batt.append(sid)
+        if sid == 1 and batt.count(1) == 1:
+            raise SystemExit("worker killed mid-fetch")   # NOT an Exception subclass
+    return f"/stage/{sid}"
+
+
+pb = ShardPrefetcher([0, 1, 2, 3], base_exc_fetch, ahead=2, keep_behind=1, streams=1).start()
+check(pb.ensure(0) == "/stage/0", "shard 0 staged normally")
+deadline = time.time() + 5.0
+while time.time() < deadline and 1 not in batt:   # wait for the worker to attempt (and die on) shard 1
+    time.sleep(0.01)
+res_box = []
+t_ens = threading.Thread(target=lambda: res_box.append(pb.ensure(1)), daemon=True)
+t_ens.start()
+t_ens.join(timeout=5.0)
+pb.stop()
+check(not t_ens.is_alive() and res_box == ["/stage/1"],
+      f"ensure(1) recovered inline after the worker died (reservation released, got {res_box})")
 
 print("\n" + ("ALL CHECKS PASSED" if not fails else f"{len(fails)} FAILURES: {fails}"))
 if __name__ == "__main__":

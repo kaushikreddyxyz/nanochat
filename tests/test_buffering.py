@@ -28,7 +28,8 @@ sys.path.insert(0, REPO)
 
 from nanochat.injection.buffering import (  # noqa: E402
     BufferState, PREFILL, RUNNING, REBUFFER,
-    coordinate_rebuffer, duty_cycle_forecast, rebuffer_progress, size_prefetch_streams,
+    coordinate_rebuffer, duty_cycle_forecast, rebuffer_progress,
+    shard_cover_seconds, size_prefetch_streams,
 )
 from nanochat.injection.activation_dataloader import BufferControl, _Chunk  # noqa: E402
 
@@ -86,6 +87,10 @@ check("~2.4x" in msg and "~100%" in msg and "consider" not in msg, f"healthy for
 ratio, duty, msg = duty_cycle_forecast(400, 1000)
 check(abs(ratio - 0.4) < 1e-6 and abs(duty - 0.4) < 1e-6, f"prod<cons -> duty ~= ratio ({msg})")
 check("~0.4x" in msg and "~40%" in msg and "consider more" in msg, f"starving forecast has the hint: {msg}")
+ratio, duty, msg = duty_cycle_forecast(1200, 1000)
+check("MARGINAL" in msg and "~35%" in msg, f"1.0-1.5x flags MARGINAL (best-fit crop discount): {msg}")
+_, _, msg = duty_cycle_forecast(2400, 1000)
+check("MARGINAL" not in msg, f">=1.5x is not marginal: {msg}")
 
 
 # --------------------------------------------------------------------------- #
@@ -111,6 +116,12 @@ streams, ahead, _ = size_prefetch_streams(8.7e9, 1e9, 50.0)         # 8.7s dl / 
 check(streams == 1 and ahead == 2, f"fast NIC -> single stream, min window (got {streams},{ahead})")
 streams, ahead, _ = size_prefetch_streams(8.7e9, 10e6, 50.0, max_streams=6)  # 870s dl -> clamp
 check(streams == 6, f"needy sizing clamps to max_streams (got {streams})")
+# cover uses the GLOBAL pace: ranks stride row groups WITHIN a shard, so all
+# ranks cross shard boundaries together (per-rank pace would oversize by world).
+check(abs(shard_cover_seconds(4e8, 1e6, 8) - 50.0) < 1e-6,
+      "shard_cover_seconds divides by world_size (global consumption pace)")
+check(abs(shard_cover_seconds(4e8, 8e6, 1) - 50.0) < 1e-6,
+      "shard_cover_seconds world_size=1 == per-rank pace")
 
 
 # --------------------------------------------------------------------------- #

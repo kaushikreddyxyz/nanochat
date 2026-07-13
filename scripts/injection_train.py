@@ -38,7 +38,7 @@ from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
 from nanochat.injection.sites import InjectionCfg, reassert_optimizability, parse_gate_spec, calibrate_auto_gate
 from nanochat.injection.sources import open_store, RuntimeProbeScoreSource
 from nanochat.injection.activation_dataloader import acts_data_loader_buffered
-from nanochat.injection.buffering import coordinate_rebuffer, duty_cycle_forecast, rebuffer_progress, size_prefetch_streams
+from nanochat.injection.buffering import coordinate_rebuffer, duty_cycle_forecast, rebuffer_progress, shard_cover_seconds, size_prefetch_streams
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
@@ -662,7 +662,9 @@ if _ratio < 1.0 and args.starvation_abort:
 def _size_prefetchers():
     if args.tokens_per_shard <= 0:
         return
-    cover_s = args.tokens_per_shard / max(_cons_tok_s, 1e-9)
+    # global pace: ranks stride row groups WITHIN a shard, so every rank crosses
+    # shard boundaries together (and each downloads every shard).
+    cover_s = shard_cover_seconds(args.tokens_per_shard, _cons_tok_s, ddp_world_size)
     for _nm, _p, _auto in _prefetchers:
         if not _auto:
             continue
@@ -674,6 +676,7 @@ def _size_prefetchers():
         _streams, _ahead, _msg = size_prefetch_streams(args.shard_bytes, _bw, cover_s,
                                                        max_streams=8, min_ahead=_p.ahead)
         print0(f"[prefetch:{_nm}] {_msg}")
+        _p.ahead = max(_p.ahead, _ahead)   # widen the window too, or the extra streams have nothing in-window to fetch
         _p.set_streams(_streams)
 _size_prefetchers()
 
