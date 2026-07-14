@@ -1,0 +1,1734 @@
+{
+ "arm": "baseline",
+ "base_arm": null,
+ "kind": "plain",
+ "has_site": false,
+ "config": {
+  "n_samples": 16,
+  "max_new": 12,
+  "temperature": 0.8,
+  "top_k": 50
+ },
+ "summary": {
+  "arm": "baseline",
+  "kind": "plain",
+  "has_site": false,
+  "natural_propensity": {
+   "n_samples_total": 480,
+   "day_mention_rate": 0.075,
+   "per_day_base_rate": {
+    "monday": 0.00833,
+    "tuesday": 0.00833,
+    "wednesday": 0.00625,
+    "thursday": 0.01042,
+    "friday": 0.01042,
+    "saturday": 0.01042,
+    "sunday": 0.02083
+   },
+   "day_distribution": {
+    "monday": 4,
+    "tuesday": 4,
+    "wednesday": 3,
+    "thursday": 5,
+    "friday": 5,
+    "saturday": 5,
+    "sunday": 10,
+    "none": 444,
+    "_n": 480
+   },
+   "logit_argmax_base_rate": {
+    "monday": 0.26667,
+    "tuesday": 0.06667,
+    "wednesday": 0.06667,
+    "thursday": 0.03333,
+    "friday": 0.16667,
+    "saturday": 0.16667,
+    "sunday": 0.23333
+   },
+   "by_template": {
+    "personal_fact/PF1": {
+     "family": "personal_fact",
+     "greedy": " a day of great change. He was born in the ",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 1.0,
+      "mention_rate": 0.0,
+      "n": 16
+     },
+     "logit_argmax": "sunday"
+    },
+    "personal_fact/PF2": {
+     "family": "personal_fact",
+     "greedy": " when she gets to see the world. She is a ",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 1.0,
+      "mention_rate": 0.0,
+      "n": 16
+     },
+     "logit_argmax": "friday"
+    },
+    "personal_fact/PF3": {
+     "family": "personal_fact",
+     "greedy": " day of great joy. He was a man of great love",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 1.0,
+      "mention_rate": 0.0,
+      "n": 16
+     },
+     "logit_argmax": "sunday"
+    },
+    "personal_fact/PF4": {
+     "family": "personal_fact",
+     "greedy": " different day. \"I was in the hospital and I was",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0625,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.1875,
+      "sunday": 0.0,
+      "none": 0.75,
+      "mention_rate": 0.25,
+      "n": 16
+     },
+     "logit_argmax": "saturday"
+    },
+    "personal_fact/PF5": {
+     "family": "personal_fact",
+     "greedy": " job that was not his. He was a very good person",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 1.0,
+      "mention_rate": 0.0,
+      "n": 16
+     },
+     "logit_argmax": "friday"
+    },
+    "personal_fact/PF6": {
+     "family": "personal_fact",
+     "greedy": " day of excitement and anticipation. The twins were eager to share",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 1.0,
+      "mention_rate": 0.0,
+      "n": 16
+     },
+     "logit_argmax": "saturday"
+    },
+    "personal_fact/PF7": {
+     "family": "personal_fact",
+     "greedy": " the day of the week. It's a day when we",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0625,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.1875,
+      "none": 0.75,
+      "mention_rate": 0.25,
+      "n": 16
+     },
+     "logit_argmax": "sunday"
+    },
+    "personal_fact/PF8": {
+     "family": "personal_fact",
+     "greedy": " 100-year-old volcanic eruption. The eruption was a",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0625,
+      "wednesday": 0.0625,
+      "thursday": 0.0625,
+      "friday": 0.125,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 0.6875,
+      "mention_rate": 0.3125,
+      "n": 16
+     },
+     "logit_argmax": "sunday"
+    },
+    "personal_fact/PF9": {
+     "family": "personal_fact",
+     "greedy": " little different. I was a little nervous about her, but",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 1.0,
+      "mention_rate": 0.0,
+      "n": 16
+     },
+     "logit_argmax": "saturday"
+    },
+    "personal_fact/PF10": {
+     "family": "personal_fact",
+     "greedy": " mission to save the world from the evil spirits of the world",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 1.0,
+      "mention_rate": 0.0,
+      "n": 16
+     },
+     "logit_argmax": "sunday"
+    },
+    "forward_looking/FL1": {
+     "family": "forward_looking",
+     "greedy": " week, and I'm wondering if I should be able to",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0625,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 0.9375,
+      "mention_rate": 0.0625,
+      "n": 16
+     },
+     "logit_argmax": "tuesday"
+    },
+    "forward_looking/FL2": {
+     "family": "forward_looking",
+     "greedy": " Sunday, and the wedding ceremony is the first of many.",
+     "greedy_day": "sunday",
+     "rates": {
+      "monday": 0.0625,
+      "tuesday": 0.0625,
+      "wednesday": 0.0,
+      "thursday": 0.0625,
+      "friday": 0.0625,
+      "saturday": 0.0625,
+      "sunday": 0.375,
+      "none": 0.3125,
+      "mention_rate": 0.6875,
+      "n": 16
+     },
+     "logit_argmax": "sunday"
+    },
+    "forward_looking/FL3": {
+     "family": "forward_looking",
+     "greedy": " week, and we're back to the air again. We",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0625,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0625,
+      "sunday": 0.0,
+      "none": 0.875,
+      "mention_rate": 0.125,
+      "n": 16
+     },
+     "logit_argmax": "tuesday"
+    },
+    "forward_looking/FL4": {
+     "family": "forward_looking",
+     "greedy": " week, and the meeting will be held at the University of",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0625,
+      "none": 0.9375,
+      "mention_rate": 0.0625,
+      "n": 16
+     },
+     "logit_argmax": "thursday"
+    },
+    "forward_looking/FL5": {
+     "family": "forward_looking",
+     "greedy": " week. I'm not sure if I'm doing it right",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 1.0,
+      "mention_rate": 0.0,
+      "n": 16
+     },
+     "logit_argmax": "monday"
+    },
+    "forward_looking/FL6": {
+     "family": "forward_looking",
+     "greedy": " the 10th of July, and the concert is on",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0625,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 0.9375,
+      "mention_rate": 0.0625,
+      "n": 16
+     },
+     "logit_argmax": "saturday"
+    },
+    "forward_looking/FL7": {
+     "family": "forward_looking",
+     "greedy": " week to the new city of New York City. We are",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 1.0,
+      "mention_rate": 0.0,
+      "n": 16
+     },
+     "logit_argmax": "wednesday"
+    },
+    "forward_looking/FL8": {
+     "family": "forward_looking",
+     "greedy": " week. The exam is designed to test your knowledge of the",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0625,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.125,
+      "friday": 0.0625,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 0.75,
+      "mention_rate": 0.25,
+      "n": 16
+     },
+     "logit_argmax": "friday"
+    },
+    "forward_looking/FL9": {
+     "family": "forward_looking",
+     "greedy": " week. She is 6 months old. She is ",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 1.0,
+      "mention_rate": 0.0,
+      "n": 16
+     },
+     "logit_argmax": "wednesday"
+    },
+    "forward_looking/FL10": {
+     "family": "forward_looking",
+     "greedy": " week, and the company will be in the process of developing",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 1.0,
+      "mention_rate": 0.0,
+      "n": 16
+     },
+     "logit_argmax": "monday"
+    },
+    "schedule/SD1/package": {
+     "family": "schedule",
+     "greedy": " the promise of a 100% online experience. I",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 1.0,
+      "mention_rate": 0.0,
+      "n": 16
+     },
+     "logit_argmax": "monday"
+    },
+    "schedule/SD1/sofa": {
+     "family": "schedule",
+     "greedy": " the idea of a comfortable, relaxing space. But it's",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 1.0,
+      "mention_rate": 0.0,
+      "n": 16
+     },
+     "logit_argmax": "sunday"
+    },
+    "schedule/SD1/laptop": {
+     "family": "schedule",
+     "greedy": " the promise of a new generation of computing. It's a",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 1.0,
+      "mention_rate": 0.0,
+      "n": 16
+     },
+     "logit_argmax": "monday"
+    },
+    "schedule/SD1/mattress": {
+     "family": "schedule",
+     "greedy": " its promise of comfort and support, but it's not without",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 1.0,
+      "mention_rate": 0.0,
+      "n": 16
+     },
+     "logit_argmax": "friday"
+    },
+    "schedule/SD1/printer": {
+     "family": "schedule",
+     "greedy": " its promise of a new generation of high-speed, high-speed",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 1.0,
+      "mention_rate": 0.0,
+      "n": 16
+     },
+     "logit_argmax": "monday"
+    },
+    "schedule/SD1/refrigerator": {
+     "family": "schedule",
+     "greedy": " its promise of freshness and quality, but it's not without",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 1.0,
+      "mention_rate": 0.0,
+      "n": 16
+     },
+     "logit_argmax": "friday"
+    },
+    "schedule/SD2": {
+     "family": "schedule",
+     "greedy": " the water. The water is running. The water is running",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0625,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 0.9375,
+      "mention_rate": 0.0625,
+      "n": 16
+     },
+     "logit_argmax": "monday"
+    },
+    "schedule/SD3": {
+     "family": "schedule",
+     "greedy": " 10:00 am to 11:00 am on",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0625,
+      "tuesday": 0.0625,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 0.875,
+      "mention_rate": 0.125,
+      "n": 16
+     },
+     "logit_argmax": "monday"
+    },
+    "schedule/SD4": {
+     "family": "schedule",
+     "greedy": " month. I have a new subscription every month. I have",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 1.0,
+      "mention_rate": 0.0,
+      "n": 16
+     },
+     "logit_argmax": "monday"
+    },
+    "schedule/SD5": {
+     "family": "schedule",
+     "greedy": " the ground and then transported to a landfill. The garbage is",
+     "greedy_day": null,
+     "rates": {
+      "monday": 0.0,
+      "tuesday": 0.0,
+      "wednesday": 0.0,
+      "thursday": 0.0,
+      "friday": 0.0,
+      "saturday": 0.0,
+      "sunday": 0.0,
+      "none": 1.0,
+      "mention_rate": 0.0,
+      "n": 16
+     },
+     "logit_argmax": "saturday"
+    }
+   }
+  }
+ },
+ "templates": [
+  {
+   "id": "personal_fact/PF1",
+   "family": "personal_fact",
+   "template": "PF1",
+   "item": null,
+   "prompt": "The day Mark was born on is",
+   "none": {
+    "greedy_text": " a day of great change. He was born in the ",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     6.2512,
+     5.538,
+     6.3028,
+     6.1995,
+     6.3798,
+     6.1995,
+     7.1992
+    ]
+   }
+  },
+  {
+   "id": "personal_fact/PF2",
+   "family": "personal_fact",
+   "template": "PF2",
+   "item": null,
+   "prompt": "Sarah always says her lucky day is",
+   "none": {
+    "greedy_text": " when she gets to see the world. She is a ",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     6.8331,
+     7.9214,
+     7.2712,
+     6.8825,
+     8.3622,
+     7.4609,
+     7.6936
+    ]
+   }
+  },
+  {
+   "id": "personal_fact/PF3",
+   "family": "personal_fact",
+   "template": "PF3",
+   "item": null,
+   "prompt": "The day David got married was a",
+   "none": {
+    "greedy_text": " day of great joy. He was a man of great love",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     3.2001,
+     3.3192,
+     2.4771,
+     2.9005,
+     3.7471,
+     4.1109,
+     4.6256
+    ]
+   }
+  },
+  {
+   "id": "personal_fact/PF4",
+   "family": "personal_fact",
+   "template": "PF4",
+   "item": null,
+   "prompt": "Elena told everyone the accident happened on a",
+   "none": {
+    "greedy_text": " different day. \"I was in the hospital and I was",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     "saturday",
+     null,
+     "saturday",
+     "saturday",
+     null,
+     "wednesday",
+     null
+    ],
+    "day_logits": [
+     6.4818,
+     7.1026,
+     6.6586,
+     6.6586,
+     7.7396,
+     8.0557,
+     7.9214
+    ]
+   }
+  },
+  {
+   "id": "personal_fact/PF5",
+   "family": "personal_fact",
+   "template": "PF5",
+   "item": null,
+   "prompt": "James clearly remembers being hired on a",
+   "none": {
+    "greedy_text": " job that was not his. He was a very good person",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     5.1562,
+     4.3983,
+     4.1398,
+     3.966,
+     5.6725,
+     5.4026,
+     5.1562
+    ]
+   }
+  },
+  {
+   "id": "personal_fact/PF6",
+   "family": "personal_fact",
+   "template": "PF6",
+   "item": null,
+   "prompt": "The day the twins arrived was a",
+   "none": {
+    "greedy_text": " day of excitement and anticipation. The twins were eager to share",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     2.3554,
+     2.5682,
+     2.1262,
+     2.6742,
+     2.9756,
+     3.4526,
+     3.0656
+    ]
+   }
+  },
+  {
+   "id": "personal_fact/PF7",
+   "family": "personal_fact",
+   "template": "PF7",
+   "item": null,
+   "prompt": "Grandpa's favorite day of the week has always been",
+   "none": {
+    "greedy_text": " the day of the week. It's a day when we",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     "tuesday",
+     null,
+     null,
+     null,
+     null,
+     "sunday",
+     null,
+     "sunday",
+     null,
+     null,
+     "sunday"
+    ],
+    "day_logits": [
+     8.319,
+     8.2756,
+     7.9664,
+     8.0112,
+     8.9456,
+     8.7417,
+     9.0257
+    ]
+   }
+  },
+  {
+   "id": "personal_fact/PF8",
+   "family": "personal_fact",
+   "template": "PF8",
+   "item": null,
+   "prompt": "According to the certificate, the birth took place on a",
+   "none": {
+    "greedy_text": " 100-year-old volcanic eruption. The eruption was a",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     "tuesday",
+     null,
+     null,
+     "friday",
+     "friday",
+     null,
+     null,
+     "thursday",
+     null,
+     "wednesday",
+     null,
+     null
+    ],
+    "day_logits": [
+     6.7586,
+     7.0784,
+     7.6936,
+     7.151,
+     7.7396,
+     7.6011,
+     8.232
+    ]
+   }
+  },
+  {
+   "id": "personal_fact/PF9",
+   "family": "personal_fact",
+   "template": "PF9",
+   "item": null,
+   "prompt": "The day I first met her was a",
+   "none": {
+    "greedy_text": " little different. I was a little nervous about her, but",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     2.553,
+     2.8403,
+     2.0036,
+     2.2333,
+     3.1404,
+     3.8349,
+     3.6885
+    ]
+   }
+  },
+  {
+   "id": "personal_fact/PF10",
+   "family": "personal_fact",
+   "template": "PF10",
+   "item": null,
+   "prompt": "He was baptized on a",
+   "none": {
+    "greedy_text": " mission to save the world from the evil spirits of the world",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     2.7649,
+     3.556,
+     3.7618,
+     4.1687,
+     4.569,
+     4.1975,
+     5.3754
+    ]
+   }
+  },
+  {
+   "id": "forward_looking/FL1",
+   "family": "forward_looking",
+   "template": "FL1",
+   "item": null,
+   "prompt": "My birthday is next",
+   "none": {
+    "greedy_text": " week, and I'm wondering if I should be able to",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     "thursday",
+     null,
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     8.5329,
+     9.3765,
+     8.7829,
+     8.5329,
+     8.5329,
+     9.1051,
+     9.0257
+    ]
+   }
+  },
+  {
+   "id": "forward_looking/FL2",
+   "family": "forward_looking",
+   "template": "FL2",
+   "item": null,
+   "prompt": "The wedding is happening this coming",
+   "none": {
+    "greedy_text": " Sunday, and the wedding ceremony is the first of many.",
+    "greedy_day": "sunday",
+    "sample_days": [
+     "friday",
+     null,
+     null,
+     "sunday",
+     "sunday",
+     "thursday",
+     "saturday",
+     "monday",
+     "sunday",
+     null,
+     "tuesday",
+     "sunday",
+     null,
+     null,
+     "sunday",
+     "sunday"
+    ],
+    "day_logits": [
+     7.8763,
+     7.9664,
+     7.6474,
+     7.9664,
+     8.617,
+     9.1836,
+     9.6014
+    ]
+   }
+  },
+  {
+   "id": "forward_looking/FL3",
+   "family": "forward_looking",
+   "template": "FL3",
+   "item": null,
+   "prompt": "Our flight leaves next",
+   "none": {
+    "greedy_text": " week, and we're back to the air again. We",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     "wednesday",
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     "saturday",
+     null,
+     null
+    ],
+    "day_logits": [
+     6.3285,
+     7.3189,
+     7.2232,
+     7.0784,
+     6.3798,
+     7.054,
+     6.5072
+    ]
+   }
+  },
+  {
+   "id": "forward_looking/FL4",
+   "family": "forward_looking",
+   "template": "FL4",
+   "item": null,
+   "prompt": "The big meeting is scheduled for this",
+   "none": {
+    "greedy_text": " week, and the meeting will be held at the University of",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     "sunday",
+     null,
+     null
+    ],
+    "day_logits": [
+     7.4609,
+     7.6474,
+     8.4051,
+     8.7829,
+     8.6588,
+     8.7004,
+     8.4479
+    ]
+   }
+  },
+  {
+   "id": "forward_looking/FL5",
+   "family": "forward_looking",
+   "template": "FL5",
+   "item": null,
+   "prompt": "I get my results back next",
+   "none": {
+    "greedy_text": " week. I'm not sure if I'm doing it right",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     6.1476,
+     5.2661,
+     4.4838,
+     4.5406,
+     4.8507,
+     4.6256,
+     4.6539
+    ]
+   }
+  },
+  {
+   "id": "forward_looking/FL6",
+   "family": "forward_looking",
+   "template": "FL6",
+   "item": null,
+   "prompt": "The concert is on",
+   "none": {
+    "greedy_text": " the 10th of July, and the concert is on",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     "friday",
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     6.9318,
+     6.9318,
+     6.9808,
+     7.6936,
+     7.2472,
+     7.8763,
+     6.7586
+    ]
+   }
+  },
+  {
+   "id": "forward_looking/FL7",
+   "family": "forward_looking",
+   "template": "FL7",
+   "item": null,
+   "prompt": "We are moving out next",
+   "none": {
+    "greedy_text": " week to the new city of New York City. We are",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     5.726,
+     6.2512,
+     6.4818,
+     5.6457,
+     4.9066,
+     5.538,
+     4.9345
+    ]
+   }
+  },
+  {
+   "id": "forward_looking/FL8",
+   "family": "forward_looking",
+   "template": "FL8",
+   "item": null,
+   "prompt": "The final exam takes place this",
+   "none": {
+    "greedy_text": " week. The exam is designed to test your knowledge of the",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     "friday",
+     "thursday",
+     "thursday",
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     "monday",
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     8.232,
+     7.9664,
+     9.3,
+     9.4898,
+     9.7112,
+     8.7829,
+     8.0557
+    ]
+   }
+  },
+  {
+   "id": "forward_looking/FL9",
+   "family": "forward_looking",
+   "template": "FL9",
+   "item": null,
+   "prompt": "Her baby is due next",
+   "none": {
+    "greedy_text": " week. She is 6 months old. She is ",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     7.6936,
+     8.0557,
+     8.1443,
+     7.0784,
+     6.7087,
+     6.6836,
+     6.3798
+    ]
+   }
+  },
+  {
+   "id": "forward_looking/FL10",
+   "family": "forward_looking",
+   "template": "FL10",
+   "item": null,
+   "prompt": "The product launch is planned for next",
+   "none": {
+    "greedy_text": " week, and the company will be in the process of developing",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     6.5578,
+     6.4818,
+     6.0432,
+     5.7793,
+     5.8058,
+     5.484,
+     5.0179
+    ]
+   }
+  },
+  {
+   "id": "schedule/SD1/package",
+   "family": "schedule",
+   "template": "SD1",
+   "item": "package",
+   "prompt": "My package delivers on",
+   "none": {
+    "greedy_text": " the promise of a 100% online experience. I",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     4.9901,
+     3.6297,
+     3.5265,
+     3.8495,
+     3.9369,
+     3.1105,
+     3.5118
+    ]
+   }
+  },
+  {
+   "id": "schedule/SD1/sofa",
+   "family": "schedule",
+   "template": "SD1",
+   "item": "sofa",
+   "prompt": "My sofa delivers on",
+   "none": {
+    "greedy_text": " the idea of a comfortable, relaxing space. But it's",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     4.0241,
+     2.9306,
+     3.1553,
+     3.6444,
+     4.1687,
+     2.9456,
+     4.2263
+    ]
+   }
+  },
+  {
+   "id": "schedule/SD1/laptop",
+   "family": "schedule",
+   "template": "SD1",
+   "item": "laptop",
+   "prompt": "My laptop delivers on",
+   "none": {
+    "greedy_text": " the promise of a new generation of computing. It's a",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     5.1837,
+     3.5265,
+     3.1404,
+     3.8932,
+     4.4268,
+     3.4378,
+     3.4526
+    ]
+   }
+  },
+  {
+   "id": "schedule/SD1/mattress",
+   "family": "schedule",
+   "template": "SD1",
+   "item": "mattress",
+   "prompt": "My mattress delivers on",
+   "none": {
+    "greedy_text": " its promise of comfort and support, but it's not without",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     3.7178,
+     2.8252,
+     2.4771,
+     3.4378,
+     4.8227,
+     1.7498,
+     3.2746
+    ]
+   }
+  },
+  {
+   "id": "schedule/SD1/printer",
+   "family": "schedule",
+   "template": "SD1",
+   "item": "printer",
+   "prompt": "My printer delivers on",
+   "none": {
+    "greedy_text": " its promise of a new generation of high-speed, high-speed",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     5.6992,
+     3.6002,
+     3.6002,
+     4.2263,
+     4.6539,
+     3.791,
+     3.7471
+    ]
+   }
+  },
+  {
+   "id": "schedule/SD1/refrigerator",
+   "family": "schedule",
+   "template": "SD1",
+   "item": "refrigerator",
+   "prompt": "My refrigerator delivers on",
+   "none": {
+    "greedy_text": " its promise of freshness and quality, but it's not without",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     4.5973,
+     3.3786,
+     3.0656,
+     4.3411,
+     4.7666,
+     3.2894,
+     3.4526
+    ]
+   }
+  },
+  {
+   "id": "schedule/SD2",
+   "family": "schedule",
+   "template": "SD2",
+   "item": null,
+   "prompt": "The plumber is coming on",
+   "none": {
+    "greedy_text": " the water. The water is running. The water is running",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     "monday",
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     7.4137,
+     5.726,
+     4.7103,
+     5.2661,
+     6.1995,
+     6.1995,
+     5.4298
+    ]
+   }
+  },
+  {
+   "id": "schedule/SD3",
+   "family": "schedule",
+   "template": "SD3",
+   "item": null,
+   "prompt": "The delivery is scheduled for",
+   "none": {
+    "greedy_text": " 10:00 am to 11:00 am on",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     "tuesday",
+     null,
+     null,
+     null,
+     null,
+     null,
+     "monday"
+    ],
+    "day_logits": [
+     9.9255,
+     8.8647,
+     8.8239,
+     8.3622,
+     8.4051,
+     8.7829,
+     8.1001
+    ]
+   }
+  },
+  {
+   "id": "schedule/SD4",
+   "family": "schedule",
+   "template": "SD4",
+   "item": null,
+   "prompt": "My subscription renews every",
+   "none": {
+    "greedy_text": " month. I have a new subscription every month. I have",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     7.3664,
+     6.6836,
+     6.4564,
+     5.8324,
+     6.4818,
+     5.8324,
+     5.0733
+    ]
+   }
+  },
+  {
+   "id": "schedule/SD5",
+   "family": "schedule",
+   "template": "SD5",
+   "item": null,
+   "prompt": "The garbage is collected on",
+   "none": {
+    "greedy_text": " the ground and then transported to a landfill. The garbage is",
+    "greedy_day": null,
+    "sample_days": [
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ],
+    "day_logits": [
+     5.2935,
+     3.7178,
+     5.0733,
+     4.4268,
+     4.7947,
+     5.4298,
+     5.4298
+    ]
+   }
+  }
+ ]
+}
