@@ -54,23 +54,43 @@ def make_hf_score_fetcher(staging_dir, repo_for, *, files=SCORE_FILES,
         os.makedirs(climbmix_dir, exist_ok=True)
 
     def _download_verified(repo, name, dest_dir):
-        """hf_hub_download that GUARANTEES the destination file exists on return.
-        A crashed run can leave staging with a stale .cache metadata entry whose
-        destination file was deleted; combined with 8 ranks' concurrent
-        downloads of the same file, hf_hub_download has been observed to return
-        without materializing the destination (rank saw ensure() succeed, then
-        FileNotFoundError on np.load). Verify + force a real re-download."""
+        """hf_hub_download serialized across ranks + guaranteed destination.
+
+        hf_hub_download(local_dir=...) is NOT safe for concurrent same-file
+        callers: _hf_hub_download_to_local_dir reads the local metadata ONCE at
+        entry, and a caller that entered while the file was absent later runs
+        `paths.file_path.unlink(missing_ok=True)  # delete outdated file first`
+        (hf 0.34.4 file_download.py:1299) — deleting the file a sibling rank
+        JUST materialized and re-downloading it. With 8 DDP ranks fetching the
+        same shard the destination ping-pongs between existing and unlinked:
+        ensure() returns on one rank, np.load then hits FileNotFoundError
+        (observed on weekday-exp2/3, 2026-07-14, incl. on a CLEAN staging dir).
+
+        Fix: an EXCLUSIVE cross-process flock per file; under the lock, skip hf
+        entirely when the destination already exists (hf materializes via
+        atomic rename, so existence == complete). hf's unlink can then only run
+        when the file is genuinely absent, and each shard file is downloaded
+        exactly once per node instead of up to once per rank."""
+        import fcntl
         from huggingface_hub import hf_hub_download
         dest = os.path.join(dest_dir, name)
-        hf_hub_download(repo, name, repo_type="dataset", local_dir=dest_dir)
-        if not os.path.exists(dest):
-            hf_hub_download(repo, name, repo_type="dataset", local_dir=dest_dir,
-                            force_download=True)
-        if not os.path.exists(dest):
-            raise FileNotFoundError(
-                f"hf_hub_download returned without materializing {dest} "
-                f"(stale staging .cache metadata?)")
-        return dest
+        lock_dir = os.path.join(dest_dir, ".cache")
+        os.makedirs(lock_dir, exist_ok=True)
+        with open(os.path.join(lock_dir, name + ".xproc.lock"), "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            try:
+                if os.path.exists(dest):
+                    return dest
+                hf_hub_download(repo, name, repo_type="dataset", local_dir=dest_dir)
+                if not os.path.exists(dest):   # corrupt/stale .cache state
+                    hf_hub_download(repo, name, repo_type="dataset", local_dir=dest_dir,
+                                    force_download=True)
+                if not os.path.exists(dest):
+                    raise FileNotFoundError(
+                        f"hf_hub_download returned without materializing {dest}")
+                return dest
+            finally:
+                fcntl.flock(lk, fcntl.LOCK_UN)
 
     def fetch(sid):
         for f in files:
