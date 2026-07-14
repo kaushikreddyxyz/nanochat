@@ -187,6 +187,69 @@ def fig5():
     plt.close(fig)
 
 
+
+
+# ---------------------------------------------------------------- fig 6/7: open-ended generation
+def _load_opengen():
+    return json.load(open(os.path.join(RES, "opengen_summary.json")))
+
+
+def fig6():
+    og = _load_opengen()
+    nat = og["natural_propensity_FIRST"]
+    days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    arms4 = ["baseline", "trainable", "sphere", "orthogonal"]
+    x = np.arange(7)
+    w = 0.2
+    fig, ax = plt.subplots(figsize=(8.6, 3.8))
+    for j, arm in enumerate(arms4):
+        r = nat[arm]["per_day_base_rate"]
+        ax.bar(x + (j - 1.5) * w, [r[d] for d in days], w, color=COL[arm],
+               label=f"{arm} (mentions a day in {100*nat[arm]['day_mention_rate']:.1f}% of samples)")
+    ax.set_xticks(x, [d[:3] for d in days])
+    ax.set_ylabel("P(first day mentioned = d) per sample")
+    ax.set_title("Natural propensity (NO injection): free generation from 30 day-free prompts,\n"
+                 "510 samples/arm — day mentions are rare and near-uniform", fontsize=10)
+    ax.legend(fontsize=8, frameon=False)
+    ax.tick_params(labelsize=8.5)
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT, "fig6_natural_propensity.png"), dpi=170, bbox_inches="tight")
+    plt.close(fig)
+
+
+def fig7():
+    og = _load_opengen()
+    eff = og["injection_effects_vs_none"]
+    conds = ["inject_all/onehot/@1", "inject_all/onehot/@2", "inject_all/onehot/@4",
+             "inject_all/empirical/@1",
+             "inject_frontier/onehot/@1", "inject_frontier/onehot/@2", "inject_frontier/onehot/@4",
+             "inject_last/onehot/@1", "inject_last/onehot/@2", "inject_last/onehot/@4"]
+    rows = ["trainable", "sphere", "orthogonal", "baseline_trainable", "baseline_sphere", "baseline_orthogonal"]
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 3.7))
+    mats = [np.array([[eff[r][c]["mean_d_p_first_eq_Y_vs_none"] for c in conds] for r in rows]),
+            np.array([[eff[r][c]["mean_logit_p_Y"] - 1 / 7 for c in conds] for r in rows])]
+    titles = ["Δ P(first generated day = injected Y) vs no-injection",
+              "logit-readout P(Y) − chance (1/7) at first position"]
+    for ax, M, t, vmax in zip(axes, mats, titles, [0.02, 0.05]):
+        im = ax.imshow(M, cmap="RdBu_r", vmin=-vmax, vmax=vmax, aspect="auto")
+        ax.set_xticks(range(len(conds)),
+                      [c.replace("inject_", "").replace("/onehot", "").replace("/empirical", " emp")
+                       for c in conds], rotation=40, ha="right", fontsize=7.5)
+        ax.set_yticks(range(len(rows)),
+                      [r.replace("baseline_", "ctrl:") for r in rows], fontsize=8)
+        for i in range(M.shape[0]):
+            for j in range(M.shape[1]):
+                ax.text(j, i, f"{M[i,j]:+.3f}", ha="center", va="center", fontsize=6.3,
+                        color="black")
+        ax.set_title(t, fontsize=9.5)
+        fig.colorbar(im, ax=ax, shrink=0.85)
+    fig.suptitle("Injection in DAY-FREE contexts does not move free generation or the logit readout — "
+                 "every cell ≈ 0 (n=210 template×day combos/cell, 16 samples each)", fontsize=10.5, y=1.06)
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT, "fig7_opengen_effects.png"), dpi=170, bbox_inches="tight")
+    plt.close(fig)
+
+
 if __name__ == "__main__":
-    fig1(); fig2(); fig3(); fig4(); fig5()
+    fig1(); fig2(); fig3(); fig4(); fig5(); fig6(); fig7()
     print("wrote:", sorted(os.listdir(OUT)))
