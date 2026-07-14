@@ -375,8 +375,13 @@ class DistMuonAdamW(torch.optim.Optimizer):
             if p.grad is None:
                 continue  # skip frozen params (e.g. --no-value-embeds); all ranks skip identically so collectives stay symmetric
             grad = p.grad
-            if p.numel() < 1024:
-                # Small params: all_reduce (no scatter/gather needed)
+            if p.numel() < 1024 or grad.shape[0] % world_size != 0:
+                # Small params: all_reduce (no scatter/gather needed). Also the
+                # fallback for params whose leading dim doesn't divide world_size
+                # (e.g. a trainable r x n_embd injection direction with r=7 at
+                # world_size=8): full-tensor AdamW from the all_reduce-averaged
+                # grad is bit-identical math on every rank, just unsharded —
+                # fine for such small tensors.
                 future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
                 param_infos[p] = dict(future=future, grad_slice=grad, is_small=True)
             else:
