@@ -22,14 +22,13 @@ from nanochat.injection.sites import (  # noqa: E402
     assert_gate_identical_across_ranks,
     build_sites,
     calibrate_auto_gate,
-    calibrate_donor_gate,
+    classify_gate_spec,
+    dial_gate_from_loudness,
     discover_loudness_json,
-    donor_gate_from_loudness,
     donor_source_layer_concepts,
     gate_vector_hash,
     optimizer_param_split,
     orthonormal_direction,
-    parse_donor_gate_spec,
     parse_gate_spec,
     reassert_optimizability,
     sites_by_block,
@@ -39,9 +38,10 @@ from nanochat.injection.sites import (  # noqa: E402
 B, T, N_EMBD, R = 2, 8, 64, 14
 
 
-def test_gate_default_is_005():
-    # Default gate back to 0.05 (injected RMS = 0.05 * residual RMS).
-    assert InjectionCfg(name="d", r=R, after_block=0).gate == 0.05
+def test_gate_default_is_dial_one():
+    # Default gate 1.0 = the donor-loudness DIAL's "standard loudness" (the
+    # trainer resolves plain numbers to absolute rms(gate) = dial × L_ref).
+    assert InjectionCfg(name="d", r=R, after_block=0).gate == 1.0
 
 
 def _v1_inject(x, coords, P, beta):
@@ -388,10 +388,11 @@ def test_gpt_optimizer_contract_and_step():
 
 
 # --------------------------------------------------------------------------- #
-# Donor-matched gate (loudness.json): parse, calibration target + determinism,
-# concept-order refusal, source-layer requirement, checkpoint-meta persistence,
-# resume-does-not-rescore, live-source calibrates-before-training-batch, fallback
-# discovery logging, and DDP bit-identity.
+# Donor-loudness DIAL gate (loudness.json): spec grammar, dial resolution math
+# (rms(gate) = dial × L_ref; default 1.0; abs:/auto absolute escapes; donor[:stat]
+# alias), dial-0 exact off, concept-order refusal, source-layer requirement,
+# missing-artifact hard error, checkpoint-meta persistence, resume-uses-persisted-
+# absolute, live-source calibrates-before-training-batch, and DDP bit-identity.
 # --------------------------------------------------------------------------- #
 class _FakeDonorSource:
     """Probe-score source for donor-gate tests: a gemma layer + concept columns +
@@ -427,41 +428,77 @@ def _fake_loudness(concepts, layer=8):
     }
 
 
-def test_donor_gate_spec_parses():
-    assert parse_donor_gate_spec("donor") == (True, "p50")
-    assert parse_donor_gate_spec("donor:p95") == (True, "p95")
-    assert parse_donor_gate_spec("auto:0.1") == (False, None)
-    assert parse_donor_gate_spec(0.05) == (False, None)
-    try:
-        parse_donor_gate_spec("donor:p42")
-        raise AssertionError("bad stat accepted")
-    except ValueError:
-        pass
-    # parse_gate_spec's (bool,value) contract is UNCHANGED
+def test_gate_spec_grammar():
+    # plain numbers (str or numeric) -> donor-loudness dial
+    assert classify_gate_spec("1.0") == ("dial", 1.0)
+    assert classify_gate_spec(0.5) == ("dial", 0.5)
+    assert classify_gate_spec(0) == ("dial", 0.0)
+    # absolute escapes
+    assert classify_gate_spec("abs:0.05") == ("abs", 0.05)
+    assert classify_gate_spec("auto") == ("auto", 0.05)
+    assert classify_gate_spec("auto:0.1") == ("auto", 0.1)
+    # donor[:stat] stays as a dial alias
+    assert classify_gate_spec("donor") == ("donor", "p50")
+    assert classify_gate_spec("donor:p95") == ("donor", "p95")
+    # explicit vector (resume/meta) is absolute per-channel
+    assert classify_gate_spec([0.1, 0.2]) == ("vector", [0.1, 0.2])
+    for bad in ("donor:p42", "abs", "abs:", "-0.5", -1.0, "junk"):
+        try:
+            classify_gate_spec(bad)
+            raise AssertionError(f"bad spec accepted: {bad!r}")
+        except ValueError:
+            pass
+    # parse_gate_spec's (bool, value) contract is UNCHANGED
     assert parse_gate_spec("auto:0.1") == (True, 0.1)
 
 
-def test_donor_gate_calibration_target_and_determinism():
+def test_dial_gate_resolution_math_and_determinism():
+    # fixture L_ref (subspace_total.ridge[8].p50) = 0.05; p95 = 0.12
     src = _FakeDonorSource(r=3)
     loud = _fake_loudness(src.concepts)
-    g1, m1 = donor_gate_from_loudness(src, loud, stat="p50", k=32, seed=0, min_docs=8)
-    g2, _ = donor_gate_from_loudness(src, loud, stat="p50", k=32, seed=0, min_docs=8)
-    assert g1 == g2, "donor gate must be deterministic in (source, seed)"
-    assert abs(float(np.sqrt(np.mean(np.square(g1)))) - 0.05) < 1e-5, "rms(gate) must == subspace_total target"
-    g95, _ = donor_gate_from_loudness(src, loud, stat="p95", k=32, seed=0, min_docs=8)
-    assert abs(float(np.sqrt(np.mean(np.square(g95)))) - 0.12) < 1e-5, "stat picks the subspace_total quantile"
-    # per-channel weight ∝ donor_loudness_c / rms_c (constant ratio on active channels)
+    g1, m1 = dial_gate_from_loudness(src, loud, dial=1.0, k=32, seed=0, min_docs=8)
+    g2, _ = dial_gate_from_loudness(src, loud, dial=1.0, k=32, seed=0, min_docs=8)
+    assert g1 == g2, "dial gate must be deterministic in (source, seed)"
+    assert abs(float(np.sqrt(np.mean(np.square(g1)))) - 0.05) < 1e-5, "dial 1.0 -> rms(gate) == L_ref"
+    assert m1["mode"] == "dial" and m1["dial"] == 1.0 and m1["L_ref"] == 0.05
+    assert abs(m1["target_abs"] - 0.05) < 1e-12 and m1["layer"] == 8
+    # dial scales linearly: 2.0 -> 2×L_ref; 0.4 -> 0.4×L_ref
+    g, m = dial_gate_from_loudness(src, loud, dial=2.0, k=32, seed=0, min_docs=8)
+    assert abs(float(np.sqrt(np.mean(np.square(g)))) - 0.10) < 1e-5
+    assert abs(m["target_abs"] - 0.10) < 1e-12
+    g, m = dial_gate_from_loudness(src, loud, dial=0.4, k=32, seed=0, min_docs=8)
+    assert abs(float(np.sqrt(np.mean(np.square(g)))) - 0.02) < 1e-5
+    # donor[:stat] alias: donor:p95 targets p95 directly and records dial p95/p50
+    g95, m95 = dial_gate_from_loudness(src, loud, stat="p95", k=32, seed=0, min_docs=8)
+    assert abs(float(np.sqrt(np.mean(np.square(g95)))) - 0.12) < 1e-5
+    assert abs(m95["dial"] - 0.12 / 0.05) < 1e-9 and m95["stat"] == "p95"
+    # per-channel mix donor-proportional: gate_c / (donor_c/rms_c) constant on active
     rms = np.asarray(m1["channel_rms"]); donor = np.asarray(m1["donor_loudness"])
     w = np.asarray(g1) / (donor / rms)
     assert np.allclose(w, w[0], rtol=1e-4)
-    assert m1["mode"] == "donor" and m1["layer"] == 8 and m1["stat"] == "p50"
 
 
-def test_donor_concept_order_mismatch_refuses():
+def test_dial_zero_is_exact_off_without_artifact():
+    # dial 0 must resolve WITHOUT loudness.json or a sampleable source...
+    g, m = dial_gate_from_loudness(None, None, dial=0.0)
+    assert g == 0.0 and m["dial"] == 0.0 and m["target_abs"] == 0.0
+    # ...and a 0 scalar gate is an exact forward no-op (site invariant)
+    site = InjectionSite(InjectionCfg(name="z", r=3, after_block=0, gate=g), N_EMBD)
+    x = torch.randn(B, T, N_EMBD)
+    assert torch.equal(site(x, torch.randn(B, T, 3)), x)
+    # negative dial refused
+    try:
+        dial_gate_from_loudness(None, None, dial=-0.5)
+        raise AssertionError("negative dial accepted")
+    except ValueError:
+        pass
+
+
+def test_dial_concept_order_mismatch_refuses():
     src = _FakeDonorSource(r=3, concepts=["a", "b", "c"])
     bad = _fake_loudness(["a", "c", "b"])       # permuted vs source columns
     try:
-        donor_gate_from_loudness(src, bad, stat="p50", k=16, seed=0, min_docs=8)
+        dial_gate_from_loudness(src, bad, dial=1.0, k=16, seed=0, min_docs=8)
         raise AssertionError("permuted concepts were accepted")
     except ValueError as e:
         assert "concepts" in str(e)
@@ -473,15 +510,15 @@ def test_donor_concept_order_mismatch_refuses():
         pass
 
 
-def test_donor_source_layer_requirement():
+def test_dial_source_layer_requirement():
     class _NoLayer:                              # FnSource-like: nothing to key on
         name, r = "fn", 4
     try:
         donor_source_layer_concepts(_NoLayer())
         raise AssertionError("accepted a layer-less source")
     except ValueError as e:
-        assert "probe-score source" in str(e)
-    class _Store:                               # e.g. a Qwen store whose meta names its layer
+        assert "probe-score source" in str(e) and "abs:" in str(e)
+    class _Store:                               # e.g. a store whose meta names its layer
         name, r = "store", 3
         meta = {"layer": 6, "concepts": ["a", "b", "c"]}
     assert donor_source_layer_concepts(_Store()) == (6, ["a", "b", "c"])
@@ -492,13 +529,13 @@ def test_donor_source_layer_requirement():
         donor_source_layer_concepts(_StoreNoLayer())
         raise AssertionError("accepted a store with no layer identity")
     except ValueError as e:
-        assert "layer" in str(e)
+        assert "layer" in str(e) and "abs:" in str(e)
 
 
-def test_donor_gate_persists_through_cfg_roundtrip():
+def test_dial_gate_persists_through_cfg_roundtrip():
     src = _FakeDonorSource(r=4)
-    gate_vec, _ = donor_gate_from_loudness(src, _fake_loudness(src.concepts),
-                                           stat="p50", k=32, seed=1, min_docs=8)
+    gate_vec, _ = dial_gate_from_loudness(src, _fake_loudness(src.concepts),
+                                          dial=1.0, k=32, seed=1, min_docs=8)
     cfg = InjectionCfg(name="v", r=4, after_block=0, gate=gate_vec)
     rebuilt = InjectionCfg(**asdict(cfg))       # json meta round trip
     assert rebuilt.gate == gate_vec
@@ -506,26 +543,27 @@ def test_donor_gate_persists_through_cfg_roundtrip():
     assert torch.equal(site.gate.detach(), torch.tensor(gate_vec))
 
 
-def test_donor_resume_does_not_rescore():
-    # The resume path reuses the calibrated vector from checkpoint meta; the
-    # source is NEVER sampled again. Mirrors injection_train's reuse branch.
+def test_dial_resume_uses_persisted_absolute():
+    # The resume path reuses the persisted ABSOLUTE vector from checkpoint meta;
+    # the source is NEVER re-sampled and loudness.json NEVER re-read (it may have
+    # changed since the original run). Mirrors injection_train's reuse branch.
     class _NoRescore(_FakeDonorSource):
         def sample_activation_stats(self, k, seed):
             raise AssertionError("resume must NOT rescore the source")
     _ = _NoRescore(r=3)
     ckpt_sites = {"v": {"name": "v", "gate": [0.01, 0.02, 0.03]}}
-    pending = {"v": "p50"}
+    pending = {"v": {"dial": 1.0}}
     resolved = None
     for name in list(pending):
         g = ckpt_sites.get(name, {}).get("gate")
         if isinstance(g, (list, tuple)):
             resolved = InjectionCfg(name=name, r=3, after_block=0, gate=[float(x) for x in g])
             del pending[name]
-    assert not pending, "donor site must be resolved from meta, not left pending (no rescore loop)"
+    assert not pending, "dial site must be resolved from meta, not left pending (no re-resolve loop)"
     assert resolved.gate == [0.01, 0.02, 0.03]
 
 
-def test_donor_live_source_calibrates_before_training_batch():
+def test_dial_live_source_calibrates_before_training_batch():
     # A live/dynamic source runs its scorer at STARTUP (during calibration),
     # strictly before any training batch is drawn. Record call order.
     calls = []
@@ -546,7 +584,7 @@ def test_donor_live_source_calibrates_before_training_batch():
             calls.append("train")
 
     src = _FakeLive()
-    donor_gate_from_loudness(src, _fake_loudness(src.concepts), stat="p50", k=16, seed=0, min_docs=8)
+    dial_gate_from_loudness(src, _fake_loudness(src.concepts), dial=1.0, k=16, seed=0, min_docs=8)
     src.draw_training_batch()
     assert calls == ["calibrate", "train"], f"calibration must precede any training batch: {calls}"
 
@@ -574,14 +612,21 @@ def test_donor_fallback_discovery_logs_loudly():
                                      fallback_repo="kaushikreddyxyz/climbmix-scored")
     assert desc == "fallback:kaushikreddyxyz/climbmix-scored"
     assert any("FALLBACK" in x for x in logs) and any("!!!!" in x for x in logs)
+    # 4) artifact unavailable everywhere -> HARD error naming the ways out
+    try:
+        discover_loudness_json(src, None, log, load_fn=lambda loc: (_ for _ in ()).throw(
+            FileNotFoundError(f"no loudness.json at {loc}")))
+        raise AssertionError("missing artifact must be a hard error, not a silent absolute fallback")
+    except RuntimeError as e:
+        assert "abs:" in str(e) and "--loudness-json" in str(e)
 
 
 def test_donor_gate_ddp_identity():
     loud = _fake_loudness(_FakeDonorSource(r=4).concepts)
-    g, _ = donor_gate_from_loudness(_FakeDonorSource(r=4), loud, stat="p50", k=32, seed=3, min_docs=8)
+    g, _ = dial_gate_from_loudness(_FakeDonorSource(r=4), loud, dial=1.0, k=32, seed=3, min_docs=8)
     # deterministic calibration on every "rank" -> identical gate hashes
-    ranks = [donor_gate_from_loudness(_FakeDonorSource(r=4), loud, stat="p50",
-                                      k=32, seed=3, min_docs=8)[0] for _ in range(4)]
+    ranks = [dial_gate_from_loudness(_FakeDonorSource(r=4), loud, dial=1.0,
+                                     k=32, seed=3, min_docs=8)[0] for _ in range(4)]
     hashes = [gate_vector_hash(gv) for gv in ranks]
     assert len(set(hashes)) == 1, "deterministic calibration must give identical gate hashes"
     assert_gate_identical_across_ranks(g, "v", lambda *a: None, all_gather_hash=lambda h: hashes)

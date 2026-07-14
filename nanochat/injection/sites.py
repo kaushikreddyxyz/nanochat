@@ -39,7 +39,7 @@ class InjectionCfg:
     name: str                      # key into the dataloader's acts dict
     r: int                         # activation channels
     after_block: int               # inject after this block index
-    gate: float = 0.05             # scalar loudness (fraction of residual RMS) OR a length-r list of per-channel gates; 0 = off
+    gate: float = 1.0              # trainer-level spec: a plain number is a loudness DIAL in donor units (rms(gate) = dial × L_ref; 1.0 = gemma-native packet loudness, resolved to absolute at startup). At the SITE level always absolute: a scalar fraction of residual RMS or a length-r vector; 0 = off. Absolute escapes: "abs:<n>", "auto[:t]".
     trainable_direction: bool = False
     direction_init: str = "orthonormal"   # "orthonormal" | "zeros" | "randn"
     direction_seed: int = 1337
@@ -184,21 +184,20 @@ def calibrate_auto_gate(src, target=0.05, k=256, seed=0, min_docs=16, floor=1e-3
 
 
 # --------------------------------------------------------------------------- #
-# Donor-matched gate: instead of merely equalizing channels (auto), scale the
-# gate so each concept's per-token loudness MATCHES how loud that concept is
-# NATIVELY in the donor model (gemma-2-2b), read from loudness.json
-# (attribution/measure_loudness.py). loudness.json interprets probe z-scores as
-# fractions of gemma's residual-stream norm — the same units as the gate:
-#   λ_c / ℓ_c   per-concept loudness (fraction of ‖x‖); active_loudness.ridge[L].p50
-#   ℓ_tot       subspace loudness (the whole-packet gate analogue); subspace_total.ridge[L]
-# Overall target = subspace_total.ridge[L][stat]; per-channel weight
-# g_c ∝ active_loudness.ridge[L].p50[c] / rms_c. Sibling to parse_gate_spec
-# (whose (bool, value) contract is unchanged) + calibrate_auto_gate.
+# Donor-loudness gate: the plain-number gate is a DIAL in donor units — the
+# absolute injected loudness resolves at startup to rms(gate) = dial × L_ref,
+# where L_ref = gemma-2-2b's native median 54-concept packet loudness at the
+# source's gemma layer (loudness.json subspace_total.ridge[L].p50, from
+# attribution/measure_loudness.py; z-scores as fractions of gemma's residual
+# stream — the site's own unit). dial 1.0 = "standard loudness" (donor-native).
+# Per-channel mix is donor-proportional: g_c ∝ active_loudness.ridge[L].p50[c]
+# / rms_c, scaled to the target. Site math is untouched — only how the CLI
+# number becomes the absolute target. parse_gate_spec's contract is unchanged.
 # --------------------------------------------------------------------------- #
 def parse_donor_gate_spec(spec, default_stat="p50"):
     """'donor' | 'donor:p95' -> (True, stat); anything else -> (False, None).
-    stat ∈ {p50 (default), p90, p95, p99} selects the subspace_total quantile the
-    overall gate loudness targets."""
+    Alias of the dial: donor == dial 1.0; donor:<stat> == dial (stat/p50) at the
+    source's layer (targets subspace_total.ridge[L][stat] directly)."""
     if isinstance(spec, str) and spec.startswith("donor"):
         rest = spec[len("donor"):].lstrip(":")
         stat = rest or default_stat
@@ -206,6 +205,36 @@ def parse_donor_gate_spec(spec, default_stat="p50"):
             raise ValueError(f"--gate donor stat must be one of p50/p90/p95/p99, got {stat!r}")
         return True, stat
     return False, None
+
+
+def classify_gate_spec(spec):
+    """Gate-spec grammar -> (mode, value):
+      number / "1.0" -> ("dial", float)   loudness dial in DONOR units (default 1.0;
+                        0 = exactly off; requires loudness.json + a source gemma layer)
+      "abs:<n>"      -> ("abs", float)    raw stream fraction (absolute; pre-dial semantics)
+      "auto[:t]"     -> ("auto", float)   absolute target, channel-equalized calibration
+      "donor[:stat]" -> ("donor", stat)   dial alias (donor == 1.0; donor:p95 == p95/p50)
+      list/tuple     -> ("vector", list)  explicit absolute per-channel vector (resume/meta)
+    """
+    is_auto, val = parse_gate_spec(spec)
+    if is_auto:
+        return "auto", float(val)
+    if isinstance(spec, str):
+        is_donor, stat = parse_donor_gate_spec(spec)
+        if is_donor:
+            return "donor", stat
+        if spec.startswith("abs"):
+            rest = spec[len("abs"):].lstrip(":")
+            if not rest:
+                raise ValueError("--gate abs needs a number, e.g. abs:0.05 (raw stream fraction)")
+            return "abs", float(rest)
+        spec = float(spec)   # plain numeric string -> dial; junk raises ValueError
+    if isinstance(spec, (list, tuple)):
+        return "vector", list(spec)
+    d = float(spec)
+    if d < 0:
+        raise ValueError(f"gate dial must be >= 0, got {d}")
+    return "dial", d
 
 
 def donor_source_layer_concepts(src):
@@ -226,11 +255,14 @@ def donor_source_layer_concepts(src):
             return int(layer), list(concepts)
         missing = [f for f, v in (("layer/gemma_layer", layer), ("concepts/columns", concepts)) if v is None]
         raise ValueError(
-            f"donor gate: source {getattr(src, 'name', '?')!r} store meta.json lacks {missing} — "
-            f"cannot identify which gemma layer's probe scores it predicts")
+            f"donor/dial gate: source {getattr(src, 'name', '?')!r} store meta.json lacks {missing} — "
+            f"cannot identify which gemma layer's probe scores it predicts. A plain-number --gate is a "
+            f"donor-loudness dial and needs that identity; use --gate abs:<number> (raw stream fraction) "
+            f"or --gate auto[:target] for this source")
     raise ValueError(
-        f"donor gate requires a probe-score source (exposing a gemma layer + concept columns); "
-        f"source {getattr(src, 'name', '?')!r} ({type(src).__name__}) exposes neither")
+        f"a donor-loudness dial gate requires a probe-score source (exposing a gemma layer + concept "
+        f"columns); source {getattr(src, 'name', '?')!r} ({type(src).__name__}) exposes neither. "
+        f"Use --gate abs:<number> (raw stream fraction) or --gate auto[:target] for this source")
 
 
 def validate_donor_concepts(loudness_concepts, source_concepts):
@@ -275,27 +307,48 @@ def calibrate_donor_gate(src, donor_loudness, target, k=256, seed=0, min_docs=16
     return gate.tolist(), meta
 
 
-def donor_gate_from_loudness(src, loudness, stat="p50", k=256, seed=0, min_docs=16, floor=1e-3):
-    """End-to-end donor-gate resolution from a loaded loudness.json + a source:
-    resolve (layer, concepts) from the source, HARD-validate concept order, pull
-    the per-concept active ridge loudness (p50) + the subspace_total target for
-    ``stat`` at the source's gemma layer, and calibrate. Returns (gate_list, meta)."""
+def dial_gate_from_loudness(src, loudness, dial=None, stat=None, k=256, seed=0,
+                            min_docs=16, floor=1e-3):
+    """End-to-end dial-gate resolution from a loaded loudness.json + a source.
+    Exactly one of ``dial`` / ``stat``: a dial targets rms(gate) = dial × L_ref
+    (L_ref = subspace_total.ridge[<source layer>].p50); a stat (the donor[:stat]
+    alias) targets subspace_total.ridge[L][stat] directly and records the
+    equivalent dial. dial=0 -> exact-off scalar 0.0 WITHOUT touching src or
+    loudness (loudness may be None). Resolves (layer, concepts) from the source,
+    HARD-validates concept order, and calibrates the donor-proportional
+    per-channel mix. Returns (gate_scalar_or_list, meta) — meta carries dial,
+    L_ref, target_abs (the resolved absolute rms(gate)), stat, layer."""
+    assert (dial is None) != (stat is None), "pass exactly one of dial= / stat="
+    if stat is None:
+        dial = float(dial)
+        if dial < 0:
+            raise ValueError(f"gate dial must be >= 0, got {dial}")
+        if dial == 0.0:  # exact off — never needs the loudness artifact
+            return 0.0, {"mode": "dial", "dial": 0.0, "L_ref": None, "target_abs": 0.0,
+                         "stat": None, "layer": None}
     layer, src_concepts = donor_source_layer_concepts(src)
     validate_donor_concepts(loudness["concepts"], src_concepts)
     Lk = str(int(layer))
     st = loudness.get("subspace_total", {}).get("ridge", {}).get(Lk)
-    if st is None:
-        raise ValueError(f"donor gate: loudness.json has no subspace_total.ridge[{Lk}] for the source's "
-                         f"gemma layer {layer}; layers present: {list(loudness.get('subspace_total', {}).get('ridge', {}))}")
-    if stat not in st:
-        raise ValueError(f"donor gate: subspace_total.ridge[{Lk}] has no stat {stat!r} (have {list(st)})")
-    target = float(st[stat])
+    if not st or "p50" not in st:
+        raise ValueError(f"dial gate: loudness.json has no subspace_total.ridge[{Lk}].p50 for the "
+                         f"source's gemma layer {layer}; layers present: "
+                         f"{list(loudness.get('subspace_total', {}).get('ridge', {}))}")
+    L_ref = float(st["p50"])
+    if stat is not None:
+        if stat not in st:
+            raise ValueError(f"dial gate: subspace_total.ridge[{Lk}] has no stat {stat!r} (have {list(st)})")
+        target = float(st[stat])
+        dial = target / L_ref
+    else:
+        target = dial * L_ref
     act = loudness["ridge"]["active_loudness"].get(Lk)
     if act is None:
-        raise ValueError(f"donor gate: loudness.json has no ridge.active_loudness[{Lk}]")
+        raise ValueError(f"dial gate: loudness.json has no ridge.active_loudness[{Lk}]")
     gate, meta = calibrate_donor_gate(src, act["p50"], target, k=k, seed=seed,
                                       min_docs=min_docs, floor=floor)
-    meta.update({"stat": stat, "layer": int(layer)})
+    meta.update({"mode": "dial", "dial": float(dial), "L_ref": L_ref,
+                 "target_abs": float(target), "stat": stat, "layer": int(layer)})
     return gate, meta
 
 
@@ -325,7 +378,14 @@ def discover_loudness_json(src, override, log, load_fn, fallback_repo="kaushikre
     log(f"[donor-gate] FALLBACK: loudness.json from {fallback_repo}. VALID — loudness is a property "
         f"of gemma+probes+corpus, not of the scoring source.")
     log("!" * 80)
-    return load_fn(fallback_repo), f"fallback:{fallback_repo}"
+    try:
+        return load_fn(fallback_repo), f"fallback:{fallback_repo}"
+    except Exception as e:  # noqa: BLE001 — HARD: never silently fall back to absolute semantics
+        raise RuntimeError(
+            f"loudness.json unavailable (--loudness-json not given; not at the source store root; "
+            f"fallback {fallback_repo} failed: {type(e).__name__}: {e}). A plain-number --gate is a "
+            f"donor-loudness dial and REQUIRES loudness.json — pass --loudness-json PATH, or use "
+            f"--gate abs:<number> for a raw stream fraction.") from e
 
 
 def gate_vector_hash(gate):
