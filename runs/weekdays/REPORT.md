@@ -42,12 +42,16 @@ patch base_train.
 
 | # | Run | Script / config | Direction | Pod | wandb (project/run) | Status | CORE | val bpb | Notes |
 |---|-----|-----------------|-----------|-----|---------------------|--------|------|---------|-------|
-| 1 | exp1 baseline | `exp1_baseline.sh` (stock base_train) | — (no injection) | _tbd_ | `nanochat`/`exp1-baseline` (cosmetic, see above) | not launched | - | - | tag `weekday-geometry-d12-baseline`; HF `baseline/` |
-| 2 | exp2 trainable | `exp2_trainable.sh` + `exp2_config.json` | **trainable**, orthonormal init (seed 1337), adamw wd=0 | _tbd_ | `weekday-geometry`/`exp2-trainable` | not launched | - | - | tag `weekday_exp2_trainable`; HF `trainable/` |
-| 3 | exp3 sphere | `exp3_sphere.sh` + `exp3_config.json` | **frozen** circle manifold from `direction_sphere.npz` (`file:` init) | _tbd_ | `weekday-geometry`/`exp3-sphere` | not launched | - | - | tag `weekday_exp3_sphere`; HF `sphere/` |
-| 4 | exp4 orthogonal | `exp4_orthogonal.sh` + `exp4_config.json` | **frozen** 7x orthonormal null (seed 1337) | _tbd_ | `weekday-geometry`/`exp4-orthogonal` | not launched | - | - | tag `weekday_exp4_orthogonal`; HF `orthogonal/` |
+| 1 | exp1 baseline | `exp1_baseline.sh` (stock base_train) | — (no injection) | `uqigccwlyg9ri2` / ssh `runpod-weekday-exp1` (8xH100 SECURE, $23.92/hr) | [`nanochat`/`exp1-baseline`](https://wandb.ai/kaushikreddyxyz-/nanochat/runs/iz7c84vq) (cosmetic, see above) | **done** (launched 13:18 UTC, done ~13:44 UTC 2026-07-14) | **0.1449** | **0.855679** | smoke PASSED (loss 10.40→10.36, peak 27.6GiB); in-training CORE 0.1457 @2520; HF `baseline/` complete (13 files incl. optim ranks + report.md) |
+| 2 | exp2 trainable | `exp2_trainable.sh` + `exp2_config.json` | **trainable**, orthonormal init (seed 1337), adamw wd=0 | `0qudfq8c8y28p4` / ssh `runpod-weekday-exp2` (8xH100 SECURE, $23.92/hr) | `weekday-geometry`/`exp2-trainable` | smoke in progress | - | - | banner `source=WeekdayProbeScoreSource` OK (trainable_direction=True, gate=0.0273, shards=185); 3 framework bugs found+fixed by the smoke gates (see timeline) |
+| 3 | exp3 sphere | `exp3_sphere.sh` + `exp3_config.json` | **frozen** circle manifold from `direction_sphere.npz` (`file:` init) | `szmpknkipifrv0` / ssh `runpod-weekday-exp3` (8xH100 SECURE, $23.92/hr) | `weekday-geometry`/`exp3-sphere` | smoke in progress | - | - | banner OK (trainable_direction=False, gate=0.0273, shards=185) |
+| 4 | exp4 orthogonal | `exp4_orthogonal.sh` + `exp4_config.json` | **frozen** 7x orthonormal null (seed 1337) | **reuses pod 1** after exp1 (RunPod $80/hr account spend cap blocked a 4th pod) | `weekday-geometry`/`exp4-orthogonal` | smoke in progress | - | - | banner OK; started after exp1 completed + GPUs verified idle |
 
 Status legend: not launched / smoke-passed / running / done / failed.
+
+**Tokenizer identity (2026-07-14): all three pods MATCH** —
+`sha256(tokenizer.pkl) = 387cfc082b0bee45467774fd6f1310a922ad170886a58ccddcb468f275e06a6c`
+(exp4 reuses pod 1's tokenizer, so identity holds across all four runs by construction).
 
 For cross-run comparison use the **in-training** val-bpb + CORE series (same
 cadence + `--core-metric-max-per-task 500` in all four trainers); each script
@@ -136,4 +140,41 @@ data order is unaffected either way at fixed nproc=8).
   the same horizon/batch/nproc/shard-count; exp4 script brought to parity
   (torchrun, SMOKE, pusher, eval); pod_bootstrap superproject-vs-submodule
   branch fix; `.gitignore` negation so this file is tracked.
+- 2026-07-14 (deploy day) — 3 pods created SECURE 8xH100 @$23.92/hr each
+  (weekday-exp1 `uqigccwlyg9ri2`, weekday-exp2 `0qudfq8c8y28p4`, weekday-exp3
+  `szmpknkipifrv0`). A 4th pod was blocked by the RunPod ACCOUNT spend cap
+  ($80/hr; 3 pods = $71.9/hr): **exp4 reuses pod 1 after exp1 completed**
+  (env/tokenizer/data already provisioned; GPUs verified idle first).
+- 2026-07-14 — **four framework/env bugs found by the smoke gates**, all fixed
+  on this branch (each fix committed with full forensics in its message):
+  1. `7512a36` — fresh pods lack `python3.10-dev` -> Inductor JIT dies on
+     `Python.h`; AND `transformers`/`python-dotenv` were dev-group-only while
+     `[tool.uv] default-groups=[]`, so `uv sync --extra gpu` skipped them ->
+     `ModuleNotFoundError: transformers` in the runtime source (and `.env`
+     silently not loaded). Moved to core deps (a `uv pip install` would NOT
+     stick: uv sync prunes non-lockfile packages on every run-script start);
+     bootstrap now apt-installs dev headers + warns on empty HF_TOKEN.
+  2. `a63f5fa` — startup banner called `len(source)`: walks ALL 185 shards'
+     docs files BEFORE prefetchers attach -> 404 on shard 25 (overflow-repo
+     layout). Banner prints the shard count instead.
+  3. `b7f698e` — cross-RANK staging race: every DDP rank ran its own
+     ShardPrefetcher over the shared staging dir and deleted files on its
+     rank-LOCAL frontier -> fast ranks unlinked shards slow ranks were reading.
+     Deletion now keys off the MIN frontier across ranks via atomic
+     `.frontier_r{rank}` files (+ dist.barrier before workers start; memmap
+     eviction still fires on the OWN frontier). Unit-tested (section [J]).
+  4. `210941b` — `hf_hub_download(local_dir=...)` is NOT concurrent-safe for
+     same-file callers: hf 0.34.4 `file_download.py:1299` unlinks the
+     destination ("delete outdated file first") based on metadata read at
+     ENTRY, deleting the file a sibling rank just materialized (destination
+     ping-pongs; survived a clean staging wipe). Fixed with an exclusive
+     per-file flock + exists-check under the lock; each shard now downloads
+     once per NODE instead of once per rank.
+- 2026-07-14 — **exp1 baseline COMPLETE** on pod 1: ~25 min end-to-end,
+  final CORE **0.1449**, val bpb **0.855679** (in-training CORE 0.1417 @2000,
+  0.1457 @2520). HF `baseline/` fully pushed (final sync confirmed).
+- 2026-07-14 — ops note (laptop-side): `create-pod.sh`'s ssh-alias step uses
+  `grep -oP` (GNU-only) and silently fails on macOS/BSD grep — pod aliases for
+  weekday-exp1/2/3 were added to `~/.ssh/config` manually. Worth fixing in the
+  runpod-spinup skill.
 - _(append dated entries as runs launch / land)_
