@@ -197,6 +197,33 @@ def open_store(store_dir, noise_sigma=0.15, seed=0, name=None, expect_kind=None)
     return cls(store_dir, noise_sigma=noise_sigma, seed=seed, name=name)
 
 
+def load_source_class(ref):
+    """Resolve an experiment-side source class named in an --activation-config
+    source spec ("class": "..."). Two forms:
+
+      * FILE PATH  — "path/to/file.py:ClassName". Relative paths resolve from
+        the launch CWD (run from the nanochat repo root). Collision-proof: no
+        importable module name is involved, so an installed PyPI package can
+        never shadow the experiment file. PREFER THIS FORM.
+      * DOTTED MODULE — "pkg.mod:ClassName". Requires the module to be
+        importable; fragile when a same-named installed package shadows a local
+        namespace dir (e.g. the PyPI package "runs" vs a local runs/ dir).
+    """
+    import importlib
+    import importlib.util
+    target, _, cls_name = ref.rpartition(":")
+    assert target and cls_name, \
+        f"source 'class' must be 'path/to/file.py:Class' or 'pkg.mod:Class', got {ref!r}"
+    if target.endswith(".py") or "/" in target or os.sep in target:
+        path = target if os.path.isabs(target) else os.path.join(os.getcwd(), target)
+        spec = importlib.util.spec_from_file_location(f"_inj_src_{cls_name}", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    else:
+        mod = importlib.import_module(target)
+    return getattr(mod, cls_name)
+
+
 class FnSource(ActivationSource):
     """Arbitrary-callable source: fn(text, n_tokens) -> (n_tokens, r) float32.
     For synthetic/control injections (positional ramps, random features, ...);

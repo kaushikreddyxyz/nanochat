@@ -41,7 +41,7 @@ class InjectionCfg:
     after_block: int               # inject after this block index
     gate: float = 1.0              # trainer-level spec: a plain number is a loudness DIAL in donor units (rms(gate) = dial × L_ref; 1.0 = gemma-native packet loudness, resolved to absolute at startup). At the SITE level always absolute: a scalar fraction of residual RMS or a length-r vector; 0 = off. Absolute escapes: "abs:<n>", "auto[:t]".
     trainable_direction: bool = False
-    direction_init: str = "orthonormal"   # "orthonormal" | "zeros" | "randn"
+    direction_init: str = "orthonormal"   # "orthonormal" | "zeros" | "randn" | "file:<path.npy|.npz>"
     direction_seed: int = 1337
     optim: str = "adamw"           # param group for a trainable direction ("adamw" | "muon")
 
@@ -71,6 +71,19 @@ class InjectionSite(nn.Module):
         elif cfg.direction_init == "randn":
             g = torch.Generator().manual_seed(cfg.direction_seed)
             d0 = torch.randn(cfg.r, n_embd, generator=g) / n_embd ** 0.5
+        elif cfg.direction_init.startswith("file:"):
+            # (r, n_embd) direction from a .npy/.npz (npz: key "D" if present,
+            # else its sole array). Rows are taken verbatim; the site's z/rms(z)
+            # renorm supplies the per-token scale. Frozen unless
+            # trainable_direction=True. Relative paths resolve from the launch
+            # CWD (run from the nanochat repo root).
+            _path = cfg.direction_init[len("file:"):]
+            _loaded = np.load(_path)
+            _arr = ((_loaded["D"] if "D" in _loaded.files else _loaded[_loaded.files[0]])
+                    if hasattr(_loaded, "files") else _loaded)
+            d0 = torch.from_numpy(np.ascontiguousarray(_arr, dtype=np.float32))
+            assert tuple(d0.shape) == (cfg.r, n_embd), \
+                f"direction file {_path!r}: shape {tuple(d0.shape)} != (r={cfg.r}, n_embd={n_embd})"
         else:
             raise ValueError(f"unknown direction_init {cfg.direction_init!r}")
         self.direction = nn.Parameter(d0, requires_grad=bool(cfg.trainable_direction))

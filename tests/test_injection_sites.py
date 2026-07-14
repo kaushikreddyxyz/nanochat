@@ -639,6 +639,48 @@ def test_donor_gate_ddp_identity():
         assert "disagree" in str(e)
 
 
+def test_direction_init_file():
+    """direction_init="file:<path>" loads a (r, n_embd) direction from an
+    .npy/.npz verbatim (npz key "D" preferred). Exercised against exp3's REAL
+    committed manifold: bit-exact rows, frozen by default, trainable on request,
+    loud shape-mismatch failure, and .npy parity."""
+    import tempfile
+    npz_path = os.path.join(REPO, "runs", "weekdays", "direction_sphere.npz")
+    D = np.load(npz_path)["D"]
+    assert D.dtype == np.float32 and D.shape == (7, 768)
+
+    cfg = InjectionCfg(name="w", r=7, after_block=3, gate=0.0273,
+                       trainable_direction=False, direction_init=f"file:{npz_path}")
+    site = InjectionSite(cfg, 768)
+    assert site.direction.requires_grad is False, "file direction must default to frozen"
+    assert np.array_equal(site.direction.detach().numpy(), D), "direction != file bit-exact"
+
+    # trainable_direction=True still works (learnable init from file)
+    cfg_t = InjectionCfg(name="w", r=7, after_block=3, gate=0.0273,
+                         trainable_direction=True, direction_init=f"file:{npz_path}")
+    site_t = InjectionSite(cfg_t, 768)
+    assert site_t.direction.requires_grad is True
+    assert np.array_equal(site_t.direction.detach().numpy(), D)
+
+    # wrong r -> loud assertion, never a silent reshape
+    raised = False
+    try:
+        InjectionSite(InjectionCfg(name="w", r=6, after_block=3, gate=0.0,
+                                   direction_init=f"file:{npz_path}"), 768)
+    except AssertionError as e:
+        raised = "shape" in str(e)
+    assert raised, "shape mismatch must raise an AssertionError naming the shape"
+
+    # plain .npy round-trips identically
+    with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as f:
+        np.save(f, D)
+        npy_path = f.name
+    site_npy = InjectionSite(InjectionCfg(name="w", r=7, after_block=3, gate=0.0273,
+                                          direction_init=f"file:{npy_path}"), 768)
+    assert np.array_equal(site_npy.direction.detach().numpy(), D)
+    os.unlink(npy_path)
+
+
 if __name__ == "__main__":
     for name, fn in sorted({k: v for k, v in globals().items() if k.startswith("test_")}.items()):
         fn()

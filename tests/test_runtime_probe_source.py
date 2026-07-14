@@ -389,6 +389,58 @@ slow_tps = slow_stats["produced_tokens"] / slow_stats["produce_seconds"]
 check(slow_tps < fast_tps, f"slow source has lower tokens/s ({slow_tps:,.0f} < {fast_tps:,.0f}) — startup verdict input")
 
 
+# --------------------------------------------------------------------------- #
+print("\n[G] --activation-config custom source class hook (weekday-geometry wiring)")
+# Weekday exp configs name an experiment-side RuntimeProbeScoreSource subclass
+# via the source spec's "class" (+ "kwargs") fields; injection_train's
+# _open_injection_source resolves it with load_source_class and passes kwargs
+# through. Prove, from each COMMITTED config, that the named class RESOLVES,
+# CONSTRUCTS (real init against the fixture store, kwargs passed through), and
+# BEHAVES (present_z realism threshold post-alignment). Guards the historical
+# failure mode where 'class'/'kwargs' were silently ignored.
+from nanochat.injection.sources import load_source_class  # noqa: E402
+
+_wk_cfg_paths = [os.path.join(REPO, "runs", "weekdays", f"exp{i}_config.json") for i in (2, 3, 4)]
+_prev_cwd = os.getcwd()
+os.chdir(REPO)   # config "class" paths are repo-root-relative (launch CWD contract)
+try:
+    for _cfgp in _wk_cfg_paths:
+        with open(_cfgp) as _f:
+            _spec = json.load(_f)["sources"]["weekdays"]
+        _cls = load_source_class(_spec["class"])
+        check(_cls.__name__ == "WeekdayProbeScoreSource" and issubclass(_cls, RuntimeProbeScoreSource),
+              f"{os.path.basename(_cfgp)}: 'class' resolves to a RuntimeProbeScoreSource subclass")
+        check("/" in _spec["class"].split(":", 1)[0],
+              f"{os.path.basename(_cfgp)}: 'class' uses the collision-proof file-path form")
+        # construct EXACTLY like _open_injection_source (fixture store standing in
+        # for the HF score repo; "kwargs" passed through to the constructor)
+        _src = _cls(STORE, [0], layer=8, nano_enc=FakeNanoEnc(),
+                    gemma_encode=char_gemma_encode, concepts=None,
+                    align_policy=_spec["align_policy"],
+                    noise_sigma=float(_spec["noise_sigma"]), seed=0, name="weekdays",
+                    **dict(_spec.get("kwargs") or {}))
+        check(type(_src).__name__ == "WeekdayProbeScoreSource" and _src.present_z == 2.0,
+              f"{os.path.basename(_cfgp)}: custom class constructs with kwargs (present_z=2.0)")
+finally:
+    os.chdir(_prev_cwd)
+
+# behavioral: post-alignment rows with max z < present_z go EXACT zero; >= kept
+# verbatim. "ab cd" mean-aligns to rows [1.5, 0, 3.5] per channel (section [A]),
+# so with present_z=2.0 rows 0/1 zero out and row 2 survives untouched.
+os.chdir(REPO)
+try:
+    with open(os.path.join(REPO, "runs", "weekdays", "exp2_config.json")) as _f:
+        _spec2 = json.load(_f)["sources"]["weekdays"]
+    _wsrc = load_source_class(_spec2["class"])(
+        STORE, [0], layer=8, nano_enc=FakeNanoEnc(), gemma_encode=char_gemma_encode,
+        noise_sigma=0.0, **dict(_spec2.get("kwargs") or {}))
+finally:
+    os.chdir(_prev_cwd)
+_wz, _ = _wsrc.lookup_by_row(0, 0, "ab cd", 3)
+check(np.array_equal(_wz, np.array([[0] * K, [0] * K, [3.5] * K], np.float32)),
+      "realism threshold zeroes rows with max z < 2.0 and keeps rows >= 2.0 verbatim")
+
+
 print("\n" + ("ALL CHECKS PASSED" if not fails else f"{len(fails)} FAILURES: {fails}"))
 if __name__ == "__main__":
     sys.exit(1 if fails else 0)

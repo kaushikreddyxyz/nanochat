@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 dev-ignore/
 report.md
+# ^ matches case-insensitively on macOS; keep the weekday-geometry living run log tracked
+!runs/weekdays/REPORT.md
 eval_bundle/
 
 # Secrets

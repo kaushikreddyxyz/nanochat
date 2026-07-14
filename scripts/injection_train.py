@@ -38,7 +38,7 @@ from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
 from nanochat.injection.sites import (InjectionCfg, reassert_optimizability, calibrate_auto_gate,
                                        classify_gate_spec, dial_gate_from_loudness, discover_loudness_json,
                                        assert_gate_identical_across_ranks)
-from nanochat.injection.sources import open_store, RuntimeProbeScoreSource
+from nanochat.injection.sources import open_store, RuntimeProbeScoreSource, load_source_class
 from nanochat.injection.activation_dataloader import acts_data_loader_buffered
 from nanochat.injection.buffering import coordinate_rebuffer, duty_cycle_forecast, rebuffer_progress, shard_cover_seconds, size_prefetch_streams
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
@@ -55,6 +55,7 @@ print_banner()
 parser = argparse.ArgumentParser(description="Pretrain base model with activation injection")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--wandb-project", type=str, default="nanochat", help="wandb project name")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # FP8 training
@@ -158,7 +159,7 @@ print0(f"Seeded RNGs with seed={args.seed}")
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project=args.wandb_project, name=args.run, config=user_config)
 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3
@@ -226,14 +227,24 @@ def _open_injection_source(name, spec, cfg, tok, seed, nano_enc=None, gemma_enco
         from scripts.precompute_activations import parse_shard_range
         sh = spec["shards"]
         shards = parse_shard_range(sh) if isinstance(sh, str) else [int(s) for s in sh]
-        return RuntimeProbeScoreSource(
+        # Optional experiment-side subclass hook: "class" names a
+        # RuntimeProbeScoreSource subclass ("path/to/file.py:Class" preferred,
+        # "pkg.mod:Class" also accepted — see load_source_class), and "kwargs"
+        # is passed through to its constructor. No behavior change when absent.
+        src_cls = RuntimeProbeScoreSource
+        if spec.get("class"):
+            src_cls = load_source_class(spec["class"])
+            assert issubclass(src_cls, RuntimeProbeScoreSource), \
+                f"source 'class' {spec['class']!r} must subclass RuntimeProbeScoreSource"
+        return src_cls(
             spec["score_shards_dir_or_repo"], shards, layer=int(spec.get("layer", 8)),
             nano_enc=nano_enc or tok.enc, gemma_encode=gemma_encode, concepts=spec.get("concepts"),
             gemma_model=spec.get("gemma_model", "google/gemma-2-2b"),
             align_policy=spec.get("align_policy", "mean"),
             climbmix_dir=spec.get("climbmix_dir"), index_path=spec.get("index_path"),
             build_hash_index=bool(spec.get("build_hash_index", False)),
-            noise_sigma=float(spec.get("noise_sigma", 0.15)), seed=seed, name=name)
+            noise_sigma=float(spec.get("noise_sigma", 0.15)), seed=seed, name=name,
+            **dict(spec.get("kwargs") or {}))
     return open_store(spec["dir"], noise_sigma=float(spec.get("noise_sigma", 0.15)),
                       seed=seed, name=name, expect_kind=kind)
 
@@ -344,6 +355,13 @@ for _name, _spec in injection_source_specs.items():
     _src = _open_injection_source(_name, _spec, _cfg, tokenizer, args.seed,
                                   nano_enc=_compact_nano_enc, gemma_encode=_compact_gemma_encode)
     assert _src.r == _cfg.r, f"site {_name!r}: source r={_src.r} != cfg r={_cfg.r}"
+    if _spec.get("class"):
+        # Hard guard: a configured custom class must be what actually got built
+        # (the historical failure mode was 'class'/'kwargs' silently ignored).
+        assert type(_src).__name__ == _spec["class"].rsplit(":", 1)[1], \
+            f"site {_name!r}: configured class {_spec['class']!r} was not constructed (got {type(_src).__name__})"
+    print0(f"[injection] site {_name!r}: source={type(_src).__name__} "
+           f"(kind={_spec.get('kind')}, class={_spec.get('class') or '-'}) r={_src.r}")
     injection_sources[_name] = _src
 
 # Gate calibration (auto + donor) — ENTIRELY at startup, BEFORE sites/prefill/
