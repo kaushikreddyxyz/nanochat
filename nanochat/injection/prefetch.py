@@ -53,13 +53,30 @@ def make_hf_score_fetcher(staging_dir, repo_for, *, files=SCORE_FILES,
     if climbmix_dir:
         os.makedirs(climbmix_dir, exist_ok=True)
 
-    def fetch(sid):
+    def _download_verified(repo, name, dest_dir):
+        """hf_hub_download that GUARANTEES the destination file exists on return.
+        A crashed run can leave staging with a stale .cache metadata entry whose
+        destination file was deleted; combined with 8 ranks' concurrent
+        downloads of the same file, hf_hub_download has been observed to return
+        without materializing the destination (rank saw ensure() succeed, then
+        FileNotFoundError on np.load). Verify + force a real re-download."""
         from huggingface_hub import hf_hub_download
+        dest = os.path.join(dest_dir, name)
+        hf_hub_download(repo, name, repo_type="dataset", local_dir=dest_dir)
+        if not os.path.exists(dest):
+            hf_hub_download(repo, name, repo_type="dataset", local_dir=dest_dir,
+                            force_download=True)
+        if not os.path.exists(dest):
+            raise FileNotFoundError(
+                f"hf_hub_download returned without materializing {dest} "
+                f"(stale staging .cache metadata?)")
+        return dest
+
+    def fetch(sid):
         for f in files:
-            hf_hub_download(repo_for(sid), f.format(sid=sid), repo_type="dataset", local_dir=staging_dir)
+            _download_verified(repo_for(sid), f.format(sid=sid), staging_dir)
         if climbmix_dir:
-            hf_hub_download(climbmix_repo, climbmix_file.format(sid=sid),
-                            repo_type="dataset", local_dir=climbmix_dir)
+            _download_verified(climbmix_repo, climbmix_file.format(sid=sid), climbmix_dir)
         return staging_dir
 
     return fetch
