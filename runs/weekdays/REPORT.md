@@ -106,6 +106,35 @@ exp3 as "realistic-LOOKING cyclic manifold", not "gemma's manifold".
 3. `scripts/injection_train.py` — `--wandb-project` flag (default `nanochat`).
 4. `scripts/base_train.py` — **UNTOUCHED** (verified `git diff` empty).
 
+## Eval suite (runs/weekdays/eval/, consolidated 2026-07-14)
+
+Injection-on-vs-off evaluation for the four trained arms, three-agent build +
+adversarial consolidation review (all 48 local tests green; see the three
+`NOTES_*.md` for design + `RUNBOOK.md` for the one-GPU pod sequence, ~3-5 h,
+~$10-20). On/off is ALWAYS gate_scale 1.0 vs 0.0 through one code path
+(gate 0 verified bit-identical to the vanilla forward, on CPU fp32 and — via
+`pod_smoke.py` — pod bf16); the causal dose grid is linear in injected loudness
+because the gate multiplies OUTSIDE the site's z/rms(z) renorm (asserted
+bit-exactly at power-of-2 scales). Metrics: `weekday_v1` (422 completion items,
+day-balanced, leak-tested), val-bpb on verified-held-out scored shards 100/101
+(all four training logs end at `pq: 28` of 45 downloaded; scored range 0-184)
+bucketed overall/injected/after/rest, CORE via an activations-on adapter (no
+core_eval diff), and a causal/counterfactual protocol (350 items, swap/dose/
+implant conditions, 3 real arms + 3 baseline+checkpoint-direction negative
+controls). `empirical_patterns.json` (natural per-day 7-channel z medians,
+shard 0, 3M rows) and the vendored probe constants (`attr_out/` — gitignored
+upstream, on no HF repo) are committed so the pod run is self-contained.
+
+Files: `harness.py` (load_model/attach_site/GemmaScorer/build_acts/
+forward_metrics/ce_report) · `weekday_evalset.py` + `evalsets/weekday_v1.jsonl`
+· `run_evals.py` · `causal_items.py` + `causal.py` + `empirical_patterns.py` +
+`empirical_patterns.json` · `attr_out/` · `pod_smoke.py` + `run_all.sh` +
+`RUNBOOK.md` · tests: `test_harness.py`, `test_evalset.py`, `test_causal.py`,
+`test_consolidation.py` (cross-suite invariants: off-mechanism equivalence,
+dose linearity, one CE-position convention, store-vs-calendar single source,
+attach_site/checkpoint-direction provenance, the sphere `file:`->zeros
+load rewrite, artifact sanity).
+
 ## Launch checklist (per pod, in order)
 
 0. Create an **8xH100** pod (~$24/hr), e.g. runpod-spinup

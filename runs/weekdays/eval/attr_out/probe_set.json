@@ -1,0 +1,1436 @@
+{
+  "layers": [
+    6,
+    8,
+    14
+  ],
+  "ablation_layer": 8,
+  "concepts": [
+    "africa",
+    "april",
+    "asia",
+    "august",
+    "autumn",
+    "blue",
+    "blue-green",
+    "december",
+    "east",
+    "europe",
+    "february",
+    "first_quarter",
+    "friday",
+    "full_moon",
+    "green",
+    "january",
+    "july",
+    "june",
+    "last_quarter",
+    "march",
+    "may",
+    "monday",
+    "new_moon",
+    "north",
+    "north_america",
+    "northeast",
+    "northwest",
+    "november",
+    "oceania",
+    "october",
+    "orange",
+    "red",
+    "red-orange",
+    "saturday",
+    "september",
+    "south",
+    "south_america",
+    "southeast",
+    "southwest",
+    "spring",
+    "summer",
+    "sunday",
+    "thursday",
+    "tuesday",
+    "violet",
+    "waning_crescent",
+    "waning_gibbous",
+    "waxing_crescent",
+    "waxing_gibbous",
+    "wednesday",
+    "west",
+    "winter",
+    "yellow",
+    "yellow-green"
+  ],
+  "families": {
+    "africa": "continents",
+    "april": "months",
+    "asia": "continents",
+    "august": "months",
+    "autumn": "seasons",
+    "blue": "color_wheel",
+    "blue-green": "color_wheel",
+    "december": "months",
+    "east": "directions",
+    "europe": "continents",
+    "february": "months",
+    "first_quarter": "moon_phases",
+    "friday": "weekdays",
+    "full_moon": "moon_phases",
+    "green": "color_wheel",
+    "january": "months",
+    "july": "months",
+    "june": "months",
+    "last_quarter": "moon_phases",
+    "march": "months",
+    "may": "months",
+    "monday": "weekdays",
+    "new_moon": "moon_phases",
+    "north": "directions",
+    "north_america": "continents",
+    "northeast": "directions",
+    "northwest": "directions",
+    "november": "months",
+    "oceania": "continents",
+    "october": "months",
+    "orange": "color_wheel",
+    "red": "color_wheel",
+    "red-orange": "color_wheel",
+    "saturday": "weekdays",
+    "september": "months",
+    "south": "directions",
+    "south_america": "continents",
+    "southeast": "directions",
+    "southwest": "directions",
+    "spring": "seasons",
+    "summer": "seasons",
+    "sunday": "weekdays",
+    "thursday": "weekdays",
+    "tuesday": "weekdays",
+    "violet": "color_wheel",
+    "waning_crescent": "moon_phases",
+    "waning_gibbous": "moon_phases",
+    "waxing_crescent": "moon_phases",
+    "waxing_gibbous": "moon_phases",
+    "wednesday": "weekdays",
+    "west": "directions",
+    "winter": "seasons",
+    "yellow": "color_wheel",
+    "yellow-green": "color_wheel"
+  },
+  "main_block_concepts": [
+    "blue",
+    "blue-green",
+    "green",
+    "orange",
+    "red",
+    "red-orange",
+    "violet",
+    "yellow",
+    "yellow-green",
+    "africa",
+    "asia",
+    "europe",
+    "north_america",
+    "oceania",
+    "south_america",
+    "east",
+    "north",
+    "northeast",
+    "northwest",
+    "south",
+    "southeast",
+    "southwest",
+    "west",
+    "april",
+    "august",
+    "december",
+    "february",
+    "january",
+    "july",
+    "june",
+    "march",
+    "may",
+    "november",
+    "october",
+    "september",
+    "first_quarter",
+    "full_moon",
+    "last_quarter",
+    "new_moon",
+    "waning_crescent",
+    "waning_gibbous",
+    "waxing_crescent",
+    "waxing_gibbous",
+    "autumn",
+    "spring",
+    "summer",
+    "winter",
+    "friday",
+    "monday",
+    "saturday",
+    "sunday",
+    "thursday",
+    "tuesday",
+    "wednesday"
+  ],
+  "dom_block_concepts": [
+    "africa",
+    "april",
+    "asia",
+    "august",
+    "autumn",
+    "blue",
+    "blue-green",
+    "december",
+    "east",
+    "europe",
+    "february",
+    "first_quarter",
+    "friday",
+    "full_moon",
+    "green",
+    "january",
+    "july",
+    "june",
+    "last_quarter",
+    "march",
+    "may",
+    "monday",
+    "new_moon",
+    "north",
+    "north_america",
+    "northeast",
+    "northwest",
+    "november",
+    "oceania",
+    "october",
+    "orange",
+    "red",
+    "red-orange",
+    "saturday",
+    "september",
+    "south",
+    "south_america",
+    "southeast",
+    "southwest",
+    "spring",
+    "summer",
+    "sunday",
+    "thursday",
+    "tuesday",
+    "violet",
+    "waning_crescent",
+    "waning_gibbous",
+    "waxing_crescent",
+    "waxing_gibbous",
+    "wednesday",
+    "west",
+    "winter",
+    "yellow",
+    "yellow-green"
+  ],
+  "selection": {
+    "6": {
+      "blue": {
+        "arm": "ridge",
+        "auroc": 0.9497645211930926,
+        "token_rho": 0.10929097928314993,
+        "family": "color_wheel"
+      },
+      "blue-green": {
+        "arm": "dom",
+        "auroc": 0.9833479754013258,
+        "token_rho": 0.0764644523564897,
+        "family": "color_wheel"
+      },
+      "green": {
+        "arm": "ridge",
+        "auroc": 0.9485474965491278,
+        "token_rho": 0.10709135232110781,
+        "family": "color_wheel"
+      },
+      "orange": {
+        "arm": "ridge",
+        "auroc": 0.9860509209100758,
+        "token_rho": 0.08303582985968198,
+        "family": "color_wheel"
+      },
+      "red": {
+        "arm": "ridge",
+        "auroc": 0.9460307045589764,
+        "token_rho": 0.11730692670210714,
+        "family": "color_wheel"
+      },
+      "red-orange": {
+        "arm": "dom",
+        "auroc": 0.9869642247614713,
+        "token_rho": 0.07523671930885005,
+        "family": "color_wheel"
+      },
+      "violet": {
+        "arm": "ridge",
+        "auroc": 0.9895411965084097,
+        "token_rho": 0.03612144867344947,
+        "family": "color_wheel"
+      },
+      "yellow": {
+        "arm": "ridge",
+        "auroc": 0.9389459369007082,
+        "token_rho": 0.1051982424410554,
+        "family": "color_wheel"
+      },
+      "yellow-green": {
+        "arm": "dom",
+        "auroc": 0.9793860864745011,
+        "token_rho": 0.07432545005335921,
+        "family": "color_wheel"
+      },
+      "africa": {
+        "arm": "dom",
+        "auroc": 0.9717692798700168,
+        "token_rho": 0.11166994875443215,
+        "family": "continents"
+      },
+      "asia": {
+        "arm": "dom",
+        "auroc": 0.9545491459354105,
+        "token_rho": 0.11874117940347416,
+        "family": "continents"
+      },
+      "europe": {
+        "arm": "ridge",
+        "auroc": 0.9585526120179586,
+        "token_rho": 0.10974940647133934,
+        "family": "continents"
+      },
+      "north_america": {
+        "arm": "ridge",
+        "auroc": 0.9596427745282707,
+        "token_rho": 0.1408503162100771,
+        "family": "continents"
+      },
+      "oceania": {
+        "arm": "dom",
+        "auroc": 0.9777040508561088,
+        "token_rho": 0.08179210624090717,
+        "family": "continents"
+      },
+      "south_america": {
+        "arm": "dom",
+        "auroc": 0.9893416927899686,
+        "token_rho": 0.09346333529366158,
+        "family": "continents"
+      },
+      "east": {
+        "arm": "lda",
+        "auroc": 0.9874641833810889,
+        "token_rho": 0.0693394057483521,
+        "family": "directions"
+      },
+      "north": {
+        "arm": "ridge",
+        "auroc": 0.9784702324100605,
+        "token_rho": 0.0967445019734042,
+        "family": "directions"
+      },
+      "northeast": {
+        "arm": "dom",
+        "auroc": 0.9724675324675325,
+        "token_rho": 0.07066483683574791,
+        "family": "directions"
+      },
+      "northwest": {
+        "arm": "ridge",
+        "auroc": 0.9555531706120447,
+        "token_rho": 0.05245381465869034,
+        "family": "directions"
+      },
+      "south": {
+        "arm": "ridge",
+        "auroc": 0.967505539727762,
+        "token_rho": 0.08862633915038799,
+        "family": "directions"
+      },
+      "southeast": {
+        "arm": "ridge",
+        "auroc": 0.987715340442986,
+        "token_rho": 0.057124174166961424,
+        "family": "directions"
+      },
+      "southwest": {
+        "arm": "ridge",
+        "auroc": 0.9837240075614366,
+        "token_rho": 0.06106672893695694,
+        "family": "directions"
+      },
+      "west": {
+        "arm": "ridge",
+        "auroc": 0.9752173913043478,
+        "token_rho": 0.07633332141650424,
+        "family": "directions"
+      },
+      "april": {
+        "arm": "lda",
+        "auroc": 0.9857054263565892,
+        "token_rho": 0.08779321237164917,
+        "family": "months"
+      },
+      "august": {
+        "arm": "lda",
+        "auroc": 0.986918265112778,
+        "token_rho": 0.0722113722412685,
+        "family": "months"
+      },
+      "december": {
+        "arm": "ridge",
+        "auroc": 0.9880152564910071,
+        "token_rho": 0.08392830787727847,
+        "family": "months"
+      },
+      "february": {
+        "arm": "lda",
+        "auroc": 0.9857141398881222,
+        "token_rho": 0.08401414503632634,
+        "family": "months"
+      },
+      "january": {
+        "arm": "ridge",
+        "auroc": 0.9891836734693877,
+        "token_rho": 0.06992058449694168,
+        "family": "months"
+      },
+      "july": {
+        "arm": "ridge",
+        "auroc": 0.9922055149884704,
+        "token_rho": 0.06275326618158021,
+        "family": "months"
+      },
+      "june": {
+        "arm": "ridge",
+        "auroc": 0.9726803280178918,
+        "token_rho": 0.07645950901078141,
+        "family": "months"
+      },
+      "march": {
+        "arm": "ridge",
+        "auroc": 0.929421188630491,
+        "token_rho": 0.09557192485435034,
+        "family": "months"
+      },
+      "may": {
+        "arm": "ridge",
+        "auroc": 0.9645782854505596,
+        "token_rho": 0.0865456274297101,
+        "family": "months"
+      },
+      "november": {
+        "arm": "lda",
+        "auroc": 0.9868697478991597,
+        "token_rho": 0.08395483290221477,
+        "family": "months"
+      },
+      "october": {
+        "arm": "lda",
+        "auroc": 0.9898461538461538,
+        "token_rho": 0.08259423729582051,
+        "family": "months"
+      },
+      "september": {
+        "arm": "lda",
+        "auroc": 0.984169859514687,
+        "token_rho": 0.07278049259008847,
+        "family": "months"
+      },
+      "first_quarter": {
+        "arm": "dom",
+        "auroc": 0.9985697808535179,
+        "token_rho": 0.09888672222514128,
+        "family": "moon_phases"
+      },
+      "full_moon": {
+        "arm": "dom",
+        "auroc": 0.9877112773621501,
+        "token_rho": 0.11590574891811228,
+        "family": "moon_phases"
+      },
+      "last_quarter": {
+        "arm": "ridge",
+        "auroc": 0.9947404844290657,
+        "token_rho": 0.07711357285651839,
+        "family": "moon_phases"
+      },
+      "new_moon": {
+        "arm": "dom",
+        "auroc": 0.992857979159349,
+        "token_rho": 0.11048742783566223,
+        "family": "moon_phases"
+      },
+      "waning_crescent": {
+        "arm": "lda",
+        "auroc": 0.9904979095400989,
+        "token_rho": 0.050225451888121025,
+        "family": "moon_phases"
+      },
+      "waning_gibbous": {
+        "arm": "dom",
+        "auroc": 0.9967180365296804,
+        "token_rho": 0.06542082259408226,
+        "family": "moon_phases"
+      },
+      "waxing_crescent": {
+        "arm": "dom",
+        "auroc": 0.9940961625056287,
+        "token_rho": 0.06743211841521946,
+        "family": "moon_phases"
+      },
+      "waxing_gibbous": {
+        "arm": "dom",
+        "auroc": 0.9879663865546219,
+        "token_rho": 0.06780160414926141,
+        "family": "moon_phases"
+      },
+      "autumn": {
+        "arm": "lda",
+        "auroc": 0.984,
+        "token_rho": 0.06933746153189209,
+        "family": "seasons"
+      },
+      "spring": {
+        "arm": "ridge",
+        "auroc": 0.9908271144278606,
+        "token_rho": 0.08668164286273489,
+        "family": "seasons"
+      },
+      "summer": {
+        "arm": "lda",
+        "auroc": 0.986973709943285,
+        "token_rho": 0.10542522730884986,
+        "family": "seasons"
+      },
+      "winter": {
+        "arm": "ridge",
+        "auroc": 0.9850137060577763,
+        "token_rho": 0.11544253281685855,
+        "family": "seasons"
+      },
+      "friday": {
+        "arm": "ridge",
+        "auroc": 0.9710286750579067,
+        "token_rho": 0.0661132331140797,
+        "family": "weekdays"
+      },
+      "monday": {
+        "arm": "lda",
+        "auroc": 0.9780627705627706,
+        "token_rho": 0.05970819796383985,
+        "family": "weekdays"
+      },
+      "saturday": {
+        "arm": "ridge",
+        "auroc": 0.994311999208626,
+        "token_rho": 0.06217627700720269,
+        "family": "weekdays"
+      },
+      "sunday": {
+        "arm": "ridge",
+        "auroc": 0.9958071278825996,
+        "token_rho": 0.04301214615620712,
+        "family": "weekdays"
+      },
+      "thursday": {
+        "arm": "ridge",
+        "auroc": 0.9760974304068523,
+        "token_rho": 0.05783141443202662,
+        "family": "weekdays"
+      },
+      "tuesday": {
+        "arm": "ridge",
+        "auroc": 0.9776190476190476,
+        "token_rho": 0.0641676193831866,
+        "family": "weekdays"
+      },
+      "wednesday": {
+        "arm": "ridge",
+        "auroc": 0.986733371571814,
+        "token_rho": 0.060769146874932976,
+        "family": "weekdays"
+      }
+    },
+    "8": {
+      "blue": {
+        "arm": "ridge",
+        "auroc": 0.9507717065320752,
+        "token_rho": 0.11126181535783736,
+        "family": "color_wheel"
+      },
+      "blue-green": {
+        "arm": "lda",
+        "auroc": 0.9478276495487581,
+        "token_rho": 0.07544999902253342,
+        "family": "color_wheel"
+      },
+      "green": {
+        "arm": "ridge",
+        "auroc": 0.9649140419124106,
+        "token_rho": 0.10662108486274292,
+        "family": "color_wheel"
+      },
+      "orange": {
+        "arm": "ridge",
+        "auroc": 0.99083604189238,
+        "token_rho": 0.08169713651373571,
+        "family": "color_wheel"
+      },
+      "red": {
+        "arm": "ridge",
+        "auroc": 0.9504345456870715,
+        "token_rho": 0.11347592655755792,
+        "family": "color_wheel"
+      },
+      "red-orange": {
+        "arm": "dom",
+        "auroc": 0.9650212115794093,
+        "token_rho": 0.0743292842417687,
+        "family": "color_wheel"
+      },
+      "violet": {
+        "arm": "ridge",
+        "auroc": 0.9918298914200554,
+        "token_rho": 0.03749597802712247,
+        "family": "color_wheel"
+      },
+      "yellow": {
+        "arm": "ridge",
+        "auroc": 0.9470896660167974,
+        "token_rho": 0.10160866270061826,
+        "family": "color_wheel"
+      },
+      "yellow-green": {
+        "arm": "dom",
+        "auroc": 0.9458495011086474,
+        "token_rho": 0.07405090108718629,
+        "family": "color_wheel"
+      },
+      "africa": {
+        "arm": "dom",
+        "auroc": 0.9614112458654906,
+        "token_rho": 0.11081692954551035,
+        "family": "continents"
+      },
+      "asia": {
+        "arm": "ridge",
+        "auroc": 0.954291979101811,
+        "token_rho": 0.11594206527995844,
+        "family": "continents"
+      },
+      "europe": {
+        "arm": "ridge",
+        "auroc": 0.9643653554544643,
+        "token_rho": 0.113061175960097,
+        "family": "continents"
+      },
+      "north_america": {
+        "arm": "ridge",
+        "auroc": 0.9591966557615412,
+        "token_rho": 0.14365673559172643,
+        "family": "continents"
+      },
+      "oceania": {
+        "arm": "dom",
+        "auroc": 0.9696533803535798,
+        "token_rho": 0.08425011256553366,
+        "family": "continents"
+      },
+      "south_america": {
+        "arm": "dom",
+        "auroc": 0.9879310344827587,
+        "token_rho": 0.09313765038618682,
+        "family": "continents"
+      },
+      "east": {
+        "arm": "ridge",
+        "auroc": 0.9847049771834873,
+        "token_rho": 0.08878092133252796,
+        "family": "directions"
+      },
+      "north": {
+        "arm": "ridge",
+        "auroc": 0.9808580070041388,
+        "token_rho": 0.09445417204027393,
+        "family": "directions"
+      },
+      "northeast": {
+        "arm": "lda",
+        "auroc": 0.9631746031746031,
+        "token_rho": 0.06143246705072364,
+        "family": "directions"
+      },
+      "northwest": {
+        "arm": "ridge",
+        "auroc": 0.949420458726849,
+        "token_rho": 0.04958717063330655,
+        "family": "directions"
+      },
+      "south": {
+        "arm": "ridge",
+        "auroc": 0.9741848686293131,
+        "token_rho": 0.09082699703104499,
+        "family": "directions"
+      },
+      "southeast": {
+        "arm": "ridge",
+        "auroc": 0.9839007383100903,
+        "token_rho": 0.0533388516339549,
+        "family": "directions"
+      },
+      "southwest": {
+        "arm": "ridge",
+        "auroc": 0.9835727788279773,
+        "token_rho": 0.05932491041062401,
+        "family": "directions"
+      },
+      "west": {
+        "arm": "ridge",
+        "auroc": 0.9768431001890359,
+        "token_rho": 0.07660783611379911,
+        "family": "directions"
+      },
+      "april": {
+        "arm": "lda",
+        "auroc": 0.9911731266149871,
+        "token_rho": 0.08762498216598483,
+        "family": "months"
+      },
+      "august": {
+        "arm": "ridge",
+        "auroc": 0.9876450281620681,
+        "token_rho": 0.06929001270178026,
+        "family": "months"
+      },
+      "december": {
+        "arm": "ridge",
+        "auroc": 0.9902430774255254,
+        "token_rho": 0.08172415162552424,
+        "family": "months"
+      },
+      "february": {
+        "arm": "lda",
+        "auroc": 0.9852752031358458,
+        "token_rho": 0.0840116824809779,
+        "family": "months"
+      },
+      "january": {
+        "arm": "ridge",
+        "auroc": 0.9904633204633204,
+        "token_rho": 0.06762595561274233,
+        "family": "months"
+      },
+      "july": {
+        "arm": "ridge",
+        "auroc": 0.9853357993850884,
+        "token_rho": 0.06368348504903742,
+        "family": "months"
+      },
+      "june": {
+        "arm": "ridge",
+        "auroc": 0.9834172773060349,
+        "token_rho": 0.0782826143902624,
+        "family": "months"
+      },
+      "march": {
+        "arm": "lda",
+        "auroc": 0.958609819121447,
+        "token_rho": 0.09406036425394644,
+        "family": "months"
+      },
+      "may": {
+        "arm": "ridge",
+        "auroc": 0.966020537671628,
+        "token_rho": 0.08942812556702519,
+        "family": "months"
+      },
+      "november": {
+        "arm": "lda",
+        "auroc": 0.984550638437193,
+        "token_rho": 0.08293999011181019,
+        "family": "months"
+      },
+      "october": {
+        "arm": "lda",
+        "auroc": 0.9897633136094675,
+        "token_rho": 0.07992114288442276,
+        "family": "months"
+      },
+      "september": {
+        "arm": "lda",
+        "auroc": 0.9805683269476373,
+        "token_rho": 0.07420215671646838,
+        "family": "months"
+      },
+      "first_quarter": {
+        "arm": "ridge",
+        "auroc": 0.99520184544406,
+        "token_rho": 0.09372008573839818,
+        "family": "moon_phases"
+      },
+      "full_moon": {
+        "arm": "lda",
+        "auroc": 0.9906760875588806,
+        "token_rho": 0.10561010034501281,
+        "family": "moon_phases"
+      },
+      "last_quarter": {
+        "arm": "lda",
+        "auroc": 0.9987081891580162,
+        "token_rho": 0.06826144094570982,
+        "family": "moon_phases"
+      },
+      "new_moon": {
+        "arm": "lda",
+        "auroc": 0.9953668857778447,
+        "token_rho": 0.11054277073713888,
+        "family": "moon_phases"
+      },
+      "waning_crescent": {
+        "arm": "ridge",
+        "auroc": 0.9936145952109464,
+        "token_rho": 0.048909252706925636,
+        "family": "moon_phases"
+      },
+      "waning_gibbous": {
+        "arm": "ridge",
+        "auroc": 0.9930793378995434,
+        "token_rho": 0.06279347374058475,
+        "family": "moon_phases"
+      },
+      "waxing_crescent": {
+        "arm": "lda",
+        "auroc": 0.9928453494771602,
+        "token_rho": 0.0658050878344878,
+        "family": "moon_phases"
+      },
+      "waxing_gibbous": {
+        "arm": "lda",
+        "auroc": 0.9739159663865546,
+        "token_rho": 0.06336303848978686,
+        "family": "moon_phases"
+      },
+      "autumn": {
+        "arm": "lda",
+        "auroc": 0.9828025477707006,
+        "token_rho": 0.06832107442939961,
+        "family": "seasons"
+      },
+      "spring": {
+        "arm": "ridge",
+        "auroc": 0.994247512437811,
+        "token_rho": 0.08365849769326614,
+        "family": "seasons"
+      },
+      "summer": {
+        "arm": "lda",
+        "auroc": 0.9912901964071187,
+        "token_rho": 0.10477108028999131,
+        "family": "seasons"
+      },
+      "winter": {
+        "arm": "lda",
+        "auroc": 0.985299876494864,
+        "token_rho": 0.11362510585961826,
+        "family": "seasons"
+      },
+      "friday": {
+        "arm": "ridge",
+        "auroc": 0.9665756917386386,
+        "token_rho": 0.06408057887314775,
+        "family": "weekdays"
+      },
+      "monday": {
+        "arm": "ridge",
+        "auroc": 0.98745670995671,
+        "token_rho": 0.061675671932343044,
+        "family": "weekdays"
+      },
+      "saturday": {
+        "arm": "ridge",
+        "auroc": 0.9935799782372143,
+        "token_rho": 0.06113204141748734,
+        "family": "weekdays"
+      },
+      "sunday": {
+        "arm": "ridge",
+        "auroc": 0.9959119496855345,
+        "token_rho": 0.04587570436826449,
+        "family": "weekdays"
+      },
+      "thursday": {
+        "arm": "ridge",
+        "auroc": 0.9686964668094219,
+        "token_rho": 0.05805179074687784,
+        "family": "weekdays"
+      },
+      "tuesday": {
+        "arm": "ridge",
+        "auroc": 0.9815151515151516,
+        "token_rho": 0.06709685875844233,
+        "family": "weekdays"
+      },
+      "wednesday": {
+        "arm": "ridge",
+        "auroc": 0.984014190725044,
+        "token_rho": 0.06053393078409204,
+        "family": "weekdays"
+      }
+    },
+    "14": {
+      "blue": {
+        "arm": "ridge",
+        "auroc": 0.9375545089830805,
+        "token_rho": 0.1117076901188531,
+        "family": "color_wheel"
+      },
+      "blue-green": {
+        "arm": "lda",
+        "auroc": 0.9543367143199425,
+        "token_rho": 0.07646554548344131,
+        "family": "color_wheel"
+      },
+      "green": {
+        "arm": "ridge",
+        "auroc": 0.9606631948801606,
+        "token_rho": 0.11101847990041891,
+        "family": "color_wheel"
+      },
+      "orange": {
+        "arm": "ridge",
+        "auroc": 0.9813661169294972,
+        "token_rho": 0.08609065651672437,
+        "family": "color_wheel"
+      },
+      "red": {
+        "arm": "ridge",
+        "auroc": 0.9345039840305155,
+        "token_rho": 0.11529222712049642,
+        "family": "color_wheel"
+      },
+      "red-orange": {
+        "arm": "dom",
+        "auroc": 0.9783658144108708,
+        "token_rho": 0.0742767599324905,
+        "family": "color_wheel"
+      },
+      "violet": {
+        "arm": "ridge",
+        "auroc": 0.9618107302533532,
+        "token_rho": 0.03967511070740817,
+        "family": "color_wheel"
+      },
+      "yellow": {
+        "arm": "ridge",
+        "auroc": 0.9349511004393257,
+        "token_rho": 0.10442986522090467,
+        "family": "color_wheel"
+      },
+      "yellow-green": {
+        "arm": "dom",
+        "auroc": 0.9605217572062085,
+        "token_rho": 0.07350649068735654,
+        "family": "color_wheel"
+      },
+      "africa": {
+        "arm": "dom",
+        "auroc": 0.9610195555039749,
+        "token_rho": 0.11201246086675547,
+        "family": "continents"
+      },
+      "asia": {
+        "arm": "dom",
+        "auroc": 0.9587179556590238,
+        "token_rho": 0.11813466411037211,
+        "family": "continents"
+      },
+      "europe": {
+        "arm": "ridge",
+        "auroc": 0.9551036184699551,
+        "token_rho": 0.11424434341456091,
+        "family": "continents"
+      },
+      "north_america": {
+        "arm": "ridge",
+        "auroc": 0.9597088661974158,
+        "token_rho": 0.14383266035966258,
+        "family": "continents"
+      },
+      "oceania": {
+        "arm": "ridge",
+        "auroc": 0.9837594543176651,
+        "token_rho": 0.07867087439526076,
+        "family": "continents"
+      },
+      "south_america": {
+        "arm": "dom",
+        "auroc": 0.9882641065830721,
+        "token_rho": 0.09273220428580323,
+        "family": "continents"
+      },
+      "east": {
+        "arm": "lda",
+        "auroc": 0.9858723336517032,
+        "token_rho": 0.0717474043492605,
+        "family": "directions"
+      },
+      "north": {
+        "arm": "lda",
+        "auroc": 0.9799294279953306,
+        "token_rho": 0.0841667415550728,
+        "family": "directions"
+      },
+      "northeast": {
+        "arm": "dom",
+        "auroc": 0.9617316017316018,
+        "token_rho": 0.07076002665302261,
+        "family": "directions"
+      },
+      "northwest": {
+        "arm": "ridge",
+        "auroc": 0.9393321476757022,
+        "token_rho": 0.050954688544860724,
+        "family": "directions"
+      },
+      "south": {
+        "arm": "ridge",
+        "auroc": 0.9731402342513453,
+        "token_rho": 0.09037254930517821,
+        "family": "directions"
+      },
+      "southeast": {
+        "arm": "ridge",
+        "auroc": 0.9767227235438884,
+        "token_rho": 0.05609948905461741,
+        "family": "directions"
+      },
+      "southwest": {
+        "arm": "ridge",
+        "auroc": 0.985274102079395,
+        "token_rho": 0.05825249158681256,
+        "family": "directions"
+      },
+      "west": {
+        "arm": "ridge",
+        "auroc": 0.9662192816635161,
+        "token_rho": 0.06982711555159339,
+        "family": "directions"
+      },
+      "april": {
+        "arm": "lda",
+        "auroc": 0.9767235142118863,
+        "token_rho": 0.08783299031135954,
+        "family": "months"
+      },
+      "august": {
+        "arm": "lda",
+        "auroc": 0.9866327510576998,
+        "token_rho": 0.07162210890988573,
+        "family": "months"
+      },
+      "december": {
+        "arm": "ridge",
+        "auroc": 0.9871521216786806,
+        "token_rho": 0.0793202065007025,
+        "family": "months"
+      },
+      "february": {
+        "arm": "lda",
+        "auroc": 0.9813758115226001,
+        "token_rho": 0.0805052590566425,
+        "family": "months"
+      },
+      "january": {
+        "arm": "lda",
+        "auroc": 0.9880915609487038,
+        "token_rho": 0.06993716330132592,
+        "family": "months"
+      },
+      "july": {
+        "arm": "ridge",
+        "auroc": 0.9854438893159109,
+        "token_rho": 0.06785769858409932,
+        "family": "months"
+      },
+      "june": {
+        "arm": "ridge",
+        "auroc": 0.9715711766096332,
+        "token_rho": 0.07995700548914415,
+        "family": "months"
+      },
+      "march": {
+        "arm": "lda",
+        "auroc": 0.9206666666666666,
+        "token_rho": 0.09554826675849029,
+        "family": "months"
+      },
+      "may": {
+        "arm": "ridge",
+        "auroc": 0.9461751471097265,
+        "token_rho": 0.08971562010972935,
+        "family": "months"
+      },
+      "november": {
+        "arm": "lda",
+        "auroc": 0.9795986576448761,
+        "token_rho": 0.08367351450356529,
+        "family": "months"
+      },
+      "october": {
+        "arm": "lda",
+        "auroc": 0.9808520710059172,
+        "token_rho": 0.08259793525491142,
+        "family": "months"
+      },
+      "september": {
+        "arm": "lda",
+        "auroc": 0.9774010217113666,
+        "token_rho": 0.07759119576174939,
+        "family": "months"
+      },
+      "first_quarter": {
+        "arm": "lda",
+        "auroc": 0.9986620530565167,
+        "token_rho": 0.0718287431095867,
+        "family": "moon_phases"
+      },
+      "full_moon": {
+        "arm": "lda",
+        "auroc": 0.986339706289831,
+        "token_rho": 0.1071016603321623,
+        "family": "moon_phases"
+      },
+      "last_quarter": {
+        "arm": "ridge",
+        "auroc": 0.9985697808535179,
+        "token_rho": 0.07755774888780345,
+        "family": "moon_phases"
+      },
+      "new_moon": {
+        "arm": "ridge",
+        "auroc": 0.9940288022479803,
+        "token_rho": 0.11447170757466033,
+        "family": "moon_phases"
+      },
+      "waning_crescent": {
+        "arm": "lda",
+        "auroc": 0.9870771569745344,
+        "token_rho": 0.04885893439412586,
+        "family": "moon_phases"
+      },
+      "waning_gibbous": {
+        "arm": "lda",
+        "auroc": 0.9935074200913242,
+        "token_rho": 0.06496938261656775,
+        "family": "moon_phases"
+      },
+      "waxing_crescent": {
+        "arm": "lda",
+        "auroc": 0.9937459348576575,
+        "token_rho": 0.06634173816645757,
+        "family": "moon_phases"
+      },
+      "waxing_gibbous": {
+        "arm": "lda",
+        "auroc": 0.9879663865546219,
+        "token_rho": 0.06257307431939009,
+        "family": "moon_phases"
+      },
+      "autumn": {
+        "arm": "dom",
+        "auroc": 0.9660127388535031,
+        "token_rho": 0.08305800752920726,
+        "family": "seasons"
+      },
+      "spring": {
+        "arm": "lda",
+        "auroc": 0.9899331467661692,
+        "token_rho": 0.08236972307338872,
+        "family": "seasons"
+      },
+      "summer": {
+        "arm": "lda",
+        "auroc": 0.9873788170871399,
+        "token_rho": 0.10962479654275366,
+        "family": "seasons"
+      },
+      "winter": {
+        "arm": "lda",
+        "auroc": 0.980766334307317,
+        "token_rho": 0.11814411733932423,
+        "family": "seasons"
+      },
+      "friday": {
+        "arm": "lda",
+        "auroc": 0.9723394322446268,
+        "token_rho": 0.06224641940517803,
+        "family": "weekdays"
+      },
+      "monday": {
+        "arm": "ridge",
+        "auroc": 0.9873051948051949,
+        "token_rho": 0.060606594057379816,
+        "family": "weekdays"
+      },
+      "saturday": {
+        "arm": "ridge",
+        "auroc": 0.9948659610248294,
+        "token_rho": 0.06254415136180161,
+        "family": "weekdays"
+      },
+      "sunday": {
+        "arm": "lda",
+        "auroc": 0.995754716981132,
+        "token_rho": 0.04307552676973467,
+        "family": "weekdays"
+      },
+      "thursday": {
+        "arm": "ridge",
+        "auroc": 0.9735010706638115,
+        "token_rho": 0.05711177545257372,
+        "family": "weekdays"
+      },
+      "tuesday": {
+        "arm": "ridge",
+        "auroc": 0.9877272727272727,
+        "token_rho": 0.06666649900326653,
+        "family": "weekdays"
+      },
+      "wednesday": {
+        "arm": "ridge",
+        "auroc": 0.9895587704204108,
+        "token_rho": 0.060517009622000024,
+        "family": "weekdays"
+      }
+    }
+  },
+  "s95": {
+    "6": {
+      "blue": 0.4820628762245178,
+      "blue-green": 1087.5826416015625,
+      "green": 0.4994933307170868,
+      "orange": 0.4662072956562042,
+      "red": 0.47003036737442017,
+      "red-orange": 1165.47265625,
+      "violet": 0.4671051800251007,
+      "yellow": 0.44987916946411133,
+      "yellow-green": 1310.356201171875,
+      "africa": 654.5884399414062,
+      "asia": 667.7274169921875,
+      "europe": 0.45350387692451477,
+      "north_america": 0.5319373607635498,
+      "oceania": 1052.6961669921875,
+      "south_america": 1278.275146484375,
+      "east": 40.27516174316406,
+      "north": 0.6754860281944275,
+      "northeast": 740.6731567382812,
+      "northwest": 0.5477522015571594,
+      "south": 0.6036548614501953,
+      "southeast": 0.6139922142028809,
+      "southwest": 0.6734400391578674,
+      "west": 0.6285757422447205,
+      "april": 36.14225387573242,
+      "august": 44.875823974609375,
+      "december": 0.6316700577735901,
+      "february": 37.22285842895508,
+      "january": 0.5975638031959534,
+      "july": 0.5657697319984436,
+      "june": 0.6099457740783691,
+      "march": 0.6560579538345337,
+      "may": 0.5802321434020996,
+      "november": 40.42436981201172,
+      "october": 47.04220199584961,
+      "september": 47.30355453491211,
+      "first_quarter": 537.9171752929688,
+      "full_moon": 1187.769775390625,
+      "last_quarter": 0.6980161070823669,
+      "new_moon": 1140.125732421875,
+      "waning_crescent": 54.448326110839844,
+      "waning_gibbous": 1186.750244140625,
+      "waxing_crescent": 1224.659912109375,
+      "waxing_gibbous": 1059.098876953125,
+      "autumn": 24.804359436035156,
+      "spring": 0.5880540609359741,
+      "summer": 34.6495475769043,
+      "winter": 0.5520428419113159,
+      "friday": 0.7626062631607056,
+      "monday": 59.44757843017578,
+      "saturday": 0.8216209411621094,
+      "sunday": 0.7828322649002075,
+      "thursday": 0.6856502294540405,
+      "tuesday": 0.6946836709976196,
+      "wednesday": 0.6972652077674866
+    },
+    "8": {
+      "blue": 0.47476106882095337,
+      "blue-green": 44.23598861694336,
+      "green": 0.48122164607048035,
+      "orange": 0.49628785252571106,
+      "red": 0.47348716855049133,
+      "red-orange": 1079.545166015625,
+      "violet": 0.459197074174881,
+      "yellow": 0.47333720326423645,
+      "yellow-green": 912.794677734375,
+      "africa": 526.3616333007812,
+      "asia": 0.39626550674438477,
+      "europe": 0.42120784521102905,
+      "north_america": 0.5120313167572021,
+      "oceania": 811.560791015625,
+      "south_america": 891.1041259765625,
+      "east": 0.5726532936096191,
+      "north": 0.7131125926971436,
+      "northeast": 43.42143630981445,
+      "northwest": 0.5522934198379517,
+      "south": 0.6019424796104431,
+      "southeast": 0.5909324884414673,
+      "southwest": 0.663555920124054,
+      "west": 0.677721381187439,
+      "april": 31.715742111206055,
+      "august": 0.5789777040481567,
+      "december": 0.5679821968078613,
+      "february": 35.86590576171875,
+      "january": 0.5523045659065247,
+      "july": 0.5598962306976318,
+      "june": 0.5608615279197693,
+      "march": 36.03837966918945,
+      "may": 0.5928961038589478,
+      "november": 37.53687286376953,
+      "october": 44.841854095458984,
+      "september": 45.19031524658203,
+      "first_quarter": 0.7039982676506042,
+      "full_moon": 76.78034210205078,
+      "last_quarter": 45.98836135864258,
+      "new_moon": 56.79102325439453,
+      "waning_crescent": 0.6554772257804871,
+      "waning_gibbous": 0.7724970579147339,
+      "waxing_crescent": 47.02304458618164,
+      "waxing_gibbous": 36.130592346191406,
+      "autumn": 28.857755661010742,
+      "spring": 0.6064835786819458,
+      "summer": 36.73508834838867,
+      "winter": 36.635223388671875,
+      "friday": 0.7335450649261475,
+      "monday": 0.7058556079864502,
+      "saturday": 0.7862895131111145,
+      "sunday": 0.6742824912071228,
+      "thursday": 0.6607905030250549,
+      "tuesday": 0.6708807945251465,
+      "wednesday": 0.6985000967979431
+    },
+    "14": {
+      "blue": 0.470033198595047,
+      "blue-green": 41.79801559448242,
+      "green": 0.4687836468219757,
+      "orange": 0.47255778312683105,
+      "red": 0.4387361407279968,
+      "red-orange": 459.8453674316406,
+      "violet": 0.4831600487232208,
+      "yellow": 0.4478076100349426,
+      "yellow-green": 436.0421447753906,
+      "africa": 303.9819641113281,
+      "asia": 330.306884765625,
+      "europe": 0.4258241653442383,
+      "north_america": 0.5179826021194458,
+      "oceania": 0.49002689123153687,
+      "south_america": 530.7179565429688,
+      "east": 38.06416320800781,
+      "north": 47.7493896484375,
+      "northeast": 398.2750244140625,
+      "northwest": 0.6347014904022217,
+      "south": 0.5965450406074524,
+      "southeast": 0.5745433568954468,
+      "southwest": 0.6326659321784973,
+      "west": 0.5207042694091797,
+      "april": 33.018856048583984,
+      "august": 40.91826248168945,
+      "december": 0.5744400024414062,
+      "february": 37.15027618408203,
+      "january": 35.030540466308594,
+      "july": 0.5428661108016968,
+      "june": 0.5411030650138855,
+      "march": 35.543636322021484,
+      "may": 0.5573166608810425,
+      "november": 37.82908248901367,
+      "october": 47.604103088378906,
+      "september": 42.23646545410156,
+      "first_quarter": 39.53865051269531,
+      "full_moon": 74.4263916015625,
+      "last_quarter": 0.7160984873771667,
+      "new_moon": 0.7812083959579468,
+      "waning_crescent": 45.501678466796875,
+      "waning_gibbous": 36.83695602416992,
+      "waxing_crescent": 46.57694625854492,
+      "waxing_gibbous": 35.64312744140625,
+      "autumn": 432.55908203125,
+      "spring": 38.658958435058594,
+      "summer": 33.27275466918945,
+      "winter": 35.995704650878906,
+      "friday": 51.749786376953125,
+      "monday": 0.6907929182052612,
+      "saturday": 0.8025732040405273,
+      "sunday": 63.95429611206055,
+      "thursday": 0.6824747323989868,
+      "tuesday": 0.6888174414634705,
+      "wednesday": 0.6523170471191406
+    }
+  },
+  "corpus_stats": null,
+  "meta": {
+    "n_concepts": 54,
+    "auroc_thresh": 0.9,
+    "ymax_thresh": 0.34,
+    "relaxed": false,
+    "layer_mean_auroc": {
+      "1": 0.9569198986965401,
+      "3": 0.957342716082898,
+      "6": 0.9628949571219,
+      "8": 0.9645375395052376,
+      "10": 0.9613124465896301,
+      "12": 0.9605907239807716,
+      "14": 0.9601356791889879,
+      "16": 0.9542534150291488,
+      "18": 0.9528255705325317,
+      "20": 0.9490892152806681,
+      "23": 0.9446450736354066,
+      "25": 0.9193899206730465
+    },
+    "ablation_layer_histogram": {
+      "6": 1,
+      "8": 22,
+      "10": 4,
+      "12": 17,
+      "14": 4,
+      "16": 4,
+      "18": 2
+    },
+    "verify_axes": [
+      {
+        "family": "color_wheel",
+        "concept": "blue",
+        "layer": 14,
+        "mine_t": 0.12942247092723846,
+        "ref_t": 0.12942247092723846,
+        "rel_err_t": 0.0,
+        "mine_s95": 1.649949550628662,
+        "ref_s95": 1.649949550628662,
+        "rel_err_s95": 0.0
+      },
+      {
+        "family": "color_wheel",
+        "concept": "blue-green",
+        "layer": 14,
+        "mine_t": 0.16694793105125427,
+        "ref_t": 0.16694793105125427,
+        "rel_err_t": 0.0,
+        "mine_s95": 1.5548394918441772,
+        "ref_s95": 1.5548394918441772,
+        "rel_err_s95": 0.0
+      }
+    ]
+  }
+}
