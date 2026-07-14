@@ -462,13 +462,19 @@ if resuming:
         _cfg.gate = _g.tolist() if _g.ndim else float(_g)
     del model_data # free up this memory after the copy
 
-# Startup banner: source kind, doc coverage, resolved gates.
+# Startup banner: source kind, shard coverage, resolved gates.
+# NOTE: deliberately does NOT call len(_src) — for a runtime probe source without
+# a hash index that walks EVERY shard's docs_*.jsonl, and it runs BEFORE
+# _attach_prefetchers(), so multi-repo shard layouts (overflow repos via
+# prefetch.repos/per_repo) 404 on the first shard outside the primary repo.
+# The shard count is cheap and prefetch-independent.
 for _name, _src in injection_sources.items():
     _cfg = next(c for c in injection_cfgs if c.name == _name)
+    _nshards = len(getattr(_src, "shards", ()) or ())
     print0(f"injection site {_name!r}: source={getattr(_src, 'source_kind', type(_src).__name__)} "
            f"r={_src.r} after_block={_cfg.after_block} gate={_gate_str(_cfg.gate)} "
            f"trainable_direction={_cfg.trainable_direction} optim={_cfg.optim} "
-           f"noise={float(injection_source_specs[_name].get('noise_sigma', 0.15))} docs={len(_src):,}")
+           f"noise={float(injection_source_specs[_name].get('noise_sigma', 0.15))} shards={_nshards}")
 
 # Optional ablation: disable the ResFormer value embeddings. We zero the value-embedding
 # tables and freeze them, so they neither contribute to the forward (v = v + gate*0 == v)
