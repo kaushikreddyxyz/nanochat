@@ -68,31 +68,68 @@ def fig1():
 
 # ---------------------------------------------------------------- fig 2: dose-response
 def fig2():
+    # absolute day-logits per dose recomputed from the per-item files (paired design)
+    import math
+    dose_conds = [("off", 0.0), ("dose@0.25", 0.25), ("dose@0.5", 0.5), ("clean_on", 1.0),
+                  ("dose@2", 2.0), ("dose@4", 4.0)]
+    meta = C["meta"]
+    def curves(fname):
+        d = json.load(open(os.path.join(RES, fname)))
+        order = None
+        txt = {k: [0.0, 0] for _, k in dose_conds}
+        oth = {k: [0.0, 0] for _, k in dose_conds}
+        for rec in d["items"]:
+            it = rec["item"]
+            if it["family"] != "mention":
+                continue
+            for cname, k in dose_conds:
+                cond = rec["conds"].get(cname)
+                if not cond or "day_logits" not in cond:
+                    continue
+                L = cond["day_logits"]
+                if order is None:
+                    order = meta["store_order"] if meta["store_order"][L.index(max(L))] == cond["argmax_day"]                         else meta["calendar_order"]
+                i = order.index(it["text_answer"])
+                txt[k][0] += L[i]; txt[k][1] += 1
+                oth[k][0] += (sum(L) - L[i]) / 6; oth[k][1] += 1
+        ks = [k for _, k in dose_conds]
+        return ks, [txt[k][0] / max(txt[k][1], 1) for k in ks], [oth[k][0] / max(oth[k][1], 1) for k in ks]
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.1))
+    ax = axes[0]
+    for arm in ARMS:
+        ks, t, o = curves(f"causal_{arm}.json")
+        ax.plot(ks, t, "-o", color=COL[arm], ms=4.5, lw=1.8, label=f"{LBL[arm]}: text day")
+        ax.plot(ks, o, ":", color=COL[arm], alpha=0.55, lw=1.3,
+                label="mean of other 6 days" if arm == "trainable" else "_")
+    ax.set_xlabel("gate multiplier (0 = off, 1 = trained loudness 0.0273)")
+    ax.set_ylabel("mean logit at answer position (absolute)")
+    ax.set_title("Absolute: mean logit of the TEXT day (solid)\nvs the other six days (dotted), per dose",
+                 fontsize=9.5)
+    ax.legend(fontsize=7.8, frameon=False)
+    ax.tick_params(labelsize=8.5)
+
+    ax = axes[1]
     dr = C["dose_response"]["correct_vs_off"]
     doses = [0.0, 0.25, 0.5, 1.0, 2.0, 4.0]
-    fig, ax = plt.subplots(figsize=(6.4, 4.2))
     for arm in ARMS:
-        ys = [dr[arm][str(d)] for d in doses]
-        ax.plot(doses, ys, "-o", color=COL[arm], label=LBL[arm], ms=5, lw=1.8)
-    for arm in ARMS:  # controls
-        ys = [dr[f"baseline_{arm}"][str(d)] for d in doses]
-        ax.plot(doses, ys, "--", color=COL[arm], alpha=0.35, lw=1.2,
-                label="controls (untrained + direction)" if arm == "trainable" else "_")
+        ax.plot(doses, [dr[arm][str(d)] for d in doses], "-o", color=COL[arm], label=LBL[arm], ms=4.5, lw=1.8)
+    for arm in ARMS:
+        ax.plot(doses, [dr[f"baseline_{arm}"][str(d)] for d in doses], "--", color=COL[arm], alpha=0.35,
+                lw=1.2, label="controls (untrained + direction)" if arm == "trainable" else "_")
     ax.set_ylim(-1.15, 0.45)
-    # sphere collapse off-scale annotation
     sph4 = dr["sphere"]["4.0"]
     if sph4 < -1.1:
-        ax.annotate(f"sphere @4×: {sph4:.2f} (collapse)", xy=(4.0, -1.12), xytext=(2.1, -0.95),
-                    fontsize=8.5, color=COL["sphere"],
-                    arrowprops=dict(arrowstyle="->", color=COL["sphere"], lw=1))
+        ax.annotate(f"sphere @4x: {sph4:.2f}", xy=(4.0, -1.12), xytext=(2.2, -0.95), fontsize=8.5,
+                    color=COL["sphere"], arrowprops=dict(arrowstyle="->", color=COL["sphere"], lw=1))
     ax.axhline(0, color="k", lw=0.6)
-    ax.set_xlabel("gate multiplier (1.0 = trained loudness 0.0273)")
-    ax.set_ylabel("Δ correct-day logit vs OFF")
-    ax.set_title("Dose–response: trained models read the injection; controls are flat.\n"
-                 "Overdrive (4×) collapses the entangled sphere geometry; orthogonal holds.",
-                 fontsize=10)
-    ax.legend(fontsize=8.5, frameon=False, loc="lower left")
+    ax.set_xlabel("gate multiplier")
+    ax.set_ylabel("paired \u0394 logit(text day) vs SAME item at gate 0")
+    ax.set_title("Paired delta vs off (the same items, gate 0):\ntrained arms respond, controls flat",
+                 fontsize=9.5)
+    ax.legend(fontsize=7.8, frameon=False, loc="lower left")
     ax.tick_params(labelsize=8.5)
+    fig.suptitle("Dose\u2013response on day-mention items (n=280, paired within item)", fontsize=11, y=1.03)
     fig.tight_layout()
     fig.savefig(os.path.join(OUT, "fig2_dose_response.png"), dpi=170, bbox_inches="tight")
     plt.close(fig)
