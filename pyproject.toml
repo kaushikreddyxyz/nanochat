@@ -9,10 +9,17 @@ dependencies = [
     "fastapi>=0.117.1",
     "kernels>=0.11.7",
     "psutil>=7.1.0",
+    # python-dotenv: common.py loads nanochat/.env (HF_TOKEN, WANDB_TOKEN) on import;
+    # without it the fallback silently skips .env (pods lost their tokens on manual runs)
+    "python-dotenv>=1.2.1",
     "rustbpe>=0.1.0",
+    # sentencepiece + transformers: runtime probe-score sources gemma-tokenize doc
+    # text for alignment (sources.py _default_gemma_encode); required by injected runs
+    "sentencepiece>=0.2.0",
     "tiktoken>=0.11.0",
     "tokenizers>=0.22.0",
     "torch==2.9.1",
+    "transformers>=4.57.3",
     "uvicorn>=0.36.0",
     "wandb>=0.21.3",
 ]

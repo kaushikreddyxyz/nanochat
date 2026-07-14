@@ -108,7 +108,31 @@ ENVF="$NANO/.env"
 [ -n "${WANDB_API_KEY:-}" ] && printf 'WANDB_TOKEN=%s\n'  "$WANDB_API_KEY" >> "$ENVF"
 chmod 600 "$ENVF" || true
 
+# --- CPython dev headers (torch.compile/Inductor JIT needs Python.h) --------
+# The runpod-torch-v240 image ships a venv-visible python WITHOUT its -dev
+# package; Inductor's cuda_utils codegen then fails at the first compile with
+# `fatal error: Python.h: No such file or directory`. Install headers for the
+# interpreter uv will use (system python3, whatever its minor version).
+PYVER="$(python3 -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')"
+if [ ! -f "/usr/include/python${PYVER}/Python.h" ]; then
+  echo ">> installing python${PYVER}-dev (Python.h needed by torch.compile)"
+  apt-get update -qq || true
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "python${PYVER}-dev" \
+    || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-dev
+  [ -f "/usr/include/python${PYVER}/Python.h" ] \
+    || { echo "ERROR: Python.h still missing after apt install" >&2; exit 1; }
+fi
+
+# --- HF token sanity (gemma tokenizer is a GATED repo; sources need auth) ---
+if [ -z "${HF_TOKEN:-}" ]; then
+  echo "WARNING: HF_TOKEN is empty — injected runs will fail to load the gated" >&2
+  echo "         google/gemma-2-2b tokenizer, and HF checkpoint pushes will fail." >&2
+fi
+
 # --- uv env (nanochat convention) -------------------------------------------
+# NOTE: transformers/sentencepiece/python-dotenv are core deps in pyproject
+# (NOT dev-group-only): uv sync prunes packages absent from the lockfile, so a
+# manual `uv pip install` here would be undone by the run scripts' own uv sync.
 cd "$NANO"
 command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
