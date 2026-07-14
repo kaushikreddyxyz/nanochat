@@ -19,13 +19,21 @@ from nanochat.injection.sources import make_orthonormal_P  # noqa: E402
 from nanochat.injection.sites import (  # noqa: E402
     InjectionCfg,
     InjectionSite,
+    assert_gate_identical_across_ranks,
     build_sites,
     calibrate_auto_gate,
+    calibrate_donor_gate,
+    discover_loudness_json,
+    donor_gate_from_loudness,
+    donor_source_layer_concepts,
+    gate_vector_hash,
     optimizer_param_split,
     orthonormal_direction,
+    parse_donor_gate_spec,
     parse_gate_spec,
     reassert_optimizability,
     sites_by_block,
+    validate_donor_concepts,
 )
 
 B, T, N_EMBD, R = 2, 8, 64, 14
@@ -377,6 +385,213 @@ def test_gpt_optimizer_contract_and_step():
     assert torch.equal(sites["coords"].gate.detach(), g0), "gate must never be stepped"
     assert torch.equal(sites["coords"].direction.detach(), d0), "frozen direction must never move"
     assert not torch.equal(sites["free"].direction.detach(), f0), "trainable direction must move"
+
+
+# --------------------------------------------------------------------------- #
+# Donor-matched gate (loudness.json): parse, calibration target + determinism,
+# concept-order refusal, source-layer requirement, checkpoint-meta persistence,
+# resume-does-not-rescore, live-source calibrates-before-training-batch, fallback
+# discovery logging, and DDP bit-identity.
+# --------------------------------------------------------------------------- #
+class _FakeDonorSource:
+    """Probe-score source for donor-gate tests: a gemma layer + concept columns +
+    a score_loc, and deterministic per-channel activation stats (like _FakeGateSource)."""
+    def __init__(self, r=3, layer=8, concepts=None, score_loc="/tmp/nope", n_docs=64):
+        self.r, self.layer, self.name = r, layer, "fake-donor"
+        self.concepts = concepts or [f"c{i}" for i in range(r)]
+        self.score_loc = score_loc
+        self._n = n_docs
+
+    def sample_activation_stats(self, k, seed):
+        rng = np.random.default_rng(seed)
+        rows = []
+        for _ in range(min(k, self._n)):
+            m = rng.integers(20, 40)
+            z = np.zeros((m, self.r), np.float32)
+            for c in range(self.r):
+                fire = rng.random(m) < (0.2 * (c + 1))
+                z[fire, c] = (c + 1) * 1.0
+            rows.append(z)
+        pooled = np.concatenate(rows)
+        rms = np.sqrt((pooled ** 2).mean(0)).astype(np.float32)
+        nz = (pooled != 0).mean(0).astype(np.float32)
+        return rms, nz, len(rows), pooled.shape[0]
+
+
+def _fake_loudness(concepts, layer=8):
+    L, K = str(layer), len(concepts)
+    return {
+        "version": 1, "concepts": list(concepts),
+        "ridge": {"active_loudness": {L: {"p50": [0.02 * (i + 1) for i in range(K)]}}},
+        "subspace_total": {"ridge": {L: {"p50": 0.05, "p90": 0.09, "p95": 0.12, "p99": 0.2}}},
+    }
+
+
+def test_donor_gate_spec_parses():
+    assert parse_donor_gate_spec("donor") == (True, "p50")
+    assert parse_donor_gate_spec("donor:p95") == (True, "p95")
+    assert parse_donor_gate_spec("auto:0.1") == (False, None)
+    assert parse_donor_gate_spec(0.05) == (False, None)
+    try:
+        parse_donor_gate_spec("donor:p42")
+        raise AssertionError("bad stat accepted")
+    except ValueError:
+        pass
+    # parse_gate_spec's (bool,value) contract is UNCHANGED
+    assert parse_gate_spec("auto:0.1") == (True, 0.1)
+
+
+def test_donor_gate_calibration_target_and_determinism():
+    src = _FakeDonorSource(r=3)
+    loud = _fake_loudness(src.concepts)
+    g1, m1 = donor_gate_from_loudness(src, loud, stat="p50", k=32, seed=0, min_docs=8)
+    g2, _ = donor_gate_from_loudness(src, loud, stat="p50", k=32, seed=0, min_docs=8)
+    assert g1 == g2, "donor gate must be deterministic in (source, seed)"
+    assert abs(float(np.sqrt(np.mean(np.square(g1)))) - 0.05) < 1e-5, "rms(gate) must == subspace_total target"
+    g95, _ = donor_gate_from_loudness(src, loud, stat="p95", k=32, seed=0, min_docs=8)
+    assert abs(float(np.sqrt(np.mean(np.square(g95)))) - 0.12) < 1e-5, "stat picks the subspace_total quantile"
+    # per-channel weight ∝ donor_loudness_c / rms_c (constant ratio on active channels)
+    rms = np.asarray(m1["channel_rms"]); donor = np.asarray(m1["donor_loudness"])
+    w = np.asarray(g1) / (donor / rms)
+    assert np.allclose(w, w[0], rtol=1e-4)
+    assert m1["mode"] == "donor" and m1["layer"] == 8 and m1["stat"] == "p50"
+
+
+def test_donor_concept_order_mismatch_refuses():
+    src = _FakeDonorSource(r=3, concepts=["a", "b", "c"])
+    bad = _fake_loudness(["a", "c", "b"])       # permuted vs source columns
+    try:
+        donor_gate_from_loudness(src, bad, stat="p50", k=16, seed=0, min_docs=8)
+        raise AssertionError("permuted concepts were accepted")
+    except ValueError as e:
+        assert "concepts" in str(e)
+    validate_donor_concepts(["a", "b"], ["a", "b"])   # exact match ok
+    try:
+        validate_donor_concepts(["a", "b"], ["b", "a"])
+        raise AssertionError("permutation accepted")
+    except ValueError:
+        pass
+
+
+def test_donor_source_layer_requirement():
+    class _NoLayer:                              # FnSource-like: nothing to key on
+        name, r = "fn", 4
+    try:
+        donor_source_layer_concepts(_NoLayer())
+        raise AssertionError("accepted a layer-less source")
+    except ValueError as e:
+        assert "probe-score source" in str(e)
+    class _Store:                               # e.g. a Qwen store whose meta names its layer
+        name, r = "store", 3
+        meta = {"layer": 6, "concepts": ["a", "b", "c"]}
+    assert donor_source_layer_concepts(_Store()) == (6, ["a", "b", "c"])
+    class _StoreNoLayer:
+        name, r = "store", 3
+        meta = {"concepts": ["a", "b", "c"]}
+    try:
+        donor_source_layer_concepts(_StoreNoLayer())
+        raise AssertionError("accepted a store with no layer identity")
+    except ValueError as e:
+        assert "layer" in str(e)
+
+
+def test_donor_gate_persists_through_cfg_roundtrip():
+    src = _FakeDonorSource(r=4)
+    gate_vec, _ = donor_gate_from_loudness(src, _fake_loudness(src.concepts),
+                                           stat="p50", k=32, seed=1, min_docs=8)
+    cfg = InjectionCfg(name="v", r=4, after_block=0, gate=gate_vec)
+    rebuilt = InjectionCfg(**asdict(cfg))       # json meta round trip
+    assert rebuilt.gate == gate_vec
+    site = InjectionSite(rebuilt, N_EMBD)
+    assert torch.equal(site.gate.detach(), torch.tensor(gate_vec))
+
+
+def test_donor_resume_does_not_rescore():
+    # The resume path reuses the calibrated vector from checkpoint meta; the
+    # source is NEVER sampled again. Mirrors injection_train's reuse branch.
+    class _NoRescore(_FakeDonorSource):
+        def sample_activation_stats(self, k, seed):
+            raise AssertionError("resume must NOT rescore the source")
+    _ = _NoRescore(r=3)
+    ckpt_sites = {"v": {"name": "v", "gate": [0.01, 0.02, 0.03]}}
+    pending = {"v": "p50"}
+    resolved = None
+    for name in list(pending):
+        g = ckpt_sites.get(name, {}).get("gate")
+        if isinstance(g, (list, tuple)):
+            resolved = InjectionCfg(name=name, r=3, after_block=0, gate=[float(x) for x in g])
+            del pending[name]
+    assert not pending, "donor site must be resolved from meta, not left pending (no rescore loop)"
+    assert resolved.gate == [0.01, 0.02, 0.03]
+
+
+def test_donor_live_source_calibrates_before_training_batch():
+    # A live/dynamic source runs its scorer at STARTUP (during calibration),
+    # strictly before any training batch is drawn. Record call order.
+    calls = []
+
+    class _FakeLive:
+        name, r, layer = "live", 3, 8
+        concepts = ["a", "b", "c"]
+        score_loc = "/tmp/none"
+
+        def sample_activation_stats(self, k, seed):
+            calls.append("calibrate")           # the live scorer runs here (startup)
+            rng = np.random.default_rng(seed)
+            pooled = np.abs(rng.normal(size=(200, self.r))).astype(np.float32) + 0.5
+            return (np.sqrt((pooled ** 2).mean(0)).astype(np.float32),
+                    np.ones(self.r, np.float32), 32, pooled.shape[0])
+
+        def draw_training_batch(self):
+            calls.append("train")
+
+    src = _FakeLive()
+    donor_gate_from_loudness(src, _fake_loudness(src.concepts), stat="p50", k=16, seed=0, min_docs=8)
+    src.draw_training_batch()
+    assert calls == ["calibrate", "train"], f"calibration must precede any training batch: {calls}"
+
+
+def test_donor_fallback_discovery_logs_loudly():
+    logs = []
+    log = logs.append
+    # 1) --loudness-json override wins (and is logged)
+    _, desc = discover_loudness_json(_FakeDonorSource(), "/some/override", log,
+                                     load_fn=lambda loc: {"src": loc})
+    assert desc == "override:/some/override" and any("--loudness-json" in x for x in logs)
+    # 2) source store root present
+    logs.clear()
+    src = _FakeDonorSource(score_loc="the-store")
+    _, desc = discover_loudness_json(src, None, log, load_fn=lambda loc: {"loc": loc})
+    assert desc == "store:the-store" and any("source store root" in x for x in logs)
+    # 3) store root lacks loudness.json -> LOUD fallback, always logged
+    logs.clear()
+
+    def _load(loc):
+        if loc == "the-store":
+            raise FileNotFoundError("no loudness.json here")
+        return {"fallback": loc}
+    _, desc = discover_loudness_json(src, None, log, load_fn=_load,
+                                     fallback_repo="kaushikreddyxyz/climbmix-scored")
+    assert desc == "fallback:kaushikreddyxyz/climbmix-scored"
+    assert any("FALLBACK" in x for x in logs) and any("!!!!" in x for x in logs)
+
+
+def test_donor_gate_ddp_identity():
+    loud = _fake_loudness(_FakeDonorSource(r=4).concepts)
+    g, _ = donor_gate_from_loudness(_FakeDonorSource(r=4), loud, stat="p50", k=32, seed=3, min_docs=8)
+    # deterministic calibration on every "rank" -> identical gate hashes
+    ranks = [donor_gate_from_loudness(_FakeDonorSource(r=4), loud, stat="p50",
+                                      k=32, seed=3, min_docs=8)[0] for _ in range(4)]
+    hashes = [gate_vector_hash(gv) for gv in ranks]
+    assert len(set(hashes)) == 1, "deterministic calibration must give identical gate hashes"
+    assert_gate_identical_across_ranks(g, "v", lambda *a: None, all_gather_hash=lambda h: hashes)
+    # ...and the collective check RAISES on any rank disagreement
+    try:
+        assert_gate_identical_across_ranks(g, "v", lambda *a: None,
+                                           all_gather_hash=lambda h: [h, "deadbeef"])
+        raise AssertionError("rank disagreement not caught")
+    except RuntimeError as e:
+        assert "disagree" in str(e)
 
 
 if __name__ == "__main__":

@@ -147,6 +147,44 @@ is gone — folded into the gate):
   calibrated vector is logged per site and stored in `cfg.gate` → the checkpoint
   meta, so **resumes reuse it and never recalibrate**.
 
+### Donor-matched gate (`--gate donor[:stat]`)
+
+Where `auto` merely equalizes channels to an arbitrary target, **donor** anchors
+the loudness to how loud these same concepts are **natively in the donor model
+(gemma-2-2b)** — read from `loudness.json` (`attribution/measure_loudness.py`),
+which interprets probe z-scores as **fractions of gemma's residual-stream norm**,
+the *same units as the gate* (`‖Δx‖/‖x‖`). Two numbers matter:
+
+- **λ_c / ℓ_c** — a concept's per-token loudness (fraction of `‖x‖`). The
+  per-channel weight is `g_c ∝ active_loudness.ridge[L].p50[c] / rms_c` (dead
+  channels → 0): louder-native concepts get a proportionally louder channel.
+- **ℓ_tot** — the whole 54-concept *packet*'s loudness (`‖Qᵀ(x−x̄)‖/‖x‖`), the
+  direct analogue of the overall gate. The overall target is
+  `subspace_total.ridge[L][stat]`, `stat ∈ {p50 (default), p90, p95, p99}` — so
+  `--gate donor` reproduces gemma's median native packet loudness and
+  `--gate donor:p95` its loud tail.
+
+`L` is the source's configured gemma layer. Resolution is **entirely at startup**
+(loudness fetch → seeded `sample_activation_stats` scoring → calibration → scaled
+so `rms(gate) == target`), strictly before buffer prefill and step 1 — for
+live/dynamic sources this runs the scorer over the sample docs up front (logged
+duration); it **never calibrates lazily**. Deterministic in (source, seed) so all
+DDP ranks agree (asserted via a gate-vector hash across ranks). Persisted in the
+checkpoint meta (`gate_calibration` + the vector in `injection_sites_config`), so
+**resumes reuse it and never rescore**.
+
+- **loudness.json discovery**: `--loudness-json PATH` (a local file/dir or an HF
+  dataset repo id) wins; else the source's own store root; else fall back to
+  `kaushikreddyxyz/climbmix-scored` with a **loud log** (valid because loudness is
+  a property of gemma+probes+corpus, not of the scoring source). The chosen
+  artifact + its origin are always logged — no silent defaulting.
+- **HARD refusal**: `loudness.json`'s `concepts` must equal the source's column
+  names **exactly, order included** (the permutation lesson) — mismatch refuses
+  to start. The source must expose a gemma layer + concept columns
+  (`RuntimeProbeScoreSource`, `LiveProbeScoreSource`, or a probe-scores store
+  whose `meta.json` names its layer); `FnSource` / a layerless store get a clear
+  "donor gate requires a probe-score source" error.
+
 ## Activation sources (`sources.py`)
 
 The per-token content is called **activations** everywhere user-facing.

@@ -495,20 +495,47 @@ class LiveProbeScoreSource(_RuntimeProbeBase):
 
     def __init__(self, score_fn, score_loc, layer=8, *, nano_enc, gemma_encode=None,
                  gemma_model="google/gemma-2-2b", concepts=None, noise_sigma=0.0,
-                 seed=0, name="probe-scores-live", align_policy="mean"):
+                 seed=0, name="probe-scores-live", align_policy="mean", sample_texts=None):
         columns = _read_store_json(score_loc, "columns.json")
         quant = _read_store_json(score_loc, "quant.json")
         corpus_stats = _read_store_json(score_loc, "corpus_stats.json")
         self._init_layout(columns, quant, corpus_stats, layer, concepts, name, noise_sigma, seed,
                           align_policy)
         self.score_fn = score_fn
+        self.score_loc = score_loc
         self.nano_enc = nano_enc
         self.gemma_encode = gemma_encode or _default_gemma_encode(gemma_model)
+        # Startup-only calibration corpus: a donor/auto gate must resolve BEFORE
+        # training, so the live scorer runs over these at startup (never lazily).
+        self.sample_texts = list(sample_texts) if sample_texts else None
 
     def lookup(self, text, n_tokens):
         raw = np.asarray(self.score_fn([text])[0], np.float32)         # (n_gemma, L, 54) raw
         z = self._standardize(raw[:, self.li][:, self.col_idx])        # (n_gemma, r)
         return self._align_and_gather(text, n_tokens, z), 0
+
+    def sample_activation_stats(self, k, seed):
+        """Run the live scorer over a seeded sample of ``sample_texts`` at startup
+        for donor/auto gate calibration — a one-time cost, strictly before any
+        training batch. Fails loudly if no calibration corpus was supplied."""
+        if not self.sample_texts:
+            raise NotImplementedError(
+                f"{self.name!r}: donor/auto gate needs a startup sample corpus — construct "
+                f"LiveProbeScoreSource(..., sample_texts=[...]) so the scorer runs over a sample "
+                f"BEFORE training (it never scores lazily).")
+        rng = np.random.default_rng(seed & 0x7FFFFFFF)
+        idx = rng.permutation(len(self.sample_texts))[:min(k, len(self.sample_texts))]
+        rows = []
+        for i in idx:
+            raw = np.asarray(self.score_fn([self.sample_texts[int(i)]])[0], np.float32)  # (n_gemma, L, 54)
+            z = self._standardize(raw[:, self.li][:, self.col_idx])
+            if z.shape[0] > 0:
+                rows.append(z)
+        if not rows:
+            return np.zeros(self.r, np.float32), np.zeros(self.r, np.float32), 0, 0
+        pooled = np.concatenate(rows, axis=0)
+        rms, nz = _channel_stats(pooled)
+        return rms, nz, len(rows), pooled.shape[0]
 
 
 def _default_gemma_encode(gemma_model):

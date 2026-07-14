@@ -35,7 +35,9 @@ import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
-from nanochat.injection.sites import InjectionCfg, reassert_optimizability, parse_gate_spec, calibrate_auto_gate
+from nanochat.injection.sites import (InjectionCfg, reassert_optimizability, parse_gate_spec, calibrate_auto_gate,
+                                       parse_donor_gate_spec, donor_gate_from_loudness, discover_loudness_json,
+                                       assert_gate_identical_across_ranks)
 from nanochat.injection.sources import open_store, RuntimeProbeScoreSource
 from nanochat.injection.activation_dataloader import acts_data_loader_buffered
 from nanochat.injection.buffering import coordinate_rebuffer, duty_cycle_forecast, rebuffer_progress, shard_cover_seconds, size_prefetch_streams
@@ -99,9 +101,10 @@ parser.add_argument("--no-value-embeds", action="store_true", help="zero and fre
 # Injection surface (exactly one of --activation-store / --activation-config required)
 parser.add_argument("--activation-store", type=str, default="", help="activation store dir (activations.int8/index.npy/meta.json[/P.npy] from scripts/precompute_activations.py): ONE tabular site named 'acts' with a frozen direction (the store's P if present, else seeded orthonormal)")
 parser.add_argument("--after-block", type=int, default=7, help="0-based block index for the single-store site; activations are added right AFTER transformer.h[N]")
-parser.add_argument("--gate", type=str, default="0.05", help="injected loudness: a number (fraction of residual RMS, 0=off) OR 'auto'/'auto:0.1' to calibrate a per-channel gate from the source (target overall loudness, default 0.05). Default 0.05.")
-parser.add_argument("--gate-k", type=int, default=256, help="docs sampled (seeded) for --gate auto calibration")
-parser.add_argument("--gate-min-docs", type=int, default=16, help="fail --gate auto if the source yields fewer sample docs than this")
+parser.add_argument("--gate", type=str, default="0.05", help="injected loudness: a number (fraction of residual RMS, 0=off) OR 'auto'/'auto:0.1' (per-channel calibration equalizing channels) OR 'donor'/'donor:p95' (match gemma's NATIVE concept loudness from loudness.json; stat p50/p90/p95/p99 picks the subspace_total target). Default 0.05.")
+parser.add_argument("--gate-k", type=int, default=256, help="docs sampled (seeded) for --gate auto/donor calibration")
+parser.add_argument("--gate-min-docs", type=int, default=16, help="fail --gate auto/donor if the source yields fewer sample docs than this")
+parser.add_argument("--loudness-json", type=str, default="", help="--gate donor: loudness.json location (local file/dir OR HF dataset repo id). Empty = the source's own store root, else fall back to kaushikreddyxyz/climbmix-scored (logged loudly).")
 parser.add_argument("--lookup-workers", type=int, default=0, help="threads for per-doc activation lookups in the ride-along loader (0=serial); overlaps runtime gemma scoring with training")
 parser.add_argument("--noise-sigma", type=float, default=0.15, help="gaussian noise std on standardized activations at load time, deterministic per doc-content hash; 0 disables")
 parser.add_argument("--activation-config", type=str, default="", help="JSON for the multi-site form: {\"sites\": [InjectionCfg dicts], \"sources\": {site: {\"kind\": \"qwen-encoder\"|\"probe-scores\", \"dir\": ..., \"noise_sigma\": ..., \"align_policy\": \"mean\"|\"last\"}}}; mutually exclusive with --activation-store. See nanochat/injection/README.md")
@@ -265,12 +268,19 @@ output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 
-# Resolve gate: numeric strings -> float; "auto[:target]" -> placeholder now,
-# calibrated per-channel from the source below (fresh runs) or reused from the
-# resumed checkpoint's meta (no recalibration). Sources open BEFORE the sites so
-# auto can sample them; they are loader-side data plumbing, never model state.
-_auto_targets = {}
+# Resolve gate: numeric strings -> float; "auto[:target]" and "donor[:stat]" ->
+# placeholder now, calibrated per-channel from the source below (fresh runs) or
+# reused from the resumed checkpoint's meta (no recalibration/rescore). Sources
+# open BEFORE the sites so calibration can sample them independently; they are
+# loader-side data plumbing, never model state.
+_auto_targets = {}       # name -> auto target loudness
+_donor_stats = {}        # name -> donor subspace_total stat (p50/p90/p95/p99)
 for _cfg in injection_cfgs:
+    _is_donor, _stat = parse_donor_gate_spec(_cfg.gate)
+    if _is_donor:
+        _donor_stats[_cfg.name] = _stat
+        _cfg.gate = 0.05                        # placeholder until calibration/load
+        continue
     _is_auto, _val = parse_gate_spec(_cfg.gate)
     if _is_auto:
         _auto_targets[_cfg.name] = _val
@@ -278,22 +288,24 @@ for _cfg in injection_cfgs:
     elif isinstance(_cfg.gate, str):
         _cfg.gate = float(_cfg.gate)
 
-# Resuming an auto-gate run: the calibrated per-channel vector must be in the
-# cfg BEFORE the sites are built — load_state_dict(assign=True) enforces shapes,
-# so a scalar-placeholder site cannot load a vector-gate checkpoint. Read it
-# from the checkpoint meta (injection_sites_config); a site absent there (warm
-# start from a vanilla checkpoint) calibrates fresh below.
+# Resuming an auto/donor-gate run: the calibrated per-channel vector must be in
+# the cfg BEFORE the sites are built — load_state_dict(assign=True) enforces
+# shapes, so a scalar-placeholder site cannot load a vector-gate checkpoint. Read
+# it from the checkpoint meta (injection_sites_config); a site absent there (warm
+# start from a vanilla checkpoint) calibrates fresh below. Resumes NEVER rescore.
 _auto_pending = dict(_auto_targets)
-if resuming and _auto_pending:
+_donor_pending = dict(_donor_stats)
+if resuming and (_auto_pending or _donor_pending):
     with open(os.path.join(checkpoint_dir, f"meta_{args.resume_from_step:06d}.json")) as f:
         _ckpt_sites = {c["name"]: c for c in json.load(f).get("injection_sites_config", [])}
-    for _name in list(_auto_pending):
-        _saved_gate = _ckpt_sites.get(_name, {}).get("gate")
-        if isinstance(_saved_gate, (list, tuple)):
-            _cfg = next(c for c in injection_cfgs if c.name == _name)
-            _cfg.gate = [float(g) for g in _saved_gate]
-            del _auto_pending[_name]
-            print0(f"[auto-gate] {_name!r}: reusing calibrated gate from checkpoint meta (no recalibration)")
+    for _pending, _label in ((_auto_pending, "auto-gate"), (_donor_pending, "donor-gate")):
+        for _name in list(_pending):
+            _saved_gate = _ckpt_sites.get(_name, {}).get("gate")
+            if isinstance(_saved_gate, (list, tuple)):
+                _cfg = next(c for c in injection_cfgs if c.name == _name)
+                _cfg.gate = [float(g) for g in _saved_gate]
+                del _pending[_name]
+                print0(f"[{_label}] {_name!r}: reusing calibrated gate from checkpoint meta (no rescore)")
 
 # Compact-tokens mode (opt-in): a gemma-boundary-respecting tokenizer used for
 # BOTH the training token stream (loader) and the runtime source alignment. OFF
@@ -325,14 +337,65 @@ for _name, _spec in injection_source_specs.items():
     assert _src.r == _cfg.r, f"site {_name!r}: source r={_src.r} != cfg r={_cfg.r}"
     injection_sources[_name] = _src
 
+# Gate calibration (auto + donor) — ENTIRELY at startup, BEFORE sites/prefill/
+# step 1; sampled independently from the source (never the training buffer, so it
+# cannot race prefill). Deterministic in (source, seed) => every DDP rank agrees;
+# we assert bit-identical gate vectors across ranks. Provenance is persisted in
+# checkpoint meta so resumes reuse the vector and never rescore.
+_gate_provenance = {}   # name -> calibration meta (saved to checkpoint)
+
+
+def _ddp_all_gather_hash(h):
+    """Gather every rank's gate-hash string (None => single process)."""
+    if not (ddp and ddp_world_size > 1 and is_ddp_initialized()):
+        return None
+    import torch.distributed as dist
+    out = [None] * ddp_world_size
+    dist.all_gather_object(out, h)
+    return out
+
+
+def _load_loudness(loc):
+    """loudness.json from a local file, a local dir, or an HF dataset repo id."""
+    if os.path.isfile(loc):
+        with open(loc) as f:
+            return json.load(f)
+    if os.path.isdir(loc):
+        with open(os.path.join(loc, "loudness.json")) as f:
+            return json.load(f)
+    from huggingface_hub import hf_hub_download
+    with open(hf_hub_download(loc, "loudness.json", repo_type="dataset")) as f:
+        return json.load(f)
+
+
 for _name, _target in _auto_pending.items():
     _cfg = next(c for c in injection_cfgs if c.name == _name)
     _gate_vec, _cal = calibrate_auto_gate(injection_sources[_name], target=_target,
                                           k=args.gate_k, seed=args.seed, min_docs=args.gate_min_docs)
     _cfg.gate = _gate_vec
+    _cal["gate_hash"] = assert_gate_identical_across_ranks(_gate_vec, _name, print0, _ddp_all_gather_hash)
+    _gate_provenance[_name] = {"mode": "auto", **_cal}
     print0(f"[auto-gate] {_name!r}: target={_target} active={_cal['n_active']}/{_cfg.r} "
            f"rms(gate)={_cal['rms_gate']:.4f} ({_cal['n_docs']} docs, {_cal['n_tokens']} tokens); "
            f"gate={[round(g, 4) for g in _gate_vec]}")
+
+for _name, _stat in _donor_pending.items():
+    _cfg = next(c for c in injection_cfgs if c.name == _name)
+    _src = injection_sources[_name]
+    _t_don = time.time()
+    _loud, _loud_src = discover_loudness_json(_src, args.loudness_json or None, print0, _load_loudness)
+    # For live/dynamic sources this actually runs the scorer over ~gate-k docs up
+    # front (one-time startup cost, logged) — calibration NEVER runs lazily.
+    _gate_vec, _cal = donor_gate_from_loudness(_src, _loud, stat=_stat, k=args.gate_k,
+                                               seed=args.seed, min_docs=args.gate_min_docs)
+    _cfg.gate = _gate_vec
+    _dur = time.time() - _t_don
+    _cal["gate_hash"] = assert_gate_identical_across_ranks(_gate_vec, _name, print0, _ddp_all_gather_hash)
+    _cal.update({"loudness_source": _loud_src, "duration_s": round(_dur, 3)})
+    _gate_provenance[_name] = _cal
+    print0(f"[donor-gate] {_name!r}: stat={_stat} layer={_cal['layer']} target={_cal['target']:.4f} "
+           f"active={_cal['n_active']}/{_cfg.r} rms(gate)={_cal['rms_gate']:.4f} "
+           f"({_cal['n_docs']} docs, {_cal['n_tokens']} tokens; {_dur:.1f}s startup scoring; {_loud_src})")
 
 model.setup_injection_sites(injection_cfgs)
 if args.activation_store:
@@ -362,7 +425,7 @@ if resuming:
     if missing:
         print0(f"warm-start: checkpoint has no injection sites; {len(missing)} site tensors keep their fresh init")
     reassert_optimizability(model.injection_sites)
-    for _name in _auto_targets:  # keep cfg (-> saved meta) in sync with the gate actually in the model
+    for _name in list(_auto_targets) + list(_donor_stats):  # keep cfg (-> saved meta) in sync with the gate in the model
         _cfg = next(c for c in injection_cfgs if c.name == _name)
         _g = model.injection_sites[_name].gate.detach().float().cpu()
         _cfg.gate = _g.tolist() if _g.ndim else float(_g)
@@ -880,6 +943,10 @@ while True:
                 # injection provenance: checkpoint_manager.build_model rebuilds
                 # the sites from injection_sites_config so the keys load
                 "injection_sites_config": [asdict(c) for c in injection_cfgs],
+                # auto/donor gate provenance (target/stat/layer/rms/hash/loudness
+                # source) — the calibrated vector rides in injection_sites_config
+                # above; a resume reuses it and never rescores.
+                "gate_calibration": _gate_provenance,
                 "injection_source_specs": injection_source_specs,
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,

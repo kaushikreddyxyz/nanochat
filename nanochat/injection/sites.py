@@ -13,6 +13,7 @@ byte-identical to the old scalar-only path. Neither form is ever optimized.
 
 Design rationale and invariants: nanochat/injection/README.md.
 """
+import hashlib
 from dataclasses import dataclass
 
 import numpy as np
@@ -180,3 +181,170 @@ def calibrate_auto_gate(src, target=0.05, k=256, seed=0, min_docs=16, floor=1e-3
             "n_active": int(active.sum()), "rms_gate": float(np.sqrt(np.mean(gate.astype(np.float64) ** 2))),
             "channel_rms": rms.astype(np.float32).tolist(), "nonzero_rate": nz.astype(np.float32).tolist()}
     return gate.tolist(), meta
+
+
+# --------------------------------------------------------------------------- #
+# Donor-matched gate: instead of merely equalizing channels (auto), scale the
+# gate so each concept's per-token loudness MATCHES how loud that concept is
+# NATIVELY in the donor model (gemma-2-2b), read from loudness.json
+# (attribution/measure_loudness.py). loudness.json interprets probe z-scores as
+# fractions of gemma's residual-stream norm — the same units as the gate:
+#   λ_c / ℓ_c   per-concept loudness (fraction of ‖x‖); active_loudness.ridge[L].p50
+#   ℓ_tot       subspace loudness (the whole-packet gate analogue); subspace_total.ridge[L]
+# Overall target = subspace_total.ridge[L][stat]; per-channel weight
+# g_c ∝ active_loudness.ridge[L].p50[c] / rms_c. Sibling to parse_gate_spec
+# (whose (bool, value) contract is unchanged) + calibrate_auto_gate.
+# --------------------------------------------------------------------------- #
+def parse_donor_gate_spec(spec, default_stat="p50"):
+    """'donor' | 'donor:p95' -> (True, stat); anything else -> (False, None).
+    stat ∈ {p50 (default), p90, p95, p99} selects the subspace_total quantile the
+    overall gate loudness targets."""
+    if isinstance(spec, str) and spec.startswith("donor"):
+        rest = spec[len("donor"):].lstrip(":")
+        stat = rest or default_stat
+        if stat not in ("p50", "p90", "p95", "p99"):
+            raise ValueError(f"--gate donor stat must be one of p50/p90/p95/p99, got {stat!r}")
+        return True, stat
+    return False, None
+
+
+def donor_source_layer_concepts(src):
+    """(gemma_layer, concept_column_names) the donor gate needs. Runtime/live
+    probe-score sources expose ``.layer`` + ``.concepts``; a probe-scores store
+    exposes them via meta.json (``layer``/``gemma_layer`` + ``concepts``/
+    ``columns``). Raises a clear error for sources with no gemma-layer / concept
+    identity (FnSource; a Qwen store whose meta lacks a layer field)."""
+    layer = getattr(src, "layer", None)
+    concepts = getattr(src, "concepts", None)
+    if layer is not None and concepts is not None:
+        return int(layer), list(concepts)
+    meta = getattr(src, "meta", None)
+    if isinstance(meta, dict):
+        layer = meta.get("layer", meta.get("gemma_layer"))
+        concepts = meta.get("concepts", meta.get("columns"))
+        if layer is not None and concepts is not None:
+            return int(layer), list(concepts)
+        missing = [f for f, v in (("layer/gemma_layer", layer), ("concepts/columns", concepts)) if v is None]
+        raise ValueError(
+            f"donor gate: source {getattr(src, 'name', '?')!r} store meta.json lacks {missing} — "
+            f"cannot identify which gemma layer's probe scores it predicts")
+    raise ValueError(
+        f"donor gate requires a probe-score source (exposing a gemma layer + concept columns); "
+        f"source {getattr(src, 'name', '?')!r} ({type(src).__name__}) exposes neither")
+
+
+def validate_donor_concepts(loudness_concepts, source_concepts):
+    """HARD: loudness.json 'concepts' must EQUAL the source's column names exactly
+    (order included) — the permutation lesson. Refuse to start otherwise."""
+    if list(loudness_concepts) != list(source_concepts):
+        raise ValueError(
+            "donor gate: loudness.json 'concepts' != source column names (order included). "
+            f"loudness[:5]={list(loudness_concepts)[:5]} source[:5]={list(source_concepts)[:5]}. "
+            "Refusing to start — a permutation here silently mis-weights every channel.")
+
+
+def calibrate_donor_gate(src, donor_loudness, target, k=256, seed=0, min_docs=16, floor=1e-3):
+    """Per-channel donor-matched gate: gate_c ∝ donor_loudness[c]/rms_c on active
+    channels (dead / zero-loudness -> 0), scaled so rms(gate) == target.
+    ``donor_loudness[c]`` = the concept's native active ridge loudness
+    (active_loudness.ridge[L].p50[c]); ``target`` = subspace_total.ridge[L][stat].
+    ``rms_c`` from the source's sampled activation stats — the SAME independent
+    sampling as auto (never the training buffer). Deterministic in (source, seed)
+    so every DDP rank agrees. Returns (gate_list, meta)."""
+    rms, nz, n_docs, n_tokens = src.sample_activation_stats(k, seed)
+    rms = np.asarray(rms, np.float64); nz = np.asarray(nz, np.float64)
+    donor = np.asarray(donor_loudness, np.float64)
+    if donor.shape[0] != rms.shape[0]:
+        raise ValueError(f"donor gate: loudness has {donor.shape[0]} concepts, source r={rms.shape[0]}")
+    if n_docs < min_docs:
+        raise RuntimeError(f"donor gate: source {getattr(src, 'name', '?')!r} sampled only {n_docs} docs "
+                           f"(< min_docs={min_docs}); too few to calibrate")
+    active = (rms > floor) & (nz > 0.0) & (donor > 0.0)
+    w = np.zeros(rms.shape[0], np.float64)
+    w[active] = donor[active] / rms[active]
+    wr = float(np.sqrt(np.mean(w ** 2)))
+    if wr <= 0.0:
+        raise RuntimeError(f"donor gate: source {getattr(src, 'name', '?')!r} has no active channels "
+                           f"(rms<=floor or zero donor loudness everywhere)")
+    gate = (w * (target / wr)).astype(np.float32)
+    meta = {"mode": "donor", "target": float(target), "k": int(k), "seed": int(seed),
+            "n_docs": int(n_docs), "n_tokens": int(n_tokens), "n_active": int(active.sum()),
+            "rms_gate": float(np.sqrt(np.mean(gate.astype(np.float64) ** 2))),
+            "channel_rms": rms.astype(np.float32).tolist(),
+            "donor_loudness": donor.astype(np.float32).tolist()}
+    return gate.tolist(), meta
+
+
+def donor_gate_from_loudness(src, loudness, stat="p50", k=256, seed=0, min_docs=16, floor=1e-3):
+    """End-to-end donor-gate resolution from a loaded loudness.json + a source:
+    resolve (layer, concepts) from the source, HARD-validate concept order, pull
+    the per-concept active ridge loudness (p50) + the subspace_total target for
+    ``stat`` at the source's gemma layer, and calibrate. Returns (gate_list, meta)."""
+    layer, src_concepts = donor_source_layer_concepts(src)
+    validate_donor_concepts(loudness["concepts"], src_concepts)
+    Lk = str(int(layer))
+    st = loudness.get("subspace_total", {}).get("ridge", {}).get(Lk)
+    if st is None:
+        raise ValueError(f"donor gate: loudness.json has no subspace_total.ridge[{Lk}] for the source's "
+                         f"gemma layer {layer}; layers present: {list(loudness.get('subspace_total', {}).get('ridge', {}))}")
+    if stat not in st:
+        raise ValueError(f"donor gate: subspace_total.ridge[{Lk}] has no stat {stat!r} (have {list(st)})")
+    target = float(st[stat])
+    act = loudness["ridge"]["active_loudness"].get(Lk)
+    if act is None:
+        raise ValueError(f"donor gate: loudness.json has no ridge.active_loudness[{Lk}]")
+    gate, meta = calibrate_donor_gate(src, act["p50"], target, k=k, seed=seed,
+                                      min_docs=min_docs, floor=floor)
+    meta.update({"stat": stat, "layer": int(layer)})
+    return gate, meta
+
+
+def discover_loudness_json(src, override, log, load_fn, fallback_repo="kaushikreddyxyz/climbmix-scored"):
+    """Locate + load loudness.json. Precedence (always logs which artifact + from
+    where — NO silent defaulting):
+      1. ``override`` (--loudness-json): a local file, a local dir, or an HF
+         dataset repo id;
+      2. the source's own store root (score_loc / store_dir);
+      3. ``fallback_repo``, with a LOUD log — valid because loudness is a property
+         of gemma+probes+corpus, not of the scoring source.
+    ``load_fn(loc)`` -> parsed dict for a location (injected for testing).
+    Returns (loudness_dict, source_desc)."""
+    if override:
+        log(f"[donor-gate] loudness.json <- --loudness-json {override}")
+        return load_fn(override), f"override:{override}"
+    loc = getattr(src, "score_loc", None) or getattr(src, "store_dir", None)
+    if loc is not None:
+        try:
+            d = load_fn(loc)
+            log(f"[donor-gate] loudness.json <- source store root {loc}")
+            return d, f"store:{loc}"
+        except Exception as e:  # noqa: BLE001 — absent at store root -> fall through to fallback
+            log(f"[donor-gate] no loudness.json at source store root {loc} "
+                f"({type(e).__name__}: {e}); falling back")
+    log("!" * 80)
+    log(f"[donor-gate] FALLBACK: loudness.json from {fallback_repo}. VALID — loudness is a property "
+        f"of gemma+probes+corpus, not of the scoring source.")
+    log("!" * 80)
+    return load_fn(fallback_repo), f"fallback:{fallback_repo}"
+
+
+def gate_vector_hash(gate):
+    """Stable content hash of a resolved gate (scalar or vector). DDP ranks
+    compare this to assert bit-identical calibration."""
+    a = np.ascontiguousarray(np.asarray(gate, np.float64).ravel())
+    return hashlib.blake2b(a.tobytes(), digest_size=16).hexdigest()
+
+
+def assert_gate_identical_across_ranks(gate, name, log, all_gather_hash=None):
+    """Assert every DDP rank computed a bit-identical gate. ``all_gather_hash(h)``
+    -> list of every rank's hash (None => single process, trivially identical).
+    Cheap + testable with simulated ranks. Returns the gate hash."""
+    h = gate_vector_hash(gate)
+    if all_gather_hash is None:
+        return h
+    hashes = list(all_gather_hash(h))
+    if len(set(hashes)) != 1:
+        raise RuntimeError(f"donor gate {name!r}: DDP ranks disagree on the calibrated gate "
+                           f"(hashes {sorted(set(hashes))}) — calibration is not deterministic")
+    log(f"[donor-gate] {name!r}: gate hash {h} identical across {len(hashes)} rank(s)")
+    return h
