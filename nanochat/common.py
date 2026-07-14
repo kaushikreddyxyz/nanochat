@@ -10,6 +10,19 @@ import torch
 import torch.distributed as dist
 from filelock import FileLock
 
+# Load nanochat's own .env (HF_TOKEN, WANDB_TOKEN, OPENROUTER_API_KEY, ...) on
+# import so every script that imports nanochat picks the tokens up. Real env vars
+# always win (override=False), so `wandb login` / pod-exported tokens are unaffected.
+try:
+    from pathlib import Path as _Path
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(_Path(__file__).resolve().parents[1] / ".env", override=False)
+    # wandb authenticates via WANDB_API_KEY; mirror the WANDB_TOKEN name if set.
+    if os.environ.get("WANDB_TOKEN") and not os.environ.get("WANDB_API_KEY"):
+        os.environ["WANDB_API_KEY"] = os.environ["WANDB_TOKEN"]
+except ModuleNotFoundError:  # python-dotenv absent — fall back to the ambient env
+    pass
+
 # The dtype used for compute (matmuls, activations). Master weights stay fp32 for optimizer precision.
 # Linear layers cast their weights to this dtype in forward, replacing torch.amp.autocast.
 # Override with NANOCHAT_DTYPE env var: "bfloat16", "float16", "float32"
@@ -182,6 +195,7 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
     # Reproducibility
     # Note that we set the global seeds here, but most of the code uses explicit rng objects.
     # The only place where global rng might be used is nn.Module initialization of the model weights.
+    # NOTE: If this module is called by ../runs/oracle_runs/baseline.sh (or possibly any of the runners in ../runs/oracle_runs/), this seed will be overwritten
     torch.manual_seed(42)
     if device_type == "cuda":
         torch.cuda.manual_seed(42)

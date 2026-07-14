@@ -3,6 +3,8 @@ Utilities for saving and loading model/optim/state checkpoints.
 """
 import os
 import re
+import io
+import gzip
 import glob
 import json
 import logging
@@ -39,14 +41,40 @@ def _patch_missing_keys(model_data, model_config):
         model_data["x0_lambdas"] = torch.zeros(n_layer)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
 
-def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
+def _save_tensorfile(obj, path, compress=True, compress_level=4):
+    """Save a torch object to `path`. If compress, gzip it to `path + '.gz'` instead.
+    We serialize to an in-memory buffer first (torch.save needs a seekable target) and
+    then gzip the bytes. Returns the path actually written."""
+    if compress:
+        buf = io.BytesIO()
+        torch.save(obj, buf)
+        gz_path = path + ".gz"
+        with open(gz_path, "wb") as f:
+            f.write(gzip.compress(buf.getvalue(), compresslevel=compress_level))
+        return gz_path
+    torch.save(obj, path)
+    return path
+
+def _load_tensorfile(path, map_location):
+    """Load a torch object saved by _save_tensorfile, auto-detecting compression:
+    prefers the plain `path`, falls back to the gzipped `path + '.gz'`."""
+    if os.path.exists(path):
+        return torch.load(path, map_location=map_location)
+    gz_path = path + ".gz"
+    if os.path.exists(gz_path):
+        with open(gz_path, "rb") as f:
+            buf = io.BytesIO(gzip.decompress(f.read()))  # decompress -> seekable buffer for torch.load
+        return torch.load(buf, map_location=map_location)
+    raise FileNotFoundError(f"Checkpoint not found: {path} (or {gz_path})")
+
+def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0, compress=True, compress_level=4):
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
-        # Save the model state parameters
+        # Save the model state parameters (optionally gzip-compressed)
         model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
-        torch.save(model_data, model_path)
-        logger.info(f"Saved model parameters to: {model_path}")
-        # Save the metadata dict as json
+        saved_path = _save_tensorfile(model_data, model_path, compress=compress, compress_level=compress_level)
+        logger.info(f"Saved model parameters to: {saved_path}")
+        # Save the metadata dict as json (small, left uncompressed)
         meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta_data, f, indent=2)
@@ -55,18 +83,18 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
     if optimizer_data is not None:
         os.makedirs(checkpoint_dir, exist_ok=True)
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
-        torch.save(optimizer_data, optimizer_path)
-        logger.info(f"Saved optimizer state to: {optimizer_path}")
+        saved_path = _save_tensorfile(optimizer_data, optimizer_path, compress=compress, compress_level=compress_level)
+        logger.info(f"Saved optimizer state to: {saved_path}")
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
-    # Load the model state
+    # Load the model state (auto-detects gzip compression)
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
-    model_data = torch.load(model_path, map_location=device)
+    model_data = _load_tensorfile(model_path, map_location=device)
     # Load the optimizer state if requested
     optimizer_data = None
     if load_optimizer:
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
-        optimizer_data = torch.load(optimizer_path, map_location=device)
+        optimizer_data = _load_tensorfile(optimizer_path, map_location=device)
     # Load the metadata
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
     with open(meta_path, "r", encoding="utf-8") as f:
@@ -102,7 +130,16 @@ def build_model(checkpoint_dir, step, device, phase):
     # Load the model state
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
+    # Injected checkpoints: rebuild the injection sites from the saved config so
+    # the injection_sites.* keys load. Sites stay dormant unless forward gets
+    # acts=... (eval is activations-off by design).
+    injection_sites_config = meta_data.get("injection_sites_config")
+    if injection_sites_config:
+        model.setup_injection_sites(injection_sites_config)
     model.load_state_dict(model_data, strict=True, assign=True)
+    if injection_sites_config:
+        from nanochat.injection.sites import reassert_optimizability
+        reassert_optimizability(model.injection_sites)  # assign=True replaced the Parameter objects
     # Put the model in the right training phase / mode
     if phase == "eval":
         model.eval()
@@ -136,10 +173,12 @@ def find_largest_model(checkpoints_dir):
 
 
 def find_last_step(checkpoint_dir):
-    # Look into checkpoint_dir and find model_<step>.pt with the highest step
-    checkpoint_files = glob.glob(os.path.join(checkpoint_dir, "model_*.pt"))
+    # Look into checkpoint_dir and find model_<step>.pt (or .pt.gz) with the highest step
+    checkpoint_files = glob.glob(os.path.join(checkpoint_dir, "model_*.pt")) + \
+                       glob.glob(os.path.join(checkpoint_dir, "model_*.pt.gz"))
     if not checkpoint_files:
         raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
+    # basename is model_<step>.pt or model_<step>.pt.gz; split("_")[-1].split(".")[0] -> <step>
     last_step = int(max(os.path.basename(f).split("_")[-1].split(".")[0] for f in checkpoint_files))
     return last_step
 
@@ -186,9 +225,9 @@ def load_optimizer_state(source, device, rank, model_tag=None, step=None):
     if step is None:
         step = find_last_step(checkpoint_dir)
     optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
-    if not os.path.exists(optimizer_path):
-        log0(f"Optimizer checkpoint not found: {optimizer_path}")
+    if not (os.path.exists(optimizer_path) or os.path.exists(optimizer_path + ".gz")):
+        log0(f"Optimizer checkpoint not found: {optimizer_path} (or .gz)")
         return None
     log0(f"Loading optimizer state from {optimizer_path}")
-    optimizer_data = torch.load(optimizer_path, map_location=device)
+    optimizer_data = _load_tensorfile(optimizer_path, map_location=device)
     return optimizer_data

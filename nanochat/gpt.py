@@ -21,6 +21,7 @@ import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW, DistMuonAdamW
+from nanochat.injection.sites import build_sites, sites_by_block, optimizer_param_split
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
@@ -37,7 +38,6 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
-
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
@@ -314,6 +314,23 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
+    def setup_injection_sites(self, cfgs):
+        """Attach injection sites (nanochat.injection.sites) as
+        ``self.injection_sites``. cfgs: list[InjectionCfg | dict]. Call AFTER
+        materialization (to_empty + init_weights), BEFORE any state-dict load /
+        setup_optimizer / torch.compile. Draws no RNG from the global stream;
+        absent this call the model is byte-identical to vanilla."""
+        assert self.transformer.wte.weight.device.type != "meta", \
+            "setup_injection_sites: materialize the model first (to_empty + init_weights)"
+        sites = build_sites(cfgs, self.config.n_embd)
+        for site in sites.values():
+            assert 0 <= site.after_block < self.config.n_layer, \
+                f"injection site {site.cfg.name!r}: after_block {site.after_block} not in [0, {self.config.n_layer})"
+        sites = sites.to(self.get_device())  # params stay fp32 (master-weight convention; forward casts)
+        self.injection_sites = sites
+        self._injection_by_block = sites_by_block(sites)  # plain dict: forward-loop lookup
+        return sites
+
     def estimate_flops(self):
         """
         Return the estimated FLOPs per token for the model (forward + backward).
@@ -332,6 +349,10 @@ class GPT(nn.Module):
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
                           self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
+        # Injection sites (when attached) excluded too: keeps reported FLOPs
+        # comparable to the baseline (eval/vanilla forwards never run them).
+        if hasattr(self, "injection_sites"):
+            nparams_exclude += sum(p.numel() for p in self.injection_sites.parameters())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -360,9 +381,11 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        # Injection sites counted separately so the groups above stay comparable to vanilla runs
+        injection = sum(p.numel() for p in self.injection_sites.parameters()) if hasattr(self, "injection_sites") else 0
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars + injection
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
-        return {
+        out = {
             'wte': wte,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
@@ -370,6 +393,9 @@ class GPT(nn.Module):
             'scalars': scalars,
             'total': total,
         }
+        if injection:
+            out['injection'] = injection  # key only present when sites are attached
+        return out
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
         model_dim = self.config.n_embd
@@ -383,7 +409,13 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        # Injection-site optimizer contract: gates (_never_optimize) go in NO
+        # group (grads assigned but never stepped); frozen directions skipped;
+        # trainable directions join AdamW by default or Muon via cfg.optim.
+        injection_sites = getattr(self, "injection_sites", None)
+        injection_params = list(injection_sites.parameters()) if injection_sites is not None else []
+        inj_adamw, inj_muon = optimizer_param_split(injection_sites) if injection_sites is not None else ([], [])
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(injection_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -406,6 +438,21 @@ class GPT(nn.Module):
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
             ))
+        # Trainable injection directions: weight decay MUST stay 0.0 — the site
+        # normalizes the direction's scale away (z / rms(z)), so decay only
+        # shrinks the matrix toward the rms clamp. The `injection` tag lets the
+        # training script's wd scheduler skip these muon groups.
+        if inj_adamw:
+            param_groups.append(dict(
+                kind='adamw', params=inj_adamw, lr=embedding_lr * dmodel_lr_scale,
+                betas=(0.8, 0.995), eps=1e-10, weight_decay=0.0, injection=True,
+            ))
+        for shape in sorted({p.shape for p in inj_muon}):
+            group_params = [p for p in inj_muon if p.shape == shape]
+            param_groups.append(dict(
+                kind='muon', params=group_params, lr=matrix_lr,
+                momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=0.0, injection=True,
+            ))
 
         Factory = DistMuonAdamW if ddp else MuonAdamW
         optimizer = Factory(param_groups)
@@ -413,7 +460,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', acts=None):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -448,15 +495,33 @@ class GPT(nn.Module):
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
                 x = x + gate * x_pre_smear
 
+        # Geometric-manifold injection (nanochat.injection.inject): frozen
+        # per-token-id feature, added after norm + smear (amplitude must not be
+        # normed away; must stay an exact per-token signal) and folded into x0.
+        # No-op unless attached; self.inject gates it off for ablation.
+        oracle_fn = getattr(self, "oracle_fn", None)
+        if oracle_fn is not None and getattr(self, "inject", True):
+            x = x + oracle_fn(idx).to(x.dtype)
+
         # Forward the trunk of the Transformer
         x0 = x  # save initial normalized embedding for x0 residual
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
+        # Injection sites (nanochat.injection.sites): each site fires after its
+        # block; `acts` is a dict site-name -> (B, T, r) no-grad tensor from the
+        # ride-along dataloader. acts=None (eval/inference/vanilla) is
+        # bit-identical to a model without sites, with zero extra compute; both
+        # `acts is None` and the by-block map are trace-time constants, so
+        # torch.compile sees no data-dependent control flow.
+        inject_by_block = getattr(self, "_injection_by_block", None) if acts is not None else None
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            if inject_by_block is not None:
+                for site in inject_by_block.get(i, ()):
+                    x = site(x, acts[site.cfg.name])
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
@@ -481,7 +546,7 @@ class GPT(nn.Module):
             return logits
 
     @torch.inference_mode()
-    def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
+    def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42): 
         """
         Naive autoregressive streaming inference.
         To make it super simple, let's assume:

@@ -372,6 +372,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
         """Launch async reduce ops for AdamW group. Returns info dict with per-param infos."""
         param_infos = {}
         for p in group['params']:
+            if p.grad is None:
+                continue  # skip frozen params (e.g. --no-value-embeds); all ranks skip identically so collectives stay symmetric
             grad = p.grad
             if p.numel() < 1024:
                 # Small params: all_reduce (no scatter/gather needed)
@@ -411,6 +413,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
         """Wait for reduce, compute AdamW updates, launch gathers for large params."""
         param_infos = info['param_infos']
         for p in group['params']:
+            if p.grad is None:
+                continue  # frozen param: skipped in _reduce_adamw, nothing to update
             pinfo = param_infos[p]
             pinfo['future'].wait()
             grad_slice = pinfo['grad_slice']
