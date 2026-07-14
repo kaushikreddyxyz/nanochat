@@ -19,6 +19,16 @@ streams are what keep the window ahead (size with ``buffering.size_prefetch_stre
 Local dirs = no-op passthrough (``fetch_fn=None``): ``ensure`` returns
 immediately, no threads, no deletes. The real HF fetcher must set
 ``HF_HUB_DISABLE_XET=1`` (xet stalls on pods). CPU-tested with a fake fetcher.
+
+Multi-rank (DDP) staging: every rank runs its own prefetcher over the SAME
+staging dir, but ranks' producers skew by a shard or two — a rank-local delete
+frontier lets a fast rank remove files a slow rank is still reading
+(FileNotFoundError / partial-read races, observed at 8xH100 prefill). With
+``coord_dir``/``rank``/``world_size`` set, each rank persists its frontier to a
+tiny ``.frontier_r{rank}`` file (atomic ``os.replace``) and deletion keys off
+the MINIMUM frontier across all ranks; a missing/garbled frontier file reads as
+-1 and conservatively blocks deletion. Fetches were already cross-process safe
+(hf_hub_download file locks); only deletion needed coordination.
 """
 import os
 import threading
@@ -73,7 +83,8 @@ def make_local_deleter(staging_dir, *, files=SCORE_FILES, climbmix_dir=None,
 
 class ShardPrefetcher:
     def __init__(self, shard_ids, fetch_fn, *, delete_fn=None, ahead=2, keep_behind=1,
-                 on_wait=None, on_delete=None, streams=1):
+                 on_wait=None, on_delete=None, streams=1,
+                 coord_dir=None, rank=0, world_size=1):
         self.order = list(shard_ids)
         self._pos = {sid: i for i, sid in enumerate(self.order)}
         self.fetch_fn = fetch_fn
@@ -95,6 +106,54 @@ class ShardPrefetcher:
         self._deleted = 0
         self._fetch_count = 0      # completed fetches (bandwidth numerator)
         self._fetch_seconds = 0.0
+        self._evicted_local = set()   # sids whose LOCAL memmap eviction already fired
+        # -- cross-rank delete coordination (shared staging dir; see module doc) --
+        self._rank = int(rank)
+        self._world_size = int(world_size)
+        self._coord_dir = coord_dir if (coord_dir and self._world_size > 1
+                                        and self.enabled) else None
+        self._wlock = threading.Lock()
+        self._written_frontier = None
+        if self._coord_dir:
+            os.makedirs(self._coord_dir, exist_ok=True)
+            self._write_frontier(-1)   # reset OUR file (stale values from a
+            # previous crashed run would otherwise unblock deletion early;
+            # callers should barrier across ranks between __init__ and start())
+
+    # -- frontier files: .frontier_r{rank} in the shared staging dir ----------
+    def _frontier_path(self, r):
+        return os.path.join(self._coord_dir, f".frontier_r{r}")
+
+    def _write_frontier(self, val):
+        tmp = self._frontier_path(self._rank) + f".tmp{os.getpid()}"
+        with open(tmp, "w") as f:
+            f.write(str(int(val)))
+        os.replace(tmp, self._frontier_path(self._rank))   # atomic
+        self._written_frontier = int(val)
+
+    def _publish_frontier(self):
+        """Persist our frontier if it advanced (monotonic; safe from any thread)."""
+        if not self._coord_dir:
+            return
+        with self._wlock:
+            with self._cv:
+                fr = self._frontier
+            if self._written_frontier is not None and fr <= self._written_frontier:
+                return
+            self._write_frontier(fr)
+
+    def _global_frontier(self):
+        """MIN of every rank's persisted frontier. Missing/garbled file -> -1
+        (that rank hasn't reported yet: conservatively block deletion)."""
+        lo = None
+        for r in range(self._world_size):
+            try:
+                with open(self._frontier_path(r)) as f:
+                    v = int(f.read().strip() or "-1")
+            except (OSError, ValueError):
+                v = -1
+            lo = v if lo is None else min(lo, v)
+        return -1 if lo is None else lo
 
     @property
     def enabled(self):
@@ -154,11 +213,14 @@ class ShardPrefetcher:
         background window has not reached ``sid`` yet."""
         if not self.enabled:
             return None
+        _MISS = object()
         with self._cv:
             self._frontier = max(self._frontier, self._pos.get(sid, self._frontier))
             self._cv.notify_all()          # let the worker re-window / delete behind
-            if sid in self._staged:
-                return self._staged[sid]
+            hit = self._staged.get(sid, _MISS)
+        self._publish_frontier()           # file IO outside the cv lock
+        if hit is not _MISS:
+            return hit
         if self.on_wait is not None:       # window did not cover this shard: starvation
             self.on_wait(sid)
         t0 = time.time()
@@ -173,20 +235,37 @@ class ShardPrefetcher:
         # the lock (so sibling streams pick DIFFERENT shards, never the same one),
         # fetches it outside the lock, then re-windows.
         while True:
+            # Deletion frontier: with cross-rank coordination this is the MIN of
+            # all ranks' persisted frontiers (never delete what any rank still
+            # needs); read OUTSIDE the cv lock (small file IO). min() with the
+            # local frontier below stays conservative if our own persist lags.
+            gf = self._global_frontier() if self._coord_dir else None
             with self._cv:
                 while not self._stop and self._frontier < 0:
                     self._cv.wait()
                 if self._stop:
                     return
                 frontier = self._frontier
+                del_frontier = frontier if gf is None else min(gf, frontier)
                 window = [self.order[i] for i in range(max(frontier, 0),
                                                        min(frontier + self.ahead + 1, len(self.order)))]
                 todo = [s for s in window if s not in self._staged and s not in self._inflight]
+                # File deletion keys off del_frontier (global min across ranks);
+                # the rank's OWN memmap-cache eviction (on_delete) keys off its
+                # LOCAL frontier — a fast rank must not pin passed shards' mmaps
+                # while it waits for the slowest rank to move on.
                 drop = [s for s in list(self._staged)
-                        if self._pos.get(s, 0) < frontier - self.keep_behind and s not in self._inflight]
+                        if self._pos.get(s, 0) < del_frontier - self.keep_behind and s not in self._inflight]
+                evict_local = [s for s in list(self._staged)
+                               if self._pos.get(s, 0) < frontier - self.keep_behind
+                               and s not in self._evicted_local and s not in self._inflight]
+                self._evicted_local.update(evict_local)
                 sid = todo[0] if todo else None
                 if sid is not None:
                     self._inflight.add(sid)    # reserve before releasing the lock
+            if self.on_delete is not None:
+                for d in evict_local:
+                    self.on_delete(d)          # idempotent (pop with default); may re-fire in _evict
             for d in drop:
                 self._evict(d)
             if sid is None:
@@ -219,10 +298,12 @@ class ShardPrefetcher:
             if sid not in self._staged or sid in self._inflight:
                 return
             self._staged.pop(sid, None)
+            self._evicted_local.discard(sid)   # bookkeeping stays bounded
         if self.on_delete is not None:
             self.on_delete(sid)
         if self.delete_fn is not None:
-            self.delete_fn(sid)
+            self.delete_fn(sid)   # concurrent ranks double-delete: deleter must
+            #                       treat a missing file as a no-op (OSError pass)
         with self._cv:
             self._deleted += 1
 

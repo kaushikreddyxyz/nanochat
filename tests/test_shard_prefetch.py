@@ -234,6 +234,72 @@ pb.stop()
 check(not t_ens.is_alive() and res_box == ["/stage/1"],
       f"ensure(1) recovered inline after the worker died (reservation released, got {res_box})")
 
+print("\n[J] cross-rank delete coordination: min-frontier files gate deletion; local"
+      "\n    memmap eviction still fires on the OWN frontier; stale/foreign files ignored")
+import tempfile  # noqa: E402
+
+with tempfile.TemporaryDirectory() as coord:
+    def _mk_fetch(tag):
+        def _fetch(sid):
+            with open(os.path.join(coord, f"f_{sid}"), "w") as fh:
+                fh.write(tag)              # idempotent rewrite, like hf re-download
+            return coord
+        return _fetch
+
+    def _delete(sid):
+        try:
+            os.remove(os.path.join(coord, f"f_{sid}"))
+        except OSError:                    # double-delete across ranks: benign no-op
+            pass
+
+    def _exists(sid):
+        return os.path.exists(os.path.join(coord, f"f_{sid}"))
+
+    # stale files from a previous crashed run: OWN ranks (overwritten to -1 at
+    # init) and a FOREIGN rank 7 (world_size=2 -> must be ignored by the min).
+    for r, v in ((0, "999"), (1, "999"), (7, "999")):
+        with open(os.path.join(coord, f".frontier_r{r}"), "w") as fh:
+            fh.write(v)
+
+    evictedA, evictedB = [], []
+    ORDER = list(range(6))
+    pA = ShardPrefetcher(ORDER, _mk_fetch("A"), delete_fn=_delete, ahead=2, keep_behind=1,
+                         on_delete=evictedA.append, streams=1,
+                         coord_dir=coord, rank=0, world_size=2)
+    pB = ShardPrefetcher(ORDER, _mk_fetch("B"), delete_fn=_delete, ahead=2, keep_behind=1,
+                         on_delete=evictedB.append, streams=1,
+                         coord_dir=coord, rank=1, world_size=2)
+    with open(os.path.join(coord, ".frontier_r0")) as fh:
+        r0_init = fh.read().strip()
+    with open(os.path.join(coord, ".frontier_r1")) as fh:
+        r1_init = fh.read().strip()
+    check(r0_init == "-1" and r1_init == "-1",
+          f"init resets OWN stale frontier files to -1 (r0={r0_init}, r1={r1_init})")
+    pA.start(); pB.start()
+
+    for sid in range(5):                   # rank 0 races ahead: frontier 4
+        pA.ensure(sid)
+    pB.ensure(0)                           # rank 1 lags: frontier 0
+    time.sleep(1.2)                        # workers re-window (idle wait <= 0.5s)
+    check(_exists(0) and _exists(1),
+          "lagging rank pins shards: nothing behind the GLOBAL min frontier deleted "
+          f"(f_0={_exists(0)}, f_1={_exists(1)}; foreign .frontier_r7=999 ignored)")
+    check(set(evictedA) >= {0, 1, 2},
+          f"fast rank's OWN memmap eviction fired on its LOCAL frontier (evictedA={sorted(set(evictedA))})")
+    check(not evictedB,
+          f"lagging rank evicted nothing yet (evictedB={sorted(set(evictedB))})")
+
+    for sid in range(1, 5):                # rank 1 catches up: global min -> 4
+        pB.ensure(sid)
+    deadline = time.time() + 4.0
+    while time.time() < deadline and (_exists(0) or _exists(1) or _exists(2)):
+        time.sleep(0.05)
+    gone = not (_exists(0) or _exists(1) or _exists(2))
+    check(gone, "once every rank passes a shard (min frontier), its files are deleted "
+          f"(f_0={_exists(0)}, f_1={_exists(1)}, f_2={_exists(2)})")
+    check(_exists(3) or _exists(4), "shards within keep_behind of the frontier survive")
+    pA.stop(); pB.stop()
+
 print("\n" + ("ALL CHECKS PASSED" if not fails else f"{len(fails)} FAILURES: {fails}"))
 if __name__ == "__main__":
     sys.exit(1 if fails else 0)

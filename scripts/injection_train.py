@@ -684,9 +684,19 @@ def _attach_prefetchers():
         cfg_streams = pf.get("streams", args.download_streams)
         auto_size = cfg_streams is None or int(cfg_streams) < 0
         init_streams = 2 if auto_size else int(cfg_streams)   # conservative start until sized
+        # coord_dir + rank/world: every rank prefetches into the SAME staging dir;
+        # deletion must key off the MIN frontier across ranks (a rank-local delete
+        # frontier let fast ranks unlink shard files slow ranks were still reading
+        # — FileNotFoundError/partial-JSON at prefill on 8xH100). The barrier
+        # guarantees every rank has reset its .frontier_r{K} file before anyone
+        # starts a worker (stale files from a crashed run would unblock deletion).
         p = ShardPrefetcher(order, fetch, delete_fn=delete, ahead=int(pf.get("ahead", 2)),
                             keep_behind=int(pf.get("keep_behind", 1)),
-                            on_wait=_on_wait, on_delete=src.evict_shard, streams=init_streams)
+                            on_wait=_on_wait, on_delete=src.evict_shard, streams=init_streams,
+                            coord_dir=staging, rank=ddp_rank, world_size=ddp_world_size)
+        if ddp and ddp_world_size > 1 and is_ddp_initialized():
+            import torch.distributed as dist
+            dist.barrier()
         src._mm_lock = _threading.Lock()
         src.score_loc = staging          # per-shard reads now come from the local staging dir
         src.prefetcher = p.start()
