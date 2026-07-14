@@ -43,7 +43,7 @@ patch base_train.
 | # | Run | Script / config | Direction | Pod | wandb (project/run) | Status | CORE | val bpb | Notes |
 |---|-----|-----------------|-----------|-----|---------------------|--------|------|---------|-------|
 | 1 | exp1 baseline | `exp1_baseline.sh` (stock base_train) | — (no injection) | `uqigccwlyg9ri2` / ssh `runpod-weekday-exp1` (8xH100 SECURE, $23.92/hr) | [`nanochat`/`exp1-baseline`](https://wandb.ai/kaushikreddyxyz-/nanochat/runs/iz7c84vq) (cosmetic, see above) | **done** (launched 13:18 UTC, done ~13:44 UTC 2026-07-14) | **0.1449** | **0.855679** | smoke PASSED (loss 10.40→10.36, peak 27.6GiB); in-training CORE 0.1457 @2520; HF `baseline/` complete (13 files incl. optim ranks + report.md) |
-| 2 | exp2 trainable | `exp2_trainable.sh` + `exp2_config.json` | **trainable**, orthonormal init (seed 1337), adamw wd=0 | `0qudfq8c8y28p4` / ssh `runpod-weekday-exp2` (8xH100 SECURE, $23.92/hr) | [`weekday-geometry`/`exp2-trainable`](https://wandb.ai/kaushikreddyxyz-/weekday-geometry/runs/g3ms1w95) | **running** (launched 13:54 UTC) | - | - | smoke PASSED (banner OK trainable_direction=True gate=0.0273 shards=185; duty forecast ~79% warm; no OOM 27.7GiB; losses 10.398/10.386/10.364 = baseline-identical) |
+| 2 | exp2 trainable | `exp2_trainable.sh` + `exp2_config.json` | **trainable**, orthonormal init (seed 1337), adamw wd=0 | `0qudfq8c8y28p4` / ssh `runpod-weekday-exp2` (8xH100 SECURE, $23.92/hr); pod DELETED ~15:08 UTC | [`weekday-geometry`/`exp2-trainable`](https://wandb.ai/kaushikreddyxyz-/weekday-geometry/runs/g3ms1w95) | **done** (launched 13:54, done 15:06 UTC) | **0.1371** | **0.856495** | smoke PASSED (banner OK trainable_direction=True gate=0.0273 shards=185; duty forecast ~79% warm); in-training CORE 0.1289 @2000, 0.1397 @2520; HF `trainable/` complete (13 files incl. report.md); log archived |
 | 3 | exp3 sphere | `exp3_sphere.sh` + `exp3_config.json` | **frozen** circle manifold from `direction_sphere.npz` (`file:` init) | `szmpknkipifrv0` / ssh `runpod-weekday-exp3` (8xH100 SECURE, $23.92/hr); pod DELETED ~15:02 UTC | [`weekday-geometry`/`exp3-sphere`](https://wandb.ai/kaushikreddyxyz-/weekday-geometry/runs/g2cfve7t) | **done** (launched 13:48, done 14:59 UTC) | **0.1423** | **0.855686** | smoke PASSED (banner OK trainable_direction=False, `file:` direction loaded; duty forecast ~19% cold); in-training CORE 0.1440 @2000, 0.1474 @2520; HF `sphere/` complete (13 files incl. report.md); log archived |
 | 4 | exp4 orthogonal | `exp4_orthogonal.sh` + `exp4_config.json` | **frozen** 7x orthonormal null (seed 1337) | **reused pod 1** `uqigccwlyg9ri2` after exp1 (RunPod $80/hr account spend cap blocked a 4th pod); pod DELETED ~14:55 UTC | [`weekday-geometry`/`exp4-orthogonal`](https://wandb.ai/kaushikreddyxyz-/weekday-geometry/runs/h3qk7zod) | **done** (launched 13:50, done ~14:50 UTC) | **0.1334** | **0.855631** | smoke PASSED (banner OK; duty forecast ~13% cold; no OOM 27.7GiB); HF `orthogonal/` complete (13 files incl. report.md); full log archived in `runs/weekdays/pod_logs/` (local) |
 
@@ -175,6 +175,17 @@ data order is unaffected either way at fixed nproc=8).
   0.1457 @2520). HF `baseline/` fully pushed (final sync confirmed).
 - 2026-07-14 — ops note (laptop-side): `create-pod.sh`'s ssh-alias step uses
   `grep -oP` (GNU-only) and silently fails on macOS/BSD grep — pod aliases for
-  weekday-exp1/2/3 were added to `~/.ssh/config` manually. Worth fixing in the
-  runpod-spinup skill.
+  weekday-exp1/2/3 were added to `~/.ssh/config` manually (and removed at
+  teardown). Worth fixing in the runpod-spinup skill.
+- 2026-07-14 — **ALL FOUR RUNS COMPLETE.** Final standings (final `base_eval`
+  CORE / val bpb): baseline **0.1449** / **0.855679** · trainable **0.1371** /
+  **0.856495** · sphere **0.1423** / **0.855686** · orthogonal **0.1334** /
+  **0.855631**. All four HF subfolders complete (13 files each: model_002000 +
+  model_002520 + 8 optimizer ranks + metas + report.md). All three pods
+  deleted after per-run HF artifact verification (exp1/exp4 pod ~14:55, exp3
+  pod ~15:02, exp2 pod ~15:08 UTC). Full run + smoke logs archived locally in
+  `runs/weekdays/pod_logs/` (gitignored). Cost actuals: 3 pods x $23.92/hr,
+  ~1.6-2.3h each ≈ **~$120 total** (vs $50-75 estimate; delta = the ~1.5h
+  debugging window in which the five bugs above were found and fixed — the
+  smoke-gate flow did exactly its job: no full run ever crashed).
 - _(append dated entries as runs launch / land)_
