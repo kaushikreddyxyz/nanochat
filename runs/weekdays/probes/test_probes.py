@@ -23,6 +23,9 @@ sys.path.insert(0, REPO)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(REPO, "runs", "weekdays", "eval"))
 
+from nanochat import flash_attention as _fa  # noqa: E402
+_fa.USE_FA3 = False   # CPU tests on a CUDA pod: FA3 kernels are CUDA-only, force SDPA
+
 import harness  # noqa: E402
 import probe_lib  # noqa: E402
 from probe_lib import Moments, pack_batches, predict, r2_from_moments, run_condition, solve_ridge  # noqa: E402
