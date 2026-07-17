@@ -52,7 +52,10 @@ def main():
     ap.add_argument("--out-dir", default=os.path.join(HERE, "results"))
     ap.add_argument("--heldout-every", type=int, default=10)
     ap.add_argument("--max-rows", type=int, default=32)
-    ap.add_argument("--max-tokens", type=int, default=65536)
+    # 16k tokens/batch: the [B,T,32k-padded-vocab] fp32 logits (+ CE reshape
+    # copies) peak ~6-8 GB/process — 4 arm processes fit one 80GB card. 64k
+    # blew past 32 GB/process and OOM'd the parallel run.
+    ap.add_argument("--max-tokens", type=int, default=16384)
     args = ap.parse_args()
 
     H = _harness()

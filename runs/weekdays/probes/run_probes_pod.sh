@@ -15,15 +15,29 @@ PROBES=runs/weekdays/probes
 OUT="$PROBES/results"
 mkdir -p "$OUT"
 
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 echo ">> [0/3] CPU test gate"
 $PY "$PROBES/test_probes.py"
 
 echo ">> [1/3] build probe data cache (held-out shard 100, prescored)"
-$PY "$PROBES/build_probe_data.py" --max-docs 2500
+if [ -f "$PROBES/probe_data.pt" ]; then
+  echo ">> probe_data.pt exists — skipping build (idempotent rerun)"
+else
+  $PY "$PROBES/build_probe_data.py" --max-docs 2500
+fi
 
 echo ">> [2/3] train probes: 4 arms in parallel (one GPU, small models)"
+_done_marker() {  # last artifact an arm writes -> arm complete, skip on rerun
+  case "$1" in baseline) echo "$OUT/probe_baseline_off.json" ;;
+               *) echo "$OUT/probe_bolt_$1_on.json" ;; esac
+}
 pids=()
 for arm in baseline trainable sphere orthogonal; do
+  if [ -f "$(_done_marker "$arm")" ]; then
+    echo ">> $arm already complete — skipping"
+    continue
+  fi
   $PY "$PROBES/train_probes.py" --arm "$arm" --device cuda \
       > "$OUT/train_$arm.log" 2>&1 &
   pids+=($!)
