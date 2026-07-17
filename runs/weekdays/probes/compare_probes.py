@@ -190,25 +190,24 @@ def main():
     fig.savefig(os.path.join(FIG, "figP3_enc_heatmaps.png"), dpi=130, bbox_inches="tight")
     plt.close(fig)
 
-    # P4: decoder V vs D matched-day mean + on-vs-off readout rotation
+    # P4: encoder vs decoder matched-day mean (grouped) + on-vs-off rotation
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.4))
     xs = np.arange(3)
-    for i, (label, key, col) in enumerate((("ON", "on", None), ("OFF", "off", PAL["off"]),
-                                           ("bolt", "bolt", PAL["bolt"]))):
-        for kind, alpha, hatch in (("enc", 1.0, None), ("V", 0.55, "//")):
-            vals = [report["vs_direction"][a][f"{key}_all_{kind}"]["matched_mean"]
-                    for a in ARMS]
-            axes[0].bar(xs + (i - 1) * 0.27 + (0.0 if kind == "enc" else 0.0), vals,
-                        width=0.27, alpha=alpha, hatch=hatch,
-                        color=[PAL[a] if key == "on" else col or PAL[a] for a in ARMS],
-                        edgecolor="k", lw=0.3,
-                        label=f"{label} {kind}" if True else None)
+    settings = (("ON enc", "on", "enc", None, None),
+                ("ON dec", "on", "V", None, "//"),
+                ("OFF enc", "off", "enc", PAL["off"], None),
+                ("bolt enc", "bolt", "enc", PAL["bolt"], None))
+    w4 = 0.2
+    for i, (label, key, kind, col, hatch) in enumerate(settings):
+        vals = [report["vs_direction"][a][f"{key}_all_{kind}"]["matched_mean"] for a in ARMS]
+        cols = [col or PAL[a] for a in ARMS]
+        axes[0].bar(xs + (i - 1.5) * w4, vals, width=w4, color=cols, hatch=hatch,
+                    edgecolor="k", lw=0.3, label=label)
     axes[0].set_xticks(xs); axes[0].set_xticklabels(ARMS)
     axes[0].axhline(0, color="k", lw=0.6)
     axes[0].set_ylabel("mean matched-day cosine vs D")
-    axes[0].set_title("encoder (solid) vs decoder (hatched)")
-    h, l = axes[0].get_legend_handles_labels()
-    axes[0].legend(h[:6], l[:6], fontsize=6, ncol=2)
+    axes[0].set_title("probe-vs-D alignment by condition")
+    axes[0].legend(fontsize=7)
     for a in ARMS:
         axes[1].plot(range(7),
                      to_cal(np.array(report["vs_direction"][a]["on_vs_off_all_enc_per_day"])),

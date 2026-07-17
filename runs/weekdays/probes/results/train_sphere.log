@@ -1,0 +1,13 @@
+[sphere] data: 2500 docs, 1373143 tokens, active_frac=0.117
+[sphere] condition sphere_off (gate_scale=0.0, acts=True)
+[sphere]     [all] n_tr=1234825 n_te=138318 lam=0.01 R2(mean)=0.0787 argmax_acc=0.3803
+[sphere]     [act] n_tr=144983 n_te=16165 lam=0.01 R2(mean)=0.2521 argmax_acc=0.4084
+[sphere] wrote probe_sphere_off.npz/.json  ce_mean=2.8379
+[sphere] condition sphere_on (gate_scale=1.0, acts=True)
+[sphere]     [all] n_tr=1234825 n_te=138318 lam=1e-05 R2(mean)=0.2592 argmax_acc=0.4281
+[sphere]     [act] n_tr=144983 n_te=16165 lam=0.001 R2(mean)=0.3997 argmax_acc=0.4743
+[sphere] wrote probe_sphere_on.npz/.json  ce_mean=2.8361
+[sphere] condition bolt_sphere_on (gate_scale=1.0, acts=True)
+[sphere]     [all] n_tr=1234825 n_te=138318 lam=0.001 R2(mean)=0.1356 argmax_acc=0.4129
+[sphere]     [act] n_tr=144983 n_te=16165 lam=0.01 R2(mean)=0.3296 argmax_acc=0.4393
+[sphere] wrote probe_bolt_sphere_on.npz/.json  ce_mean=2.8382

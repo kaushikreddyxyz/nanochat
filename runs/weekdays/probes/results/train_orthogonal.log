@@ -1,0 +1,13 @@
+[orthogonal] data: 2500 docs, 1373143 tokens, active_frac=0.117
+[orthogonal] condition orthogonal_off (gate_scale=0.0, acts=True)
+[orthogonal]     [all] n_tr=1234825 n_te=138318 lam=0.01 R2(mean)=0.0773 argmax_acc=0.3769
+[orthogonal]     [act] n_tr=144983 n_te=16165 lam=0.01 R2(mean)=0.2505 argmax_acc=0.4117
+[orthogonal] wrote probe_orthogonal_off.npz/.json  ce_mean=2.8379
+[orthogonal] condition orthogonal_on (gate_scale=1.0, acts=True)
+[orthogonal]     [all] n_tr=1234825 n_te=138318 lam=0.001 R2(mean)=0.2090 argmax_acc=0.5189
+[orthogonal]     [act] n_tr=144983 n_te=16165 lam=0.0001 R2(mean)=0.4644 argmax_acc=0.5498
+[orthogonal] wrote probe_orthogonal_on.npz/.json  ce_mean=2.8365
+[orthogonal] condition bolt_orthogonal_on (gate_scale=1.0, acts=True)
+[orthogonal]     [all] n_tr=1234825 n_te=138318 lam=0.001 R2(mean)=0.1244 argmax_acc=0.4576
+[orthogonal]     [act] n_tr=144983 n_te=16165 lam=0.001 R2(mean)=0.3667 argmax_acc=0.4895
+[orthogonal] wrote probe_bolt_orthogonal_on.npz/.json  ce_mean=2.8382

@@ -1,0 +1,6 @@
+[baseline] data: 2500 docs, 1373143 tokens, active_frac=0.117
+[baseline] condition baseline_off (gate_scale=0.0, acts=False)
+[baseline]     [all] n_tr=1234825 n_te=138318 lam=0.01 R2(mean)=0.0864 argmax_acc=0.3750
+[baseline]     [act] n_tr=144983 n_te=16165 lam=0.01 R2(mean)=0.2572 argmax_acc=0.4058
+[baseline] wrote probe_baseline_off.npz/.json  ce_mean=2.8382
+[W717 12:13:51.501999643 AllocatorConfig.cpp:28] Warning: PYTORCH_CUDA_ALLOC_CONF is deprecated, use PYTORCH_ALLOC_CONF instead (function operator())

@@ -1,0 +1,14 @@
+[trainable] data: 2500 docs, 1373143 tokens, active_frac=0.117
+[trainable] condition trainable_off (gate_scale=0.0, acts=True)
+[trainable]     [all] n_tr=1234825 n_te=138318 lam=0.01 R2(mean)=0.0802 argmax_acc=0.3813
+[trainable]     [act] n_tr=144983 n_te=16165 lam=0.01 R2(mean)=0.2526 argmax_acc=0.4161
+[trainable] wrote probe_trainable_off.npz/.json  ce_mean=2.8407
+[trainable] condition trainable_on (gate_scale=1.0, acts=True)
+[trainable]     [all] n_tr=1234825 n_te=138318 lam=0.0001 R2(mean)=0.2369 argmax_acc=0.5155
+[trainable]     [act] n_tr=144983 n_te=16165 lam=0.001 R2(mean)=0.4618 argmax_acc=0.5472
+[trainable] wrote probe_trainable_on.npz/.json  ce_mean=2.8389
+[trainable] condition bolt_trainable_on (gate_scale=1.0, acts=True)
+[trainable]     [all] n_tr=1234825 n_te=138318 lam=0.001 R2(mean)=0.1394 argmax_acc=0.4713
+[trainable]     [act] n_tr=144983 n_te=16165 lam=0.01 R2(mean)=0.3820 argmax_acc=0.5015
+[trainable] wrote probe_bolt_trainable_on.npz/.json  ce_mean=2.8381
+[W717 12:14:13.337544571 AllocatorConfig.cpp:28] Warning: PYTORCH_CUDA_ALLOC_CONF is deprecated, use PYTORCH_ALLOC_CONF instead (function operator())
