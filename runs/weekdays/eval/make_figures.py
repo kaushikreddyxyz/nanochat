@@ -23,12 +23,12 @@ S = json.load(open(os.path.join(RES, "summary.json")))
 C = json.load(open(os.path.join(RES, "causal_summary.json")))
 
 
-def v(metric, arm, gate):
-    return S[metric][arm][gate]["value"]
+def v(metric, arm, injection):
+    return S[metric][arm][injection]["value"]
 
 
-def n_of(metric, arm="baseline", gate="on"):
-    return S[metric][arm][gate]["n"]
+def n_of(metric, arm="baseline", injection="on"):
+    return S[metric][arm][injection]["n"]
 
 
 # ---------------------------------------------------------------- fig 1: bpb buckets
@@ -57,7 +57,7 @@ def fig1():
         ax.invert_yaxis()
     # legend proxy
     axes[0].scatter([], [], color="k", s=60, label="injection ON")
-    axes[0].scatter([], [], facecolor="white", edgecolor="k", s=60, lw=1.6, label="injection OFF (gate 0)")
+    axes[0].scatter([], [], facecolor="white", edgecolor="k", s=60, lw=1.6, label="injection OFF (loudness 0)")
     axes[0].legend(loc="lower left", fontsize=8, frameon=False)
     fig.suptitle("Use + reliance, cleanly localized: on < baseline < off — but only where the injection fires",
                  fontsize=11, y=1.04)
@@ -102,7 +102,7 @@ def fig2():
         ax.plot(ks, t, "-o", color=COL[arm], ms=4.5, lw=1.8, label=f"{LBL[arm]}: text day")
         ax.plot(ks, o, ":", color=COL[arm], alpha=0.55, lw=1.3,
                 label="mean of other 6 days" if arm == "trainable" else "_")
-    ax.set_xlabel("gate multiplier (0 = off, 1 = trained loudness 0.0273)")
+    ax.set_xlabel("loudness multiplier (0 = off, 1 = the arm's calibrated loudness)")
     ax.set_ylabel("mean logit at answer position (absolute)")
     ax.set_title("Absolute: mean logit of the TEXT day (solid)\nvs the other six days (dotted), per dose",
                  fontsize=9.5)
@@ -123,9 +123,9 @@ def fig2():
         ax.annotate(f"sphere @4x: {sph4:.2f}", xy=(4.0, -1.12), xytext=(2.2, -0.95), fontsize=8.5,
                     color=COL["sphere"], arrowprops=dict(arrowstyle="->", color=COL["sphere"], lw=1))
     ax.axhline(0, color="k", lw=0.6)
-    ax.set_xlabel("gate multiplier")
-    ax.set_ylabel("paired \u0394 logit(text day) vs SAME item at gate 0")
-    ax.set_title("Paired delta vs off (the same items, gate 0):\ntrained arms respond, controls flat",
+    ax.set_xlabel("loudness multiplier")
+    ax.set_ylabel("paired \u0394 logit(text day) vs SAME item at loudness 0")
+    ax.set_title("Paired delta vs off (the same items, loudness 0):\ntrained arms respond, controls flat",
                  fontsize=9.5)
     ax.legend(fontsize=7.8, frameon=False, loc="lower left")
     ax.tick_params(labelsize=8.5)
@@ -139,8 +139,8 @@ def fig2():
 def fig3():
     conds = [("cf_swap_onehot_near", "swap near\n(X→X+1)"),
              ("cf_swap_onehot_far", "swap far\n(X→X+3)"),
-             ("cf_dose_onehot_far@2", "swap far\n@2× gate"),
-             ("cf_dose_onehot_far@4", "swap far\n@4× gate")]
+             ("cf_dose_onehot_far@2", "swap far\n@2× loudness"),
+             ("cf_dose_onehot_far@4", "swap far\n@4× loudness")]
     x = np.arange(len(conds))
     w = 0.24
     fig, ax = plt.subplots(figsize=(6.8, 4.0))
@@ -168,8 +168,8 @@ def fig3():
 def fig4():
     fig, axes = plt.subplots(1, 3, figsize=(11, 3.6))
     panels = [("core_metric", "CORE (22 tasks)", None),
-              ("weekday_accuracy", "weekday_v1 accuracy (n=422)", 1 / 7),
-              ("weekday_answer_ce", "weekday_v1 answer CE (lower = better)", None)]
+              ("weekdays_accuracy", "weekday_v1 accuracy (n=422)", 1 / 7),
+              ("weekdays_answer_ce", "weekday_v1 answer CE (lower = better)", None)]
     for ax, (m, title, chance) in zip(axes, panels):
         base = v(m, "baseline", "on")
         xs = np.arange(len(ARMS))
@@ -183,7 +183,7 @@ def fig4():
         if chance:
             ax.axhline(chance, color="k", ls=":", lw=1)
             ax.text(2.35, chance, "chance", fontsize=8, va="center")
-        if m == "weekday_accuracy":  # binomial SE band around baseline
+        if m == "weekdays_accuracy":  # binomial SE band around baseline
             se = np.sqrt(base * (1 - base) / 422)
             ax.fill_between([-0.5, 2.5], base - se, base + se, color="k", alpha=0.08, zorder=0)
         ax.set_xticks(xs, [a for a in ARMS], fontsize=8.5)

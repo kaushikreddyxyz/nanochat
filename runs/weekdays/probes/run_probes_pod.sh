@@ -18,7 +18,7 @@ mkdir -p "$OUT"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 echo ">> [0/3] CPU test gate"
-$PY "$PROBES/test_probes.py"
+$PY -m pytest runs/tests/test_probes.py -q
 
 echo ">> [1/3] build probe data cache (held-out shard 100, prescored)"
 if [ -f "$PROBES/probe_data.pt" ]; then

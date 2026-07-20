@@ -49,12 +49,22 @@ class ActivationSource(abc.ABC):
     def add_noise(self, z: np.ndarray, key: int) -> np.ndarray:
         ...
 
-    def sample_activation_stats(self, k: int, seed: int):
-        """(per-channel rms, per-channel nonzero-rate, n_docs, n_tokens) over a
-        seeded sample of up to ``k`` docs — the statistics ``gate: "auto"`` needs.
-        Sources that cannot be sampled (e.g. FnSource) leave this unimplemented."""
+    def sample_activation_rows(self, k: int, seed: int):
+        """Pooled ((n, r) rows, n_docs, n_tokens) over a seeded sample of up to ``k``
+        docs — the raw rows dose calibration needs. Sources that cannot be sampled
+        (e.g. FnSource) leave this unimplemented."""
         raise NotImplementedError(
-            f"{type(self).__name__} does not support gate='auto' (no sampleable statistics)")
+            f"{type(self).__name__} does not support gate='auto' / amplitude='dose' "
+            f"(no sampleable statistics)")
+
+    def sample_activation_stats(self, k: int, seed: int):
+        """(per-channel rms, per-channel nonzero-rate, n_docs, n_tokens) over the SAME
+        seeded sample as sample_activation_rows — the statistics gate="auto" needs."""
+        rows, n_docs, n_tokens = self.sample_activation_rows(k, seed)
+        if n_tokens == 0:
+            return np.zeros(self.r, np.float32), np.zeros(self.r, np.float32), 0, 0
+        rms, nz = _channel_stats(rows)
+        return rms, nz, n_docs, n_tokens
 
 
 def doc_hash(text: str) -> np.uint64:
@@ -148,9 +158,8 @@ class _StoreSource(ActivationSource):
     def add_noise(self, z: np.ndarray, key: int) -> np.ndarray:
         return hash_seeded_noise(z, key, self.noise_sigma, self.seed)
 
-    def sample_activation_stats(self, k: int, seed: int):
-        """Pool the (dequantized) rows of up to ``k`` seeded index entries and
-        return per-channel (rms, nonzero-rate, n_docs, n_tokens) for auto-gate."""
+    def sample_activation_rows(self, k: int, seed: int):
+        """Pool the (dequantized) rows of up to ``k`` seeded index entries."""
         keys = list(self._index)
         rng = np.random.default_rng(seed & 0x7FFFFFFF)
         pick = rng.permutation(len(keys))[:min(k, len(keys))]
@@ -160,10 +169,9 @@ class _StoreSource(ActivationSource):
             if n > 0:
                 rows.append(self.mm[off:off + n].astype(np.float32) * self.scale)
         if not rows:
-            return np.zeros(self.r, np.float32), np.zeros(self.r, np.float32), 0, 0
+            return np.zeros((0, self.r), np.float32), 0, 0
         pooled = np.concatenate(rows, axis=0)
-        rms, nz = _channel_stats(pooled)
-        return rms, nz, len(rows), pooled.shape[0]
+        return pooled, len(rows), pooled.shape[0]
 
 
 class QwenEncoderSource(_StoreSource):
@@ -419,7 +427,9 @@ class RuntimeProbeScoreSource(_RuntimeProbeBase):
         sid, start, n = rec
         return self._align_and_gather(text, n_tokens, self._gemma_z(sid, start, n)), h
 
-    def sample_activation_stats(self, k, seed):
+    def sample_activation_rows(self, k, seed):
+        """Standardized GEMMA-grid rows (pre-alignment: this samples the scores, not
+        the nanochat-aligned activations the loader serves)."""
         rng = np.random.default_rng(seed & 0x7FFFFFFF)
         rows, n_docs = [], 0
         sids = sorted(self.shards)
@@ -435,10 +445,9 @@ class RuntimeProbeScoreSource(_RuntimeProbeBase):
             if n_docs >= k:
                 break
         if not rows:
-            return np.zeros(self.r, np.float32), np.zeros(self.r, np.float32), 0, 0
+            return np.zeros((0, self.r), np.float32), 0, 0
         pooled = np.concatenate(rows, axis=0)
-        rms, nz = _channel_stats(pooled)
-        return rms, nz, n_docs, pooled.shape[0]
+        return pooled, n_docs, pooled.shape[0]
 
     # -- internals --
     def _docs(self, sid):
@@ -541,13 +550,13 @@ class LiveProbeScoreSource(_RuntimeProbeBase):
         z = self._standardize(raw[:, self.li][:, self.col_idx])        # (n_gemma, r)
         return self._align_and_gather(text, n_tokens, z), 0
 
-    def sample_activation_stats(self, k, seed):
+    def sample_activation_rows(self, k, seed):
         """Run the live scorer over a seeded sample of ``sample_texts`` at startup
-        for donor/auto gate calibration — a one-time cost, strictly before any
+        for donor/auto/dose calibration — a one-time cost, strictly before any
         training batch. Fails loudly if no calibration corpus was supplied."""
         if not self.sample_texts:
             raise NotImplementedError(
-                f"{self.name!r}: donor/auto gate needs a startup sample corpus — construct "
+                f"{self.name!r}: donor/auto/dose calibration needs a startup sample corpus — construct "
                 f"LiveProbeScoreSource(..., sample_texts=[...]) so the scorer runs over a sample "
                 f"BEFORE training (it never scores lazily).")
         rng = np.random.default_rng(seed & 0x7FFFFFFF)
@@ -559,10 +568,9 @@ class LiveProbeScoreSource(_RuntimeProbeBase):
             if z.shape[0] > 0:
                 rows.append(z)
         if not rows:
-            return np.zeros(self.r, np.float32), np.zeros(self.r, np.float32), 0, 0
+            return np.zeros((0, self.r), np.float32), 0, 0
         pooled = np.concatenate(rows, axis=0)
-        rms, nz = _channel_stats(pooled)
-        return rms, nz, len(rows), pooled.shape[0]
+        return pooled, len(rows), pooled.shape[0]
 
 
 def _default_gemma_encode(gemma_model):

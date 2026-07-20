@@ -408,37 +408,57 @@ try:
         with open(_cfgp) as _f:
             _spec = json.load(_f)["sources"]["weekdays"]
         _cls = load_source_class(_spec["class"])
-        check(_cls.__name__ == "WeekdayProbeScoreSource" and issubclass(_cls, RuntimeProbeScoreSource),
+        # Expected name derived from the spec, exactly as injection_train's own guard
+        # does (assert type(src).__name__ == spec["class"].rsplit(":", 1)[1]).
+        _want = _spec["class"].rsplit(":", 1)[1]
+        check(_cls.__name__ == _want and issubclass(_cls, RuntimeProbeScoreSource),
               f"{os.path.basename(_cfgp)}: 'class' resolves to a RuntimeProbeScoreSource subclass")
         check("/" in _spec["class"].split(":", 1)[0],
               f"{os.path.basename(_cfgp)}: 'class' uses the collision-proof file-path form")
-        # construct EXACTLY like _open_injection_source (fixture store standing in
-        # for the HF score repo; "kwargs" passed through to the constructor)
+        check(dict(_spec.get("kwargs") or {}).get("family") == "weekdays",
+              f"{os.path.basename(_cfgp)}: source spec pins family=weekdays")
+        # Construct EXACTLY like _open_injection_source (fixture store standing in for
+        # the HF score repo; "kwargs" passed through). The family kwarg is dropped here
+        # ONLY because this fixture store's columns are a/b/c/d, not the real weekday
+        # registry columns the guard checks; that guard is proven in
+        # runs/lib/test_probe_source.py against the real registry.
+        _kw = {k: v for k, v in dict(_spec.get("kwargs") or {}).items() if k != "family"}
         _src = _cls(STORE, [0], layer=8, nano_enc=FakeNanoEnc(),
                     gemma_encode=char_gemma_encode, concepts=None,
                     align_policy=_spec["align_policy"],
                     noise_sigma=float(_spec["noise_sigma"]), seed=0, name="weekdays",
-                    **dict(_spec.get("kwargs") or {}))
-        check(type(_src).__name__ == "WeekdayProbeScoreSource" and _src.present_z == 2.0,
-              f"{os.path.basename(_cfgp)}: custom class constructs with kwargs (present_z=2.0)")
+                    **_kw)
+        check(type(_src).__name__ == _want and _src.present_z == float(_kw["present_z"]),
+              f"{os.path.basename(_cfgp)}: custom class constructs with the spec's kwargs")
+        check(_src.present_z == 0.0,
+              f"{os.path.basename(_cfgp)}: present_z=0 — the SITE's relu owns thresholding")
 finally:
     os.chdir(_prev_cwd)
 
-# behavioral: post-alignment rows with max z < present_z go EXACT zero; >= kept
-# verbatim. "ab cd" mean-aligns to rows [1.5, 0, 3.5] per channel (section [A]),
-# so with present_z=2.0 rows 0/1 zero out and row 2 survives untouched.
+# behavioral: a source-level present_z zeroes post-alignment rows whose max z falls
+# under it, EXACTLY (>= is kept verbatim). "ab cd" mean-aligns to rows [1.5, 0, 3.5] per
+# channel (section [A]). Set explicitly here, NOT read from a config: the dose configs
+# ship present_z=0 because the site's relu thresholds instead, but the row-gate behavior
+# is still part of the source's contract.
 os.chdir(REPO)
 try:
     with open(os.path.join(REPO, "runs", "weekdays", "exp2_config.json")) as _f:
         _spec2 = json.load(_f)["sources"]["weekdays"]
-    _wsrc = load_source_class(_spec2["class"])(
-        STORE, [0], layer=8, nano_enc=FakeNanoEnc(), gemma_encode=char_gemma_encode,
-        noise_sigma=0.0, **dict(_spec2.get("kwargs") or {}))
+    _cls2 = load_source_class(_spec2["class"])
+
+    def _mk(present_z):
+        return _cls2(STORE, [0], layer=8, nano_enc=FakeNanoEnc(),
+                     gemma_encode=char_gemma_encode, noise_sigma=0.0, present_z=present_z)
+
+    _wsrc, _wsrc_cfg = _mk(2.0), _mk(float(_spec2["kwargs"]["present_z"]))
 finally:
     os.chdir(_prev_cwd)
 _wz, _ = _wsrc.lookup_by_row(0, 0, "ab cd", 3)
 check(np.array_equal(_wz, np.array([[0] * K, [0] * K, [3.5] * K], np.float32)),
-      "realism threshold zeroes rows with max z < 2.0 and keeps rows >= 2.0 verbatim")
+      "present_z=2.0 zeroes rows with max z < 2.0 and keeps rows >= 2.0 verbatim")
+_wz0, _ = _wsrc_cfg.lookup_by_row(0, 0, "ab cd", 3)
+check(np.array_equal(_wz0, np.array([[1.5] * K, [0] * K, [3.5] * K], np.float32)),
+      "the config's present_z=0 passes every aligned row through untouched")
 
 
 print("\n" + ("ALL CHECKS PASSED" if not fails else f"{len(fails)} FAILURES: {fails}"))

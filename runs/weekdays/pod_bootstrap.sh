@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pod_bootstrap.sh — shared pod-side bootstrap for ALL 4 weekday-geometry runs.
+# pod_bootstrap.sh — shared pod-side bootstrap for every injection/baseline arm.
 # =============================================================================
 # Clones the oracle-encodings superproject + the nanochat submodule at branch
 # weekday-geometry, installs the uv env, wires HF / WANDB tokens WITHOUT ever
@@ -10,42 +10,46 @@
 #     GH_TOKEN        private-repo clone (one-shot git credential helper; env-only)
 #     HF_TOKEN        huggingface_hub auth (written to nanochat/.env, gitignored)
 #     WANDB_API_KEY   (or WANDB_TOKEN) wandb auth (written to nanochat/.env)
+# Any OTHER KEY=VALUE line is exported verbatim and inherited by the run — this is how
+# runs/lib/launch_arm.sh gets its arm identity (MODEL_TAG/CONFIG/HF_SUBDIR/...).
 # Keys already exported in the environment are used if not supplied on stdin.
 # If a repo is public and no GH_TOKEN is given, SSH-agent forwarding (`ssh -A`)
 # or an anonymous clone still works.
 #
 # USAGE (on the pod):
-#   printf 'GH_TOKEN=%s\nHF_TOKEN=%s\nWANDB_API_KEY=%s\n' "$gh" "$hf" "$wb" \
-#     | bash pod_bootstrap.sh exp1_baseline.sh
+#   printf 'GH_TOKEN=%s\nHF_TOKEN=%s\nWANDB_API_KEY=%s\nMODEL_TAG=%s\nCONFIG=%s\n' \
+#       "$gh" "$hf" "$wb" weekday_exp3_sphere runs/weekdays/exp3_config.json \
+#     | bash pod_bootstrap.sh
 #
 #   or via one ssh hop from the laptop (token still only crosses the pipe):
-#   printf 'GH_TOKEN=%s\nHF_TOKEN=%s\nWANDB_API_KEY=%s\n' "$gh" "$hf" "$wb" \
-#     | ssh runpod-<pod> 'bash -s' -- \
-#         < <(curl -s .../pod_bootstrap.sh) exp1_baseline.sh
+#   printf 'GH_TOKEN=%s\nHF_TOKEN=%s\nMODEL_TAG=%s\nCONFIG=%s\n' ... \
+#     | ssh runpod-<pod> 'bash -s' -- < <(curl -s .../pod_bootstrap.sh)
 #
 # ARGS:
-#   $1 run_script : e.g. exp1_baseline.sh  (bare name -> runs/weekdays/<name>)
-#                   or a full repo-relative path runs/weekdays/exp1_baseline.sh
+#   $1 run_script : default runs/lib/launch_arm.sh (the one parameterized launcher;
+#                   its usage header lists the env for every arm)
 #   $2 branch     : default weekday-geometry
 #   $3 workdir    : default /workspace
 # =============================================================================
 set -euo pipefail
 
-RUN_SCRIPT="${1:?usage: pod_bootstrap.sh <run_script> [branch] [workdir]}"
+RUN_SCRIPT="${1:-runs/lib/launch_arm.sh}"
 BRANCH="${2:-weekday-geometry}"
 WORKDIR="${3:-/workspace}"
 REPO_URL="https://github.com/kaushikreddyxyz/oracle-encodings.git"
 REPO_DIR="$WORKDIR/oracle-encodings"
 
-# bare filename -> runs/weekdays/<name>
-case "$RUN_SCRIPT" in */*) : ;; *) RUN_SCRIPT="runs/weekdays/$RUN_SCRIPT" ;; esac
+# bare filename -> runs/lib/<name>
+case "$RUN_SCRIPT" in */*) : ;; *) RUN_SCRIPT="runs/lib/$RUN_SCRIPT" ;; esac
 
 # --- read secrets from stdin (KEY=VALUE lines); never argv ------------------
 if [ ! -t 0 ]; then
   while IFS='=' read -r k v; do
     [ -z "${k:-}" ] && continue
+    # secrets AND arm identity (MODEL_TAG/CONFIG/...) arrive the same way; only a
+    # well-formed shell name is ever exported.
     case "$k" in
-      GH_TOKEN|HF_TOKEN|WANDB_API_KEY|WANDB_TOKEN) export "$k=$v" ;;
+      [A-Za-z_][A-Za-z0-9_]*) export "$k=$v" ;;
     esac
   done
 fi
@@ -140,7 +144,7 @@ export PATH="$HOME/.local/bin:$PATH"
 uv sync --extra gpu
 
 # --- launch the run under nohup (survives the ssh session) ------------------
-RUN_TAG="$(basename "$RUN_SCRIPT" .sh)"
+RUN_TAG="${MODEL_TAG:-$(basename "$RUN_SCRIPT" .sh)}"
 LOG="$NANO/${RUN_TAG}.log"
 PIDF="$NANO/${RUN_TAG}.pid"
 echo ">> launching $RUN_SCRIPT (branch $BRANCH) under nohup"

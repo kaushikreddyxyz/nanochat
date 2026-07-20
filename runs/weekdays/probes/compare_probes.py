@@ -1,36 +1,29 @@
 #!/usr/bin/env python3
-"""Local analysis: compare the trained probes (per arm, injection ON vs OFF,
-plus baseline bolt-on ceilings) against the injection direction matrices D.
-
-Inputs (pulled from the pod into runs/weekdays/probes/results/):
-    probe_{condition}.npz/.json   conditions: baseline_off, {arm}_{off,on},
-                                  bolt_{arm}_on   (arm in trainable/sphere/orthogonal)
-    direction_{arm}.npy           the arm CHECKPOINT's D [7, 768]
-
-Per condition the npz holds, for populations 'all' (every token) and 'act'
-(tokens the injection fires on): W (std-space ridge), V = W/sigma (raw-space
-DECODER readout rows, covariance-whitened), Cxy (raw cross-covariance =
-ENCODING-direction estimate, whitening-free), mu/sigma/ybar.
-
-Outputs: probe_report.json + figures/figP*.png. CPU, deterministic.
+"""Local weekday analysis + figures: loads the trained probes via runs/lib/probe_arms.py
+and compares each condition's readouts against that arm's checkpoint D
+(results/direction_{arm}.npy). Writes probe_report.json + figP1-4.
 Run: python3 runs/weekdays/probes/compare_probes.py
 """
 import json
 import os
+import sys
 
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy.linalg import subspace_angles
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEEKDAYS = os.path.dirname(HERE)
 RES = os.path.join(HERE, "results")
 FIG = os.path.join(HERE, "figures")
+sys.path.insert(0, os.path.abspath(os.path.join(WEEKDAYS, "..", "lib")))
 
-STORE = ["friday", "monday", "saturday", "sunday", "thursday", "tuesday", "wednesday"]
-CALENDAR = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+import concepts as concept_registry  # noqa: E402
+from probe_arms import compare_to_direction as cmp_vs_D, load_condition, unit  # noqa: E402
+
+STORE = list(concept_registry.get_family("weekdays").store_order)
+CALENDAR = list(concept_registry.get_family("weekdays").cycle_order)
 CAL_ROWS = [STORE.index(d) for d in CALENDAR]
 CAL_LABELS = [d[:3].capitalize() for d in CALENDAR]
 ARMS = ["trainable", "sphere", "orthogonal"]
@@ -38,38 +31,9 @@ PAL = {"trainable": "#1f77b4", "sphere": "#2ca02c", "orthogonal": "#d62728",
        "baseline": "#7f7f7f", "off": "#9edae5", "on": None, "bolt": "#555555"}
 
 
-def unit(M):
-    return M / np.linalg.norm(M, axis=-1, keepdims=True)
-
-
 def to_cal(M):
     M = np.asarray(M)
     return M[np.ix_(CAL_ROWS, CAL_ROWS)] if M.ndim == 2 else M[CAL_ROWS]
-
-
-def load_cond(name):
-    z = np.load(os.path.join(RES, f"probe_{name}.npz"))
-    js = json.load(open(os.path.join(RES, f"probe_{name}.json")))
-    out = {"json": js}
-    for pop in ("all", "act"):
-        out[pop] = {
-            "V": z[f"{pop}_V"],                 # [7, 768] decoder rows
-            "enc": z[f"{pop}_Cxy"].T,           # [7, 768] encoding rows
-            "r2": np.array(js["pops"][pop]["r2_heldout"]),
-            "r2_mean": js["pops"][pop]["r2_heldout_mean"],
-            "acc": js["pops"][pop].get("argmax_acc_te_act"),
-            "n_train": js["pops"][pop]["n_train"],
-        }
-    return out
-
-
-def cmp_vs_D(rows, D):
-    """rows, D: [7, 768]. Matched per-day cosine, full 7x7, subspace angles."""
-    Ru, Du = unit(rows), unit(D)
-    C = Ru @ Du.T
-    ang = np.degrees(subspace_angles(rows.T, D.T))
-    return {"matched": np.diag(C), "matrix": C, "principal_angles_deg": ang,
-            "matched_mean": float(np.diag(C).mean())}
 
 
 def main():
@@ -79,7 +43,7 @@ def main():
              + [f"{a}_{g}" for a in ARMS for g in ("off", "on")]
              + [f"bolt_{a}_on" for a in ARMS])
     for n in names:
-        conds[n] = load_cond(n)
+        conds[n] = load_condition(RES, n)
     D = {a: np.load(os.path.join(RES, f"direction_{a}.npy")).astype(np.float64) for a in ARMS}
 
     # frozen arms' checkpoint D must equal the committed npz (sanity)

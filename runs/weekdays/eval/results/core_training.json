@@ -1,0 +1,32 @@
+{
+  "_comment": "Training-time final base_eval CORE + val bpb per arm. These are the HEADLINE numbers of the 4-run study and exist in no other in-repo json (the other results/*.json are all eval-suite on/off metrics with their own CORE via the activations-on adapter, which is NOT comparable to these). Recorded here so they survive independently of any narrative file.",
+  "metric": "CORE (nanochat base_eval, --core-metric-max-per-task 500), final checkpoint step 2520",
+  "source": "each arm's report.md in kaushikreddyxyz/weekday-geometry-d12/<arm>/ (pushed by hf_push.py at run end); cross-checked against the archived pod logs in runs/weekdays/pod_logs/exp*.log",
+  "ranking": "baseline > sphere > trainable > orthogonal",
+  "arms": {
+    "baseline": {
+      "core": 0.1449,
+      "val_bpb": 0.855679,
+      "hf_path": "kaushikreddyxyz/weekday-geometry-d12/baseline/report.md",
+      "wandb": "nanochat/exp1-baseline"
+    },
+    "trainable": {
+      "core": 0.1371,
+      "val_bpb": 0.856495,
+      "hf_path": "kaushikreddyxyz/weekday-geometry-d12/trainable/report.md",
+      "wandb": "weekday-geometry/exp2-trainable"
+    },
+    "sphere": {
+      "core": 0.1423,
+      "val_bpb": 0.855686,
+      "hf_path": "kaushikreddyxyz/weekday-geometry-d12/sphere/report.md",
+      "wandb": "weekday-geometry/exp3-sphere"
+    },
+    "orthogonal": {
+      "core": 0.1334,
+      "val_bpb": 0.855631,
+      "hf_path": "kaushikreddyxyz/weekday-geometry-d12/orthogonal/report.md",
+      "wandb": "weekday-geometry/exp4-orthogonal"
+    }
+  }
+}

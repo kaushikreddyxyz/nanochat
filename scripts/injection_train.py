@@ -35,9 +35,10 @@ import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
-from nanochat.injection.sites import (InjectionCfg, reassert_optimizability, calibrate_auto_gate,
-                                       classify_gate_spec, dial_gate_from_loudness, discover_loudness_json,
-                                       assert_gate_identical_across_ranks)
+from nanochat.injection.sites import (InjectionCfg, reassert_optimizability, classify_loudness_spec,
+                                       discover_loudness_json, assert_loudness_identical_across_ranks,
+                                       calibrate_dose_gate, initial_direction,
+                                       realized_loudness_report, log_realized_loudness)
 from nanochat.injection.sources import open_store, RuntimeProbeScoreSource, load_source_class
 from nanochat.injection.activation_dataloader import acts_data_loader_buffered
 from nanochat.injection.buffering import coordinate_rebuffer, duty_cycle_forecast, rebuffer_progress, shard_cover_seconds, size_prefetch_streams
@@ -102,9 +103,13 @@ parser.add_argument("--no-value-embeds", action="store_true", help="zero and fre
 # Injection surface (exactly one of --activation-store / --activation-config required)
 parser.add_argument("--activation-store", type=str, default="", help="activation store dir (activations.int8/index.npy/meta.json[/P.npy] from scripts/precompute_activations.py): ONE tabular site named 'acts' with a frozen direction (the store's P if present, else seeded orthonormal)")
 parser.add_argument("--after-block", type=int, default=7, help="0-based block index for the single-store site; activations are added right AFTER transformer.h[N]")
-parser.add_argument("--gate", type=str, default="1.0", help="LOUDNESS DIAL in donor units: a plain number resolves to absolute rms(gate) = dial × L_ref, where L_ref = gemma's native median 54-concept packet loudness at the source's gemma layer (loudness.json subspace_total.ridge[L].p50; measured ~0.081 at L6/L8, 0.086 at L14). Default 1.0 = standard (donor-native) loudness; 0 = exactly off; per-channel mix donor-proportional. REQUIRES loudness.json + a source gemma layer (hard error otherwise). Absolute escapes: 'abs:<n>' raw stream fraction (old semantics; the old 0.05 default == abs:0.05 ≈ dial 0.62), 'auto[:target]' absolute channel-equalized. 'donor[:stat]' = dial alias (donor == 1.0; donor:p95 == p95/p50 ≈ 1.6).")
-parser.add_argument("--gate-k", type=int, default=256, help="docs sampled (seeded) for --gate dial/auto/donor calibration")
-parser.add_argument("--gate-min-docs", type=int, default=16, help="fail --gate dial/auto/donor if the source yields fewer sample docs than this")
+parser.add_argument("--loudness", type=str, default="1.0", help="Site loudness. A plain number is a DIAL in donor units: dial 1.0 means the median firing event injects at gemma's own median PER-CONCEPT active loudness for this site's concepts (loudness.json ridge.active_loudness[L].p50, medianed over the site's subset — NOT subspace_total, which is the whole 54-concept packet and would over-inject an r-concept site by ~sqrt(54/r)). Requires loudness.json + a source gemma layer. Escape hatch: 'abs:<n>' sets that median directly as a fraction of residual RMS (no loudness.json needed).")
+parser.add_argument("--loudness-k", type=int, default=256, help="docs sampled (seeded) for loudness calibration")
+parser.add_argument("--loudness-min-docs", type=int, default=16, help="fail calibration if the source yields fewer sample docs than this")
+parser.add_argument("--dose-min-events", type=int, default=50, help="a channel firing fewer times than this in the calibration sample gets the median well-measured E_c imputed (logged loudly)")
+parser.add_argument("--dose-check-tokens", type=int, default=50000, help="firing tokens to measure for the post-alignment realized-loudness check (0 disables). Batches are peeked and replayed — no training data is skipped.")
+parser.add_argument("--dose-check-tol", type=float, default=0.25, help="warn if realized median injected loudness deviates from dial x L_ref by more than this fraction")
+parser.add_argument("--dose-check-max-batches", type=int, default=32, help="cap on batches peeked for the realized-loudness check (bounds the replay buffer if the firing rate is very low)")
 parser.add_argument("--loudness-json", type=str, default="", help="dial/donor gates: loudness.json location (local file/dir OR HF dataset repo id). Empty = the source's own store root, else fall back to kaushikreddyxyz/climbmix-scored (logged loudly; unavailable = hard error).")
 parser.add_argument("--lookup-workers", type=int, default=0, help="threads for per-doc activation lookups in the ride-along loader (0=serial); overlaps runtime gemma scoring with training")
 parser.add_argument("--noise-sigma", type=float, default=0.15, help="gaussian noise std on standardized activations at load time, deterministic per doc-content hash; 0 disables")
@@ -259,9 +264,11 @@ assert bool(args.activation_store) != bool(args.activation_config), \
 if args.activation_store:
     with open(os.path.join(args.activation_store, "meta.json")) as f:
         _store_meta = json.load(f)
+    # Tabular stores have no gemma layer / concept names, so a dial has no reference:
+    # such a run must pass --loudness abs:<n>.
     injection_cfgs = [InjectionCfg(
         name="acts", r=int(_store_meta["r"]), after_block=args.after_block,
-        gate=args.gate, trainable_direction=False,
+        loudness=args.loudness, trainable_direction=False,
         direction_seed=int(_store_meta.get("p_seed", 1337)))]
     injection_source_specs = {"acts": {"kind": _store_meta.get("source_kind"),
                                        "dir": args.activation_store,
@@ -269,6 +276,8 @@ if args.activation_store:
 else:
     with open(args.activation_config) as f:
         _inj_spec = json.load(f)
+    # Each site's loudness comes from ITS OWN dict here; the --loudness CLI flag is
+    # IGNORED on this path (it only feeds the --activation-store branch above).
     injection_cfgs = [InjectionCfg(**d) for d in _inj_spec["sites"]]
     injection_source_specs = dict(_inj_spec["sources"])
     assert set(injection_source_specs) == {c.name for c in injection_cfgs}, \
@@ -279,53 +288,34 @@ output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 
-# Classify gate specs (grammar: sites.classify_gate_spec). A PLAIN NUMBER is a
-# loudness DIAL in donor units — resolved below to an absolute per-channel gate
-# (rms(gate) = dial × L_ref from loudness.json) at startup; "abs:<n>"/"auto" are
-# absolute; "donor[:stat]" is a dial alias; dial 0 is an exact off without the
-# artifact. Placeholders until calibration/load. Sources open BEFORE the sites
-# so calibration can sample them independently; they are loader-side data
-# plumbing, never model state.
-_auto_targets = {}       # name -> auto absolute target loudness
-_dial_specs = {}         # name -> {"dial": float} | {"stat": str}  (donor alias)
+# Classify loudness specs (grammar: sites.classify_loudness_spec) — two forms only:
+# a plain number is a DIAL in donor units, "abs:<n>" is an absolute median-loudness
+# target. Both resolve to channel_scale at startup. Sources open BEFORE the sites so
+# calibration can sample them independently; they are loader-side data plumbing,
+# never model state.
+_loudness_specs = {}     # name -> {"dial": float} | {"abs_target": float}
 for _cfg in injection_cfgs:
-    _mode, _val = classify_gate_spec(_cfg.gate)
-    if _mode == "auto":
-        _auto_targets[_cfg.name] = _val
-        _cfg.gate = float(_val)                 # placeholder until calibration/load
-    elif _mode == "abs":
-        _cfg.gate = float(_val)                 # raw stream fraction (old semantics)
-    elif _mode == "donor":
-        _dial_specs[_cfg.name] = {"stat": _val}
-        _cfg.gate = 0.05                        # placeholder until calibration/load
-    elif _mode == "dial":
-        if _val == 0.0:
-            _cfg.gate = 0.0                     # exact off — no loudness.json needed
-        else:
-            _dial_specs[_cfg.name] = {"dial": float(_val)}
-            _cfg.gate = 0.05                    # placeholder until calibration/load
-    else:                                       # explicit absolute per-channel vector
-        _cfg.gate = [float(g) for g in _val]
+    _mode, _val = classify_loudness_spec(_cfg.loudness)
+    _loudness_specs[_cfg.name] = ({"abs_target": _val} if _mode == "abs" else {"dial": _val})
 
-# Resuming a dial/auto-gate run: the calibrated per-channel vector must be in
-# the cfg BEFORE the sites are built — load_state_dict(assign=True) enforces
-# shapes, so a scalar-placeholder site cannot load a vector-gate checkpoint. Read
-# it from the checkpoint meta (injection_sites_config); a site absent there (warm
-# start from a vanilla checkpoint) calibrates fresh below. Resumes use the
-# PERSISTED ABSOLUTE vector and never re-resolve (loudness.json may have changed).
-_auto_pending = dict(_auto_targets)
-_dial_pending = dict(_dial_specs)
-if resuming and (_auto_pending or _dial_pending):
+# Resuming: the calibrated channel_scale must be in the cfg BEFORE the sites are built —
+# load_state_dict(assign=True) enforces shapes. Read it from the checkpoint meta
+# (injection_sites_config); a site absent there (warm start from a vanilla checkpoint)
+# calibrates fresh below. Resumes reuse the PERSISTED vector and never re-resolve
+# (loudness.json may have changed since).
+_loudness_pending = dict(_loudness_specs)
+if resuming:
     with open(os.path.join(checkpoint_dir, f"meta_{args.resume_from_step:06d}.json")) as f:
         _ckpt_sites = {c["name"]: c for c in json.load(f).get("injection_sites_config", [])}
-    for _pending, _label in ((_auto_pending, "auto-gate"), (_dial_pending, "dial-gate")):
-        for _name in list(_pending):
-            _saved_gate = _ckpt_sites.get(_name, {}).get("gate")
-            if isinstance(_saved_gate, (list, tuple)):
-                _cfg = next(c for c in injection_cfgs if c.name == _name)
-                _cfg.gate = [float(g) for g in _saved_gate]
-                del _pending[_name]
-                print0(f"[{_label}] {_name!r}: reusing the persisted ABSOLUTE gate from checkpoint meta (no re-resolve)")
+    for _name in list(_loudness_pending):
+        _saved = _ckpt_sites.get(_name, {})
+        if isinstance(_saved.get("channel_scale"), (list, tuple)):
+            _cfg = next(c for c in injection_cfgs if c.name == _name)
+            _cfg.channel_scale = [float(v) for v in _saved["channel_scale"]]
+            _cfg.threshold = _saved.get("threshold", _cfg.threshold)   # the relu that scale was fit to
+            del _loudness_pending[_name]
+            print0(f"[loudness] {_name!r}: reusing the persisted channel_scale from checkpoint meta "
+                   f"(no re-calibrate)")
 
 # Compact-tokens mode (opt-in): a gemma-boundary-respecting tokenizer used for
 # BOTH the training token stream (loader) and the runtime source alignment. OFF
@@ -369,11 +359,11 @@ for _name, _spec in injection_source_specs.items():
 # cannot race prefill). Deterministic in (source, seed) => every DDP rank agrees;
 # we assert bit-identical gate vectors across ranks. Provenance is persisted in
 # checkpoint meta so resumes reuse the vector and never rescore.
-_gate_provenance = {}   # name -> calibration meta (saved to checkpoint)
+_loudness_provenance = {}   # name -> calibration meta (saved to checkpoint)
 
 
 def _ddp_all_gather_hash(h):
-    """Gather every rank's gate-hash string (None => single process)."""
+    """Gather every rank's calibration-hash string (None => single process)."""
     if not (ddp and ddp_world_size > 1 and is_ddp_initialized()):
         return None
     import torch.distributed as dist
@@ -395,38 +385,55 @@ def _load_loudness(loc):
         return json.load(f)
 
 
-for _name, _target in _auto_pending.items():
-    _cfg = next(c for c in injection_cfgs if c.name == _name)
-    _gate_vec, _cal = calibrate_auto_gate(injection_sources[_name], target=_target,
-                                          k=args.gate_k, seed=args.seed, min_docs=args.gate_min_docs)
-    _cfg.gate = _gate_vec
-    _cal["gate_hash"] = assert_gate_identical_across_ranks(_gate_vec, _name, print0, _ddp_all_gather_hash)
-    _gate_provenance[_name] = {"mode": "auto", **_cal}
-    print0(f"[auto-gate] {_name!r}: target={_target} active={_cal['n_active']}/{_cfg.r} "
-           f"rms(gate)={_cal['rms_gate']:.4f} ({_cal['n_docs']} docs, {_cal['n_tokens']} tokens); "
-           f"gate={[round(g, 4) for g in _gate_vec]}")
-
-for _name, _spec in _dial_pending.items():
+for _name, _spec in _loudness_pending.items():
     _cfg = next(c for c in injection_cfgs if c.name == _name)
     _src = injection_sources[_name]
-    _t_dial = time.time()
-    # HARD requirement: a dial gate needs loudness.json + a source gemma layer;
-    # discover/resolve raise actionable errors (naming abs:/--loudness-json).
-    _loud, _loud_src = discover_loudness_json(_src, args.loudness_json or None, print0, _load_loudness)
-    # For live/dynamic sources this actually runs the scorer over ~gate-k docs up
-    # front (one-time startup cost, logged) — calibration NEVER runs lazily.
-    _gate_vec, _cal = dial_gate_from_loudness(_src, _loud, dial=_spec.get("dial"),
-                                              stat=_spec.get("stat"), k=args.gate_k,
-                                              seed=args.seed, min_docs=args.gate_min_docs)
-    _cfg.gate = _gate_vec
-    _dur = time.time() - _t_dial
-    _cal["gate_hash"] = assert_gate_identical_across_ranks(_gate_vec, _name, print0, _ddp_all_gather_hash)
+    _t0 = time.time()
+    # The site owns thresholding. A source-side present_z at the SAME value is idempotent
+    # with the site relu (row-max >= z0 <=> some channel survives), so an old config that
+    # double-thresholds is harmless; a HIGHER present_z would clip dose events.
+    if float(getattr(_src, "present_z", 0.0) or 0.0) > 0.0:
+        print0(f"[loudness] {_name!r}: source present_z={_src.present_z} — idempotent at "
+               f"threshold={_cfg.threshold}, but the SITE owns the threshold; prefer present_z=0")
+    _loud = _loud_src = None
+    if "dial" in _spec:
+        # HARD requirement: a dial needs loudness.json + a source gemma layer; discover/
+        # resolve raise actionable errors naming abs:/--loudness-json. For live sources this
+        # runs the scorer over ~loudness-k docs up front — calibration NEVER runs lazily.
+        _loud, _loud_src = discover_loudness_json(_src, args.loudness_json or None, print0, _load_loudness)
+    # Calibrated against the site's ACTUAL initial D (the sphere arm's rows are
+    # non-orthogonal, so a quadrature estimate of loudness would be wrong).
+    _cs, _cal = calibrate_dose_gate(_src, _loud, initial_direction(_cfg, model_config.n_embd),
+                                    dial=_spec.get("dial", 1.0), abs_target=_spec.get("abs_target"),
+                                    threshold=_cfg.threshold, k=args.loudness_k, seed=args.seed,
+                                    min_events=args.dose_min_events, min_docs=args.loudness_min_docs,
+                                    log=print0)
+    _cfg.channel_scale = _cs
+    _dur = time.time() - _t0
+    _cal["scale_hash"] = assert_loudness_identical_across_ranks(_cs, _name, print0, _ddp_all_gather_hash)
     _cal.update({"loudness_source": _loud_src, "duration_s": round(_dur, 3)})
-    _gate_provenance[_name] = _cal
-    print0(f"[dial-gate] {_name!r}: dial={_cal['dial']:.4f}{' (donor:' + _spec['stat'] + ')' if _spec.get('stat') else ''} "
-           f"L_ref={_cal['L_ref']:.4f} (layer {_cal['layer']}) -> abs rms(gate)={_cal['rms_gate']:.4f} "
-           f"target={_cal['target_abs']:.4f} active={_cal['n_active']}/{_cfg.r} "
-           f"({_cal['n_docs']} docs, {_cal['n_tokens']} tokens; {_dur:.1f}s startup scoring; {_loud_src})")
+    _loudness_provenance[_name] = _cal
+    if _cal["mode"] == "dial":
+        print0(f"[loudness] {_name!r}: L_ref={_cal['L_ref']:.4f} = median per-concept active loudness "
+               f"over this site's {_cfg.r} concepts (loudness.json cols {_cal['concept_index'][:8]}"
+               f"{'...' if _cfg.r > 8 else ''}); the 54-concept subspace_total is "
+               f"{_cal['L_ref_subspace_total']:.4f} ({_cal['L_ref_subspace_total'] / _cal['L_ref']:.2f}x) "
+               f"and is deliberately NOT the reference — concepts add in quadrature, so it would "
+               f"over-inject an r={_cfg.r} site.")
+        print0(f"[loudness] {_name!r}: dial={_cal['dial']:.4f} x L_ref -> target median injected "
+               f"loudness {_cal['target_median']:.4f} (layer {_cal['layer']}; {_loud_src})")
+    else:
+        print0(f"[loudness] {_name!r}: abs target median injected loudness "
+               f"{_cal['target_median']:.4f} (no loudness.json needed)")
+    print0(f"[loudness] {_name!r}: {_cal['n_firing_tokens']} firing / {_cal['n_tokens']} calibration "
+           f"tokens ({100 * _cal['firing_token_rate']:.2f}%); {_cal['n_imputed']} imputed-E / "
+           f"{_cal['n_dead']} dead of {_cfg.r} channels ({_cal['n_docs']} docs; {_dur:.1f}s)")
+    print0(f"[loudness] {_name!r}: channel_scale=" +
+           ", ".join(f"{_c}={_v:.4g}" for _c, _v in zip(_cal["concepts"], _cs)))
+    _ilad, _dlad = _cal["injected_loudness"], _cal["donor_loudness"] or {}
+    for _q in ("p50", "p90", "p95", "p99", "max"):
+        _dv = f"{_dlad[_q]:.4f}" if _q in _dlad else "-"
+        print0(f"[loudness] {_name!r} ladder: {_q:>4} calibrated={_ilad[_q]:.4f} donor_subspace={_dv}")
 
 model.setup_injection_sites(injection_cfgs)
 if args.activation_store:
@@ -456,10 +463,12 @@ if resuming:
     if missing:
         print0(f"warm-start: checkpoint has no injection sites; {len(missing)} site tensors keep their fresh init")
     reassert_optimizability(model.injection_sites)
-    for _name in list(_auto_targets) + list(_dial_specs):  # keep cfg (-> saved meta) in sync with the gate in the model
+    for _name in list(_loudness_specs):   # keep cfg (-> saved meta) in sync with the model
         _cfg = next(c for c in injection_cfgs if c.name == _name)
-        _g = model.injection_sites[_name].gate.detach().float().cpu()
-        _cfg.gate = _g.tolist() if _g.ndim else float(_g)
+        _site = model.injection_sites[_name]
+        _cfg.channel_scale = _site.channel_scale.detach().float().cpu().tolist()
+        _th = _site.threshold.detach().float().cpu()
+        _cfg.threshold = _th.tolist() if _th.ndim else float(_th)
     del model_data # free up this memory after the copy
 
 # Startup banner: source kind, shard coverage, resolved gates.
@@ -472,9 +481,16 @@ for _name, _src in injection_sources.items():
     _cfg = next(c for c in injection_cfgs if c.name == _name)
     _nshards = len(getattr(_src, "shards", ()) or ())
     print0(f"injection site {_name!r}: source={getattr(_src, 'source_kind', type(_src).__name__)} "
-           f"r={_src.r} after_block={_cfg.after_block} gate={_gate_str(_cfg.gate)} "
+           f"r={_src.r} after_block={_cfg.after_block} loudness={_cfg.loudness!r} "
            f"trainable_direction={_cfg.trainable_direction} optim={_cfg.optim} "
            f"noise={float(injection_source_specs[_name].get('noise_sigma', 0.15))} shards={_nshards}")
+    # Which math produced this run, readable from the log alone six months from now.
+    _p = _loudness_provenance.get(_name, {})
+    print0(f"[site] {_name!r}: DOSE x += rms(x)*(relu(a-z0)*channel_scale) @ D/rms_rows(D) | "
+           f"after_block={_cfg.after_block} z0={_cfg.threshold} | loudness={_cfg.loudness!r} "
+           f"({_p.get('mode')}, dial={_p.get('dial')}, L_ref={_p.get('L_ref')} subset-median, "
+           f"subspace_total={_p.get('L_ref_subspace_total')}) | target_median={_p.get('target_median')} | "
+           f"trainable_direction={_cfg.trainable_direction}")
 
 # Optional ablation: disable the ResFormer value embeddings. We zero the value-embedding
 # tables and freeze them, so they neither contribute to the forward (v = v + gate*0 == v)
@@ -755,6 +771,38 @@ if _buffer_tty and master_process:
     sys.stdout.write("\r" + " " * 100 + "\r"); sys.stdout.flush()
 x, y, acts, dataloader_state_dict = next(train_loader) # first batch, drawn from the warmed buffer
 
+# Realized-loudness check (dose sites, fresh runs only — a resume already logged it and
+# must not re-peek). Calibration sampled PRE-alignment gemma rows; the site sees
+# POST-alignment rows, so we measure what is actually injected. Batches are PEEKED and
+# replayed into training in order (itertools.chain) — no data is skipped and the
+# per-batch dataloader_state_dict stays aligned with what the loop consumes. Each rank
+# measures its own stream shard; rank 0 logs.
+if args.dose_check_tokens > 0 and not resuming:
+    import itertools
+    _peeked = []                      # extra batches pulled here; replayed below, never dropped
+    def _peek_acts(name):
+        """The current batch, then batches shared across sites (pulled once, capped)."""
+        yield acts[name]
+        i = 0
+        while i < args.dose_check_max_batches:
+            if i == len(_peeked):
+                _peeked.append(next(train_loader))
+            yield _peeked[i][2][name]
+            i += 1
+    for _name in _loudness_specs:
+        _site = model.injection_sites[_name]
+        _cal = _loudness_provenance.get(_name, {})
+        _rep = realized_loudness_report(
+            _peek_acts(_name), _site.threshold.detach().float().cpu().numpy(),
+            _site.channel_scale.detach().float().cpu().numpy(),
+            _site.direction.detach().float(), _cal.get("target_median", 0.0),
+            min_firing_tokens=args.dose_check_tokens, tol=args.dose_check_tol)
+        log_realized_loudness(_rep, _name, _cal.get("injected_loudness"),
+                              _cal.get("donor_loudness"), print0)
+        _cal["realized"] = _rep
+    if _peeked:
+        train_loader = itertools.chain(_peeked, train_loader)
+
 # Free duty-cycle forecast (replaces the old sampling verdict): production rate was
 # measured DURING prefill, so the forecast costs nothing extra. Consumption = this
 # rank's total_batch_size/world tokens per --target-step-time seconds/step.
@@ -993,7 +1041,7 @@ while True:
                 # auto/donor gate provenance (target/stat/layer/rms/hash/loudness
                 # source) — the calibrated vector rides in injection_sites_config
                 # above; a resume reuses it and never rescores.
-                "gate_calibration": _gate_provenance,
+                "gate_calibration": _loudness_provenance,
                 "injection_source_specs": injection_source_specs,
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,

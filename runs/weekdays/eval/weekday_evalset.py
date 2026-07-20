@@ -1,28 +1,8 @@
-"""Deterministic, template-generated weekday-knowledge eval set (weekday_v1).
-
-Produces ~400-item completion-style items (NO chat/instruction format — these are
-124M-param 1.3B-token base models) that probe weekday knowledge along three axes:
-cyclic ORDER (next/prev, k-step wrapping), FACTs (position-in-week with an
-in-prompt convention), and USAGE (weekend membership, culturally-typical
-day associations with a self-contained in-prompt fact). A `sanity` category of
-trivial non-weekday items calibrates whether the model is even on-distribution.
-
-Each item is scored by length-normalized CE over each option continuation
-(run_evals.py): prediction = argmin-CE option. Options are the 7 weekdays (or a
-targeted subset for weekend-MC / sanity). The generator is a pure function of the
-templates below — same bytes every run (test_evalset.py::test_deterministic).
-
-Item schema (one JSON object per line):
-  id        stable str  "{category}_{NNN}"
-  category  one of CATEGORIES
-  prompt    completion prefix, NO trailing space (scorer appends " " + option)
-  options   list[str], the candidate continuations (answer is one of them)
-  answer    str, the correct option
-  meta      {day, k, direction, template, convention, fill_in, ...}
-
-`fill_in` (meta): True when the answer must be INFERRED and must NOT appear in
-the prompt (leak-tested). False for association/MC items where a day is stated
-in the prompt by design (market-day copy tasks; weekend-MC lists its options).
+"""Deterministic template generator for weekday_v1 (422 completion-style items:
+cyclic order next/prev/k-step, position-in-week, weekend/usage, sanity), scored by
+length-normalized CE per option in run_evals.py. Same bytes every run; meta.fill_in
+marks items whose answer must NOT appear in the prompt (leak-tested).
+Regenerate: python runs/weekdays/eval/weekday_evalset.py
 """
 import argparse
 import json

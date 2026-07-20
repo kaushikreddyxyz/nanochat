@@ -1,21 +1,9 @@
-"""Pod-side smoke gate for the injection-on-vs-off eval suite. Run BEFORE the
-long evals (RUNBOOK.md step 2); every check here needs the pod (rustbpe / CUDA /
-gated gemma / HF checkpoints), which the laptop-side tests cannot exercise.
-
-Checks (fail loudly, in dependency order):
-  1. nanochat tokenizer round-trip: decode(encode_ordinary(t)) == t over every
-     weekday_v1 prompt+option string and every causal prompt (the exact texts the
-     evals score), plus edge/unicode samples — the CORE adapter's decode->re-encode
-     acts path relies on this (drift rows degrade to zero acts; should be ~0).
-  2. Day-name first tokens distinct (the causal single-forward readout needs it).
-  3. load_model('trainable') on CUDA: gate_scale=0 forward is BIT-identical to the
-     acts=None forward under the POD dtype (bf16) — the on/off invariant, on-device.
-  4. load_model('baseline') has NO site; attach_site + _extract_direction round-trip.
-  5. GemmaScorer end-to-end (gated gemma + vendored probe constants + store stats):
-     score a day sentence; the day's own STORE channel must be the argmax on the
-     day token and >= 2.0 (the realism threshold the injection fired on in training).
-
-Usage:  cd <nanochat repo root> && .venv/bin/python runs/weekdays/eval/pod_smoke.py
+"""Pod-side smoke gate — run BEFORE the long evals (run_all.sh step 2); needs rustbpe/
+CUDA/gated gemma/HF checkpoints. Verifies tokenizer round-trip on the exact eval texts,
+day-first-token distinctness, on-device loudness-0 bit-identity (the on/off invariant),
+baseline-has-no-site + attach_site round-trip, and GemmaScorer end-to-end. If this
+fails, stop — nothing downstream is meaningful.
+Run from repo root: .venv/bin/python runs/weekdays/eval/pod_smoke.py
 """
 import json
 import os
@@ -26,16 +14,25 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 sys.path.insert(0, REPO)
+sys.path.insert(0, os.path.join(REPO, "runs", "lib", "eval"))   # the shared harness
 sys.path.insert(0, HERE)
+
+HF_REPO = "kaushikreddyxyz/weekday-geometry-d12"
+STEP = 2520
+FAMILY = "weekdays"
+SITE_NAME = "weekdays"
+TRAINABLE_ARM = "trainable"
 
 
 def main():
     import torch
     import harness
     import causal
-    import causal_items as ci
+    import weekday_items as ci
     import weekday_evalset as W
     from nanochat.tokenizer import get_tokenizer
+
+    causal.bind_items_module(os.path.join(HERE, "weekday_items.py"))
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[smoke] device={device}")
@@ -61,39 +58,42 @@ def main():
 
     # ---- 2. day-name first tokens distinct ----------------------------------
     first = [enc.encode_ordinary(ci.completion(d))[0] for d in ci.CALENDAR_ORDER]
-    assert len(set(first)) == 7, f"day first tokens collide: {first}"
+    assert len(set(first)) == len(ci.CALENDAR_ORDER), f"day first tokens collide: {first}"
     print(f"[smoke] 2. day first tokens distinct: {first}")
 
     # ---- 3. on/off invariant on the POD dtype (trainable arm) ---------------
     harness.set_nano_tokenizer(enc)
-    model, meta = harness.load_model("trainable", device)
+    model, meta = harness.load_model(TRAINABLE_ARM, device, HF_REPO, STEP)
     bos = tok.get_bos_token_id()
     ids = [bos] + enc.encode_ordinary("Sarah was born on a Friday. The birth was on a")
-    acts = np.zeros((len(ids), 7), np.float32)
+    r = len(ci.STORE_ORDER)
+    acts = np.zeros((len(ids), r), np.float32)
     acts[len(ids) // 2, 0] = 3.0  # synthetic firing mid-sequence
-    off = harness.forward_metrics(model, ids, acts[None], gate_scale=0.0)["logits"]
+    off = harness.forward_metrics(model, ids, acts[None], loudness_scale=0.0)["logits"]
     vanilla = harness.forward_metrics(model, ids, acts=None)["logits"]
-    on = harness.forward_metrics(model, ids, acts[None], gate_scale=1.0)["logits"]
-    assert torch.equal(off, vanilla), "gate_scale=0 not bit-identical on the pod dtype"
-    assert not torch.equal(on, vanilla), "gate_scale=1 with nonzero acts is a no-op?!"
-    g = model.injection_sites["weekdays"].gate.detach().float().cpu()
-    assert torch.equal(g, torch.tensor(0.0273)), f"gate not restored: {g}"
-    direction = causal._extract_direction(model)
+    on = harness.forward_metrics(model, ids, acts[None], loudness_scale=1.0)["logits"]
+    assert torch.equal(off, vanilla), "loudness_scale=0 not bit-identical on the pod dtype"
+    assert not torch.equal(on, vanilla), "loudness_scale=1 with nonzero acts is a no-op?!"
+    params = harness.site_params(model, SITE_NAME)
+    cs = model.injection_sites[SITE_NAME].channel_scale.detach().float().cpu().numpy()
+    assert np.array_equal(cs, params["channel_scale"]), f"channel_scale not restored: {cs}"
     del model
-    print("[smoke] 3. on/off bit-identity OK on trainable (cuda/bf16); gate restored")
+    print("[smoke] 3. on/off bit-identity OK on trainable (cuda/bf16); loudness restored")
 
     # ---- 4. baseline has no site; attach_site round-trips -------------------
-    base, bmeta = harness.load_model("baseline", device)
+    base, bmeta = harness.load_model("baseline", device, HF_REPO, STEP)
     assert getattr(base, "injection_sites", None) is None, "baseline must have NO site"
-    site = harness.attach_site(base, direction)
-    got = causal._extract_direction(base)
-    assert np.array_equal(got, direction.astype(np.float32)), \
+    site = harness.attach_site(base, name=SITE_NAME, **params)
+    got = harness.site_params(base, SITE_NAME)
+    assert np.array_equal(got["direction"], params["direction"]), \
         "attach_site direction round-trip failed"
+    assert np.array_equal(got["channel_scale"], params["channel_scale"]), \
+        "attach_site must carry the arm's calibrated loudness"
     del base
-    print("[smoke] 4. baseline site-free; attach_site(checkpoint direction) OK")
+    print("[smoke] 4. baseline site-free; attach_site(arm direction + loudness) OK")
 
     # ---- 5. GemmaScorer fires the right STORE channel on a day token --------
-    scorer = harness.GemmaScorer(device)
+    scorer = harness.GemmaScorer(device, harness.family_concepts(FAMILY))
     day = "wednesday"
     text = f"The committee meets every {day.capitalize()} at noon."
     z, offsets = scorer.score_with_offsets([text])[0]
@@ -109,7 +109,7 @@ def main():
     print(f"[smoke] 5. GemmaScorer OK: {day} channel z={zday[ch]:.2f} "
           f"(store order {json.dumps(ci.STORE_ORDER)})")
 
-    print("\nSMOKE PASSED — proceed with run_evals.py and causal.py (RUNBOOK.md)")
+    print("\nSMOKE PASSED — proceed with run_evals.py and causal.py (see run_all.sh)")
 
 
 if __name__ == "__main__":

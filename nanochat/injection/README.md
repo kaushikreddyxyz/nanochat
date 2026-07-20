@@ -15,8 +15,7 @@ pre-injection..HEAD`):
 7. `c6d8f3d` — **package rename `nanochat.oracle` → `nanochat.injection`**, ActivationSource interface, activation-store-v2
 8. `9d38414` — **`scripts/injection_train.py`** (dedicated injection training script)
 9. README for the four directives
-10. **gate → default 0.05, per-channel gate + `auto` calibration** (`sites.py`:
-    one gate mechanism replacing `channel_weights`; `--gate auto[:target]`)
+10. per-channel loudness calibration (`sites.py`), replacing `channel_weights`
 11. **runtime probe-score injection** (`RuntimeProbeScoreSource` /
     `LiveProbeScoreSource`, positional ride-along join, `probe-scores-runtime`
     wiring; the `repackage-probe-scores` skeleton deleted)
@@ -33,17 +32,17 @@ pre-injection..HEAD`):
     (replaces the startup verdict), **rebuffer with hysteresis** on a dry buffer,
     **DDP-coordinated** pause/resume, and **multi-stream** shard prefetch
     (`ShardPrefetcher.streams` + bandwidth auto-sizing).
-14. `d97945b` — **donor-loudness gate** (`--gate donor[:stat]`): match gemma's
-    native concept loudness from `loudness.json`
-    (`attribution/measure_loudness.py`); startup-only resolution incl. live
-    sources, concept-order refusal, DDP gate-hash identity, resume-never-rescores.
-15. **gate = loudness DIAL in donor units** (this commit): a plain-number
-    `--gate` resolves to `rms(gate) = dial × L_ref` (`L_ref` = gemma's median
-    native packet loudness at the source's layer, ≈ 0.081); **default 1.0 =
-    standard (donor-native) loudness**; `abs:<n>` / `auto[:t]` are the absolute
-    escapes; `donor[:stat]` stays as a dial alias.
+14. `d97945b` — donor loudness from `loudness.json`
+    (`attribution/measure_loudness.py`): startup-only resolution incl. live
+    sources, concept-order refusal, DDP hash identity, resume-never-rescores.
+15. **DOSE is the standard** (this commit): per-token magnitude survives
+    (`/rms(z)` retired with the constant-amplitude path), per-event
+    equalization, relu threshold at 2.0σ, unit-RMS direction rows, name-indexed
+    concept subsets with a subset `L_ref`, a two-form `loudness` spec (dial /
+    `abs:`) replacing the five-mode gate grammar, and a startup
+    realized-loudness check. Defaults: `after_block=0`, dial `1.0`.
 
-Suggested review order: `sites.py` (the injection contract + gate/auto) →
+Suggested review order: `sites.py` (the injection contract + loudness calibration) →
 `sources.py` (ActivationSource + store format + runtime probe sources + overlap
 align + prefetch hook) → `compact.py` (compact-tokens wrapper) → `prefetch.py`
 (rolling shard prefetcher, multi-stream) → `buffering.py` (prefill/rebuffer/
@@ -101,102 +100,142 @@ with **fixed optimizability rules**:
 
 | part | what it is | optimizable? |
 |---|---|---|
-| **gate** | loudness. At the SITE level always **absolute**: a scalar (injected per-token RMS = `gate` × RMS(residual)) or a length-r per-channel vector `v` (channels pre-scaled by `v`, overall injected RMS = `rms(v)` × RMS(residual)); `gate=0`/all-zero is exactly off. At the TRAINER level `--gate <number>` is a **dial in donor units** (default **1.0** = gemma-native loudness; resolved to an absolute vector at startup — below). | **NEVER.** A parameter so autograd *assigns* it a gradient every backward (a loggable want-signal, per channel), but it sits in no optimizer group and is never stepped. |
+| **loudness** | `channel_scale` (length-r) + `threshold` (`z0`, scalar or length-r). Resolved at startup by `calibrate_dose_gate` from the config's `loudness` spec; a site cannot be built with `channel_scale` unresolved. | **NEVER.** Parameters so autograd *assigns* them a gradient every backward (a loggable want-signal, per channel), but they sit in no optimizer group and are never stepped. |
 | **activation** | the content: a `(B, T, r)` tensor per batch from a pluggable `ActivationSource`. | **NEVER.** Produced without grad by the dataloader and additionally `detach()`ed by the site. |
-| **direction** | `(r, n_embd)` map from activation channels into the residual stream. | **The only optionally-trainable part**, controlled purely by freeze/unfreeze. Frozen + orthonormal init = "tabular" injection (the fixed-P v1 behavior); unfrozen = "free" injection. |
+| **direction** | `(r, n_embd)` map from activation channels into the residual stream. | **The only optionally-trainable part**, controlled purely by freeze/unfreeze. Frozen + orthonormal init = "tabular" injection; unfrozen = "free" injection. |
 
-Site math (per token):
+Site math, per token:
 
 ```
-z     = a @ D                       # activation through direction
-z_hat = z / rms(z)                  # D's scale can never fight the gate
-x     = x + gate * rms(x).detach() * z_hat
+a_eff = relu(a - z0)                     # z0 = threshold, default 2.0 (σ units)
+u     = a_eff * channel_scale            # frozen, from calibrate_dose_gate
+D_hat = D / rms_rows(D)                  # rows to UNIT RMS, inside forward
+x     = x + rms(x).detach() * (u @ D_hat)
 ```
 
-`rms(x)` is detached: it *measures* the stream to calibrate amplitude; it is
-not a gradient path into the stream's own norm. Invariants (pinned by
-`tests/test_injection_sites.py`):
+`rms(x)` is detached: it *measures* the stream to calibrate amplitude; it is not a
+gradient path into the stream's own norm.
 
-- **zero activation rows (BOS / missing doc) are an EXACT no-op** — no NaN, no
-  branch (the `rms(z)` clamp), torch.compile-friendly;
-- injected per-token RMS == `gate` × per-token RMS(x) (scalar), or `rms(gate)` ×
-  RMS(x) for a per-channel gate vector; an **all-zero gate vector is an exact
-  no-op** and a `gate[c]=0` channel contributes exactly nothing;
-- `gate=0` is an exact forward no-op AND blocks all gradient to the direction;
-- the **scalar-gate forward is byte-identical to the retired v1 inline formula**
-  `x + beta*(rms_x/rms_z)*zc` (the detach only changes gradients, deliberately);
-  the per-channel path reduces to it continuously (a uniform vector `g·1` gives
-  `rms(gate)=g`, unit mix).
+Defaults are the standard: `after_block=0`, `threshold=2.0`, `loudness=1.0`,
+`trainable_direction=False`, `direction_init="orthonormal"`. A minimal site config is
+`{"name": ..., "r": ...}`.
 
-`GPT.setup_injection_sites(cfgs)` attaches sites as an `nn.ModuleDict`
-(checkpointed, optimizer-visible); `GPT.forward(..., acts={name: (B,T,r)})`
-fires each site after its own block. `acts=None` (eval, inference, vanilla
-runs) is bit-identical to a model without sites.
+`GPT.setup_injection_sites(cfgs)` attaches sites as an `nn.ModuleDict` (checkpointed,
+optimizer-visible); `GPT.forward(..., acts={name: (B,T,r)})` fires each site after its
+own block. `acts=None` (eval, inference, vanilla runs) is bit-identical to a model
+without sites.
 
-### Gate: a loudness dial in donor units (default 1.0)
+### Why magnitude survives (no `/rms(z)`)
 
-**`--gate <number>` is a dial in donor units, NOT a raw stream fraction.** It
-resolves at startup to an absolute per-channel gate with
-`rms(gate) = dial × L_ref`, where **L_ref** is gemma-2-2b's *native* median
-54-concept packet loudness at the source's gemma layer — read from
-`loudness.json` (`attribution/measure_loudness.py`, `subspace_total.ridge[L].p50`;
-loudness.json interprets probe z-scores as fractions of gemma's residual-stream
-norm, `‖Δx‖/‖x‖`, the site's own unit). **Default 1.0 = "standard loudness"**:
-inject the packet exactly as loud as the donor natively plays it. `0` = exactly
-off (no artifact needed). The per-channel mix is donor-proportional — each
-channel at dial × its own natural loudness share
-(`g_c ∝ active_loudness.ridge[L].p50[c] / rms_c`, dead channels → 0, scaled to
-the target).
+The retired math renormalized every token's projection to a fixed amplitude, so a 4σ
+score and a 2.1σ score injected identically — the dose response was a step function at
+the threshold. Probes are **linear** readouts of the donor's residual stream: a 4σ score
+means 4σ of projection along that concept's direction. Injecting proportionally is
+therefore the faithful transplant, and constant amplitude discarded the dose entirely.
 
-Measured anchors (climbmix, 2026-07-14 — see `attribution/REPORT.md`):
+**The retired formula**, for anyone reading a pre-2026-07-20 checkpoint's meta. Sites
+had a `gate` (scalar, or a length-r vector whose channel mix was `gate/rms(gate)`) and
+injected `x + gate * rms(x).detach() * (a @ D) / rms(a @ D)`. The `/rms(z)` forced every
+token that passed the source-side `present_z` row gate to inject at *identical*
+amplitude, making the dose response a step function; loudness was a `gate` targeting the
+54-concept `subspace_total`. Configs used a five-mode gate grammar
+(`dial` / `abs:` / `auto[:t]` / `donor[:stat]` / explicit vector). All of it is deleted —
+old checkpoints are not loadable by this code, and their results are not comparable to a
+rerun.
 
-| absolute rms(gate) | dial @ L6 | @ L8 | @ L14 |
+### Per-event equalization
+
+`channel_scale_c ∝ 1/E_c`, where `E_c` is the RMS of channel `c` **conditional on that
+channel firing** (`calibrate_dose_gate`). Every concept is equally loud *when it fires*;
+a rare concept stays rare but is audible at the same volume as a common one. Equalizing
+per *total* activation mass instead would amplify rare concepts to compensate for
+rarity — a different experiment. One global rescale then sets the median injected
+loudness over firing tokens to the resolved target.
+
+Consequence, stated plainly: **cross-concept amplitude ordering is intentionally not
+meaningful.** The site says "this concept is present, this strongly" per concept; it does
+not preserve which concept is natively louder than which.
+
+The calibration target is the **total per-token injected loudness**
+(`rms(u @ D_hat)` per token, medianed over firing tokens on the real firing pattern), not
+a per-channel budget. Co-firing therefore self-corrects: when `n` concepts fire on the
+same token — the multi-family case, e.g. a date token that is winter + january + friday —
+the per-channel scale comes out ~`1/sqrt(n)` smaller and the injected total still lands
+on target, instead of `n`-ing up. Multi-family needs no new machinery.
+
+Channels that fire fewer than `--dose-min-events` times in the calibration sample get the
+**median well-measured `E_c`** imputed (unit-consistent — still a `1/E`), logged loudly
+with the count. A channel that never fires gets `channel_scale = 0`.
+
+### Threshold semantics
+
+`relu(a - z0)`. Negative probe scores are the **noise tail of a linear readout, not
+evidence of an anti-concept**, so they inject nothing rather than a negated direction.
+Sub-threshold, zero and negative rows inject **bitwise 0** — no branch, no NaN,
+torch.compile-friendly.
+
+`threshold` is a scalar (default `2.0`) **or a length-r vector**, so per-concept knees are
+expressible without a schema change — probes differ in tail shape and calibration
+quality. Calibration applies the same per-channel knee it hands the site.
+
+The site owns thresholding. A source-side `present_z` row gate at the same value is
+idempotent with this relu (row-max ≥ z0 ⟺ some channel survives), so an old config that
+double-thresholds is harmless; a *higher* `present_z` would clip dose events. Prefer
+`present_z=0`.
+
+### Unit-RMS rows: a gauge fix
+
+`D_hat` is reparameterized inside `forward` (not by a post-step hook), so it is
+checkpoint-safe and self-enforcing. Scaling D's rows by any positive factor leaves the
+injection unchanged — loudness lives in `channel_scale` alone and **cannot be trained
+into D**. RMS rather than L2 so `channel_scale[c]` reads directly as a fraction of
+residual RMS, with no `sqrt(n_embd)` factor. Row normalization only: the gram is **not**
+constrained, so a manifold direction's deliberate off-diagonal structure (the sphere
+arm's cosines up to 0.82) survives untouched.
+
+### Loudness: two forms
+
+`loudness` (cfg field; `--loudness` on the trainer) takes exactly two forms:
+
+- **plain number = dial in donor units** (default `1.0`). `dial 1.0` ⇒ the median firing
+  event injects at gemma's own median **per-concept** active loudness for *this site's*
+  concepts. Requires `loudness.json` + a source gemma layer.
+- **`abs:<n>` = absolute target** for that same median, as a fraction of residual RMS.
+  No `loudness.json` needed — the escape hatch for sources with no gemma identity
+  (`FnSource`, a Qwen-encoder store).
+
+**`L_ref` is the subset median, not `subspace_total`.** Real sites are subsets of the 54
+concepts (seasons r=4, weekdays r=7). The reference is
+`median(ridge.active_loudness[L].p50[c])` over the site's own concepts.
+`subspace_total.ridge[L].p50` is the *whole 54-concept packet*; concepts add in
+quadrature, so using it would over-inject an r-concept site by ~`sqrt(54/r)` (≈3.7x at
+r=4). The subset median reproduces the hand-calibrated gates the campaigns used
+(weekdays 0.0273, seasons 0.0262). Both numbers are logged at startup.
+
+Concepts are matched to `loudness.json` **by name**, so column order is irrelevant by
+construction (a stronger permutation guarantee than an order check) and an unknown or
+duplicated name is a hard error.
+
+### Alignment caveat (measured, not assumed)
+
+Calibration samples *pre-alignment* gemma rows; the site sees *post-alignment* nanochat
+rows. `align_policy="mean"` pools covering gemma tokens, and since relu is convex,
+`relu(mean(z)-z0) ≤ mean(relu(z-z0))` — pooling a firing token with sub-threshold
+neighbours drags it under the knee, so the site runs **quieter** than calibration
+predicted. Measured on a synthetic source (fires at 4σ, `z0=2σ`, target 0.03):
+
+| gemma tokens pooled per nanochat token | realized p50 | vs target | dial correction |
 |---|---|---|---|
-| **L_ref** (0.0808 / 0.0813 / 0.0863) | 1.0 | 1.0 | 1.0 |
-| 0.05 (the old absolute default) | 0.62 | 0.62 | 0.58 |
-| 0.14 (architectural ceiling ≈ donor p95) | 1.73 | 1.72 | 1.62 |
+| 1 (no pooling) | 0.0300 | +0.0% | 1.00 |
+| 2 | 0.0212 | −29.3% | 1.41 |
+| 4 | 0.0150 | −50.0% | 2.00 |
+| 8 | 0.0106 | −64.6% | 2.83 |
 
-A plain-number gate **REQUIRES** `loudness.json` and a source with a gemma-layer
-identity; if either is missing the run **hard-errors** (naming the escapes below)
-— it never silently falls back to absolute semantics.
-
-**Absolute escapes** (no loudness.json involved):
-
-- **`abs:<n>`**: raw stream fraction — the pre-dial semantics. `abs:0.05`
-  reproduces the old default exactly (scalar path byte-identical to v1).
-- **`auto` / `auto:<target>`**: absolute target, channel-*equalized* calibration
-  (`g_c ∝ 1/rms_c` on active channels): sample K docs (`--gate-k`, default 256,
-  seeded by `--seed`), scale so `rms(gate)` = target (default 0.05). Equalizes
-  each channel's typical contribution instead of matching the donor.
-- **explicit vector** (a length-r list in an `--activation-config` site or
-  checkpoint meta): absolute per-channel loudness, used verbatim. All-zero is an
-  exact no-op; a zero entry mutes that channel.
-- **`donor[:stat]`** (alias): `donor` == dial 1.0; `donor:p95` == dial p95/p50 at
-  the source's layer (≈1.6) — targets `subspace_total.ridge[L][stat]` directly.
-
-**Resolution mechanics** (identical for dial/donor/auto): entirely at startup —
-loudness fetch → seeded `sample_activation_stats` scoring → calibration — strictly
-before buffer prefill and step 1; live/dynamic sources run their scorer over the
-sample docs up front (logged duration), **never lazily**. Deterministic in
-(source, seed) so all DDP ranks agree (asserted via a gate-vector hash across
-ranks). The checkpoint meta persists BOTH the dial and the resolved absolutes
-(`gate_calibration`: mode, dial, `L_ref`, `target_abs`, realized `rms_gate`,
-layer, loudness provenance, gate hash; the absolute vector itself rides in
-`injection_sites_config`) — **resumes use the persisted absolute vector and never
-re-resolve** (loudness.json may have changed since; the resumed run must be exact).
-
-- **loudness.json discovery**: `--loudness-json PATH` (a local file/dir or an HF
-  dataset repo id) wins; else the source's own store root; else fall back to
-  `kaushikreddyxyz/climbmix-scored` with a **loud log** (valid because loudness is
-  a property of gemma+probes+corpus, not of the scoring source). The chosen
-  artifact + its origin are always logged; total unavailability is a hard error.
-- **HARD refusal**: `loudness.json`'s `concepts` must equal the source's column
-  names **exactly, order included** (the permutation lesson) — mismatch refuses
-  to start. The source must expose a gemma layer + concept columns
-  (`RuntimeProbeScoreSource`, `LiveProbeScoreSource`, or a probe-scores store
-  whose `meta.json` names its layer); `FnSource` / a layerless store get a clear
-  error pointing at `abs:`/`auto`.
-
+`injection_train.py` therefore runs a **realized-loudness check** on the real stream at
+startup: it peeks batches (replayed into training — no data skipped), logs the realized
+ladder beside the calibration and donor ladders, and WARNs with the exact correction
+factor when realized p50 misses the target by more than `--dose-check-tol` (default 25%).
+It never auto-corrects — the dial is the user's decision. Skipped on resume.
 ## Activation sources (`sources.py`)
 
 The per-token content is called **activations** everywhere user-facing.
@@ -211,7 +250,7 @@ The per-token content is called **activations** everywhere user-facing.
 **Contract (do not "fix" this)**: `lookup` returning `None` (doc missing from
 a store, or stored token count mismatching = tokenizer drift) MUST be mapped to
 **EXACT zeros with NO noise** by the caller. The site renormalizes any nonzero
-row to full gate amplitude, so noised zeros would inject pure noise at full
+row to full injection amplitude, so noised zeros would inject pure noise at full
 strength on exactly the docs we know nothing about; exact zeros keep the
 injection a strict no-op there. The same reasoning makes store quantization
 **zero-preserving with no mean-centering** (raw 0 → int8 0 → dequant 0 → no-op);
@@ -458,13 +497,13 @@ would hard-error):
 
 ```
 python -m scripts.injection_train -- --activation-store <store_dir> \
-    --after-block 7 --gate abs:0.05 --noise-sigma 0.15
+    --after-block 7 --loudness abs:0.03 --noise-sigma 0.15
 ```
 
 One site named `"acts"`: frozen direction pinned to the store's `P.npy` when
 present (else seeded orthonormal via the store's `p_seed`), source opened by
-`meta.json` kind. `--gate` grammar (dial / `abs:` / `auto` / `donor` — see the
-gate section above); `--gate-k`/`--gate-min-docs` tune the sampled calibration,
+`meta.json` kind. `--loudness` grammar (dial / `abs:` — see the loudness section
+above); `--loudness-k`/`--loudness-min-docs` tune the sampled calibration,
 `--loudness-json` points the dial at a specific artifact, `--lookup-workers N`
 overlaps runtime scoring with training.
 
@@ -477,9 +516,9 @@ python -m scripts.injection_train -- --activation-config path/to/config.json
 ```json
 {
   "sites": [
-    {"name": "acts", "r": 14, "after_block": 7, "gate": "abs:0.05",
+    {"name": "acts", "r": 14, "after_block": 7, "loudness": "abs:0.03",
      "trainable_direction": false, "direction_seed": 1337},
-    {"name": "probes", "r": 54, "after_block": 8, "gate": 1.0,
+    {"name": "probes", "r": 54, "after_block": 8, "loudness": 1.0,
      "trainable_direction": true, "direction_init": "orthonormal", "optim": "muon"}
   ],
   "sources": {
@@ -491,7 +530,7 @@ python -m scripts.injection_train -- --activation-config path/to/config.json
 }
 ```
 
-Site dicts are `sites.InjectionCfg` fields (`gate` follows the gate grammar: a
+Site dicts are `sites.InjectionCfg` fields (`loudness` follows the grammar: a
 plain number is the donor dial, `"abs:<n>"`/`"auto[:target]"` are absolute, a
 length-r list is an absolute per-channel vector); `sources` keys must match site
 names; `FnSource` and `LiveProbeScoreSource` remain programmatic. The `probe-scores-runtime`
@@ -507,7 +546,7 @@ gate.
 
 Wired in `GPT.setup_optimizer` (asserted by the param-count check there):
 
-- **gates** (`_never_optimize`) go in **no** param group;
+- **loudness params** (`channel_scale`, `threshold`; `_never_optimize`) go in **no** param group;
 - **frozen directions** are skipped;
 - **trainable directions** join an AdamW group by default, or Muon with
   `"optim": "muon"` per site;
@@ -518,7 +557,7 @@ Wired in `GPT.setup_optimizer` (asserted by the param-count check there):
 
 After any `load_state_dict(..., assign=True)` (resume, eval load), call
 `sites.reassert_optimizability(model.injection_sites)` — assign-loads replace
-the Parameter objects and drop the gate's `_never_optimize` stamp.
+the Parameter objects and drop the loudness params' `_never_optimize` stamp.
 injection_train and `checkpoint_manager.build_model` already do this.
 
 ## Checkpoints
@@ -598,16 +637,18 @@ python -m pytest tests/test_injection_sites.py tests/test_activation_lockstep.py
 python -m nanochat.injection.smoke
 ```
 
-- `test_injection_sites.py` — site invariants (RMS calibration, exact zero-row
-  no-op, gate-0 no-op + zero direction grad, gate default = dial 1.0, scalar-path
-  byte-identity, per-channel gate mute + loudness, all-zero-vector no-op,
-  auto-gate calibration/determinism/checkpoint-meta persistence, optimizer
-  split, state-dict keys, v1↔v2 forward equivalence), the GPT wiring
-  (acts=None ≡ vanilla; optimizer contract; step behavior), and the dial/donor
-  gate (spec grammar, dial→absolute resolution math, dial-0 without the
-  artifact, concept-order refusal, layer requirement, missing-artifact hard
-  error, meta persistence, resume-uses-persisted-absolute, live-source
-  calibrates-before-training, discovery logging, DDP gate-hash identity).
+- `test_injection_sites.py` — config defaults, direction init (incl. `file:`
+  against the real committed manifold), module plumbing, freeze/unfreeze + the
+  optimizability contract, the GPT wiring (acts=None ≡ vanilla; optimizer
+  contract; step behavior), the two-form loudness grammar, `abs:` needing no
+  gemma identity, loudness.json discovery + loud fallback, layer requirement,
+  calibration-precedes-training, name-indexed concepts, DDP hash identity.
+- `test_injection_dose.py` — the site math and its calibration: exact linear
+  dose response, bitwise-zero no-op (sub-threshold/zero/negative), the D row
+  gauge, the sphere gram surviving row normalization, PER-EVENT equalization,
+  `min_events` imputation, dead channels, subset name-indexing, the subset
+  `L_ref`, checkpoint round-trip, and the realized-loudness check (including
+  peek/replay skipping no data).
 - `test_runtime_probe_source.py` — the runtime probe path: `lookup_by_row`
   dequant+standardize+**overlap-align** for BOTH policies (hand-checked
   multi-gemma→one-nano, one-gemma→multi-nano **broadcast**, unmapped→exact-zero,
@@ -654,4 +695,4 @@ rebuffer collective and the multi-stream download bandwidth auto-sizing are
 CPU-tested with fakes/simulated ranks but never against real DDP or a real NIC.
 SMOKE an injected launch first (a few steps, nothing saved): step time within
 ~3% of baseline and the per-site banner must print the expected `r` /
-`after_block` / `gate` / docs count.
+`after_block` / `loudness` / docs count.

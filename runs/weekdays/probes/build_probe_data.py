@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""Phase 1 (pod, once): build the probe training cache from a HELD-OUT scored
-climbmix shard — (nanochat body ids, aligned+thresholded weekday acts) per doc,
-exactly the pairs training injected (same WeekdayProbeScoreSource, prescored
-path; no gemma model needed). Saved to probes/probe_data.pt and shared by every
-arm's trainer.
-
-Run from the nanochat repo root (pod):
-    python runs/weekdays/probes/build_probe_data.py --max-docs 2500
+"""Phase 1 (pod, once): cache (nanochat body ids, aligned+thresholded weekday acts)
+per doc from a HELD-OUT scored shard — the exact pairs training injected (prescored
+path, no gemma model) — into probes/probe_data.pt, shared by every arm's trainer.
+Run from repo root: python runs/weekdays/probes/build_probe_data.py --max-docs 2500
 """
 import argparse
 import importlib.util
@@ -19,6 +15,9 @@ import torch
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 sys.path.insert(0, REPO)
+sys.path.insert(0, os.path.join(REPO, "runs", "lib"))
+
+import concepts as concept_registry  # noqa: E402
 
 
 def _load_by_path(name, path):
@@ -43,7 +42,7 @@ def main():
     ap.add_argument("--out", default=os.path.join(HERE, "probe_data.pt"))
     args = ap.parse_args()
 
-    RE = _load_by_path("_run_evals_probe", os.path.join(REPO, "runs/weekdays/eval/run_evals.py"))
+    RE = _load_by_path("_run_evals_probe", os.path.join(REPO, "runs/lib/eval/run_evals.py"))
 
     from nanochat.tokenizer import get_tokenizer
     from nanochat.injection.sources import _default_gemma_encode
@@ -81,7 +80,7 @@ def main():
             "n_store_miss": n_miss, "bos_id": int(bos_id),
             "threshold": args.threshold, "layer": args.layer,
             "max_tokens": args.max_tokens, "align_policy": "mean",
-            "concepts": list(RE._harness().WEEKDAY_CONCEPTS)}
+            "concepts": list(concept_registry.get_family("weekdays").store_order)}
     torch.save({"docs": docs, "meta": meta}, args.out)
     print(f"[build] {len(docs)} docs, {n_tok} tokens ({n_act} active, "
           f"{meta['active_frac']:.3f}), {n_miss} store-miss -> {args.out}")

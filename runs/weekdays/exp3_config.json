@@ -1,11 +1,12 @@
 {
-  "_comment": "Experiment 3 of the weekday-geometry series: weekday probe-score injection with a FROZEN circle-manifold direction (gemma-L8-calibrated 1-sphere). Passed to scripts/injection_train.py via --activation-config. The SITE differs from exp2 ONLY in the direction: trainable_direction=false and direction_init='file:...' (sites.py 'file:' loader, applied on this branch). The direction rows are in STORE order (friday..wednesday == cols 47..53), matching the source's channel order. The SOURCE block is IDENTICAL to exp2 (shared wiring: WeekdayProbeScoreSource + present_z=2.0 realism threshold + overflow prefetch) via the _open_injection_source 'class'/'kwargs' hook (applied on this branch; 'class' uses the collision-proof FILE-PATH form, resolved from the launch CWD = repo root). Gate abs:0.0273 is an absolute scalar (raw residual-RMS fraction) -- no loudness.json / startup calibration.",
+  "_comment": "Weekday-geometry arm 3/4: same source/site as arm 2 but a FROZEN gemma-L8-calibrated circle-manifold direction.",
+  "_migration": "DOSE-MATH config. The archived CORE numbers for this arm came from the retired constant-amplitude math with gate abs:0.0273; loudness=1.0 targets the same median loudness (dial 1.0 = the median per-concept active loudness over these 7 weekday columns == 0.0273) but the site math differs, so a rerun is NOT comparable to those results.",
   "sites": [
     {
       "name": "weekdays",
       "r": 7,
       "after_block": 3,
-      "gate": "abs:0.0273",
+      "loudness": 1.0,
       "trainable_direction": false,
       "direction_init": "file:runs/weekdays/direction_sphere.npz"
     }
@@ -13,12 +14,23 @@
   "sources": {
     "weekdays": {
       "kind": "probe-scores-runtime",
-      "class": "runs/weekdays/weekday_source.py:WeekdayProbeScoreSource",
-      "kwargs": {"present_z": 2.0},
+      "class": "runs/lib/probe_source.py:ConceptProbeScoreSource",
+      "kwargs": {
+        "present_z": 0.0,
+        "family": "weekdays"
+      },
       "score_shards_dir_or_repo": "kaushikreddyxyz/climbmix-scored",
       "shards": "0-184",
       "layer": 8,
-      "concepts": ["friday", "monday", "saturday", "sunday", "thursday", "tuesday", "wednesday"],
+      "concepts": [
+        "friday",
+        "monday",
+        "saturday",
+        "sunday",
+        "thursday",
+        "tuesday",
+        "wednesday"
+      ],
       "align_policy": "mean",
       "noise_sigma": 0.0,
       "prefetch": {

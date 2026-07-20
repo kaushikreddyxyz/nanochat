@@ -1,11 +1,12 @@
 {
-  "_comment": "Experiment 2 of the weekday-geometry series: weekday probe-score injection with a TRAINABLE direction. Passed to scripts/injection_train.py via --activation-config. The 'class'/'kwargs' fields in the source spec are honored by the _open_injection_source hook (applied on this branch); they wire the WeekdayProbeScoreSource subclass and its realism threshold (present_z=2.0). 'class' uses the collision-proof FILE-PATH form (path/to/file.py:Class, resolved from the launch CWD = repo root) — ALL weekday configs standardize on it (the dotted-module form is env-fragile: an installed PyPI 'runs' package shadows the local runs/ namespace dir). Gate abs:0.0273 is an absolute scalar (raw residual-RMS fraction), so NO loudness.json / startup calibration is involved.",
+  "_comment": "Weekday-geometry arm 2/4: probe-score injection after block 3 with a TRAINABLE direction.",
+  "_migration": "DOSE-MATH config. The archived CORE numbers for this arm came from the retired constant-amplitude math with gate abs:0.0273; loudness=1.0 targets the same median loudness (dial 1.0 = the median per-concept active loudness over these 7 weekday columns == 0.0273) but the site math differs, so a rerun is NOT comparable to those results.",
   "sites": [
     {
       "name": "weekdays",
       "r": 7,
       "after_block": 3,
-      "gate": "abs:0.0273",
+      "loudness": 1.0,
       "trainable_direction": true,
       "direction_init": "orthonormal",
       "direction_seed": 1337,
@@ -15,12 +16,23 @@
   "sources": {
     "weekdays": {
       "kind": "probe-scores-runtime",
-      "class": "runs/weekdays/weekday_source.py:WeekdayProbeScoreSource",
-      "kwargs": {"present_z": 2.0},
+      "class": "runs/lib/probe_source.py:ConceptProbeScoreSource",
+      "kwargs": {
+        "present_z": 0.0,
+        "family": "weekdays"
+      },
       "score_shards_dir_or_repo": "kaushikreddyxyz/climbmix-scored",
       "shards": "0-184",
       "layer": 8,
-      "concepts": ["friday", "monday", "saturday", "sunday", "thursday", "tuesday", "wednesday"],
+      "concepts": [
+        "friday",
+        "monday",
+        "saturday",
+        "sunday",
+        "thursday",
+        "tuesday",
+        "wednesday"
+      ],
       "align_policy": "mean",
       "noise_sigma": 0.0,
       "prefetch": {

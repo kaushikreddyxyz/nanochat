@@ -1,0 +1,45 @@
+{
+  "_comment": "Seasons layer-0 injection, TRAINABLE direction. loudness 1.0 = the donor-native per-concept loudness of these 4 season columns; the site's relu threshold (2.0) does the gating.",
+  "sites": [
+    {
+      "name": "seasons",
+      "r": 4,
+      "after_block": 0,
+      "loudness": 1.0,
+      "trainable_direction": true,
+      "direction_init": "orthonormal",
+      "direction_seed": 1337,
+      "optim": "adamw"
+    }
+  ],
+  "sources": {
+    "seasons": {
+      "kind": "probe-scores-runtime",
+      "class": "runs/lib/probe_source.py:ConceptProbeScoreSource",
+      "kwargs": {"present_z": 0.0, "family": "seasons"},
+      "score_shards_dir_or_repo": "kaushikreddyxyz/climbmix-scored",
+      "shards": "0-184",
+      "layer": 8,
+      "concepts": ["autumn", "spring", "summer", "winter"],
+      "align_policy": "mean",
+      "noise_sigma": 0.0,
+      "prefetch": {
+        "staging_dir": "/workspace/scores_staging",
+        "repos": [
+          "kaushikreddyxyz/climbmix-scored",
+          "kaushikreddyxyz/climbmix-scored-overflow",
+          "kaushikreddyxyz/climbmix-scored-overflow-2",
+          "kaushikreddyxyz/climbmix-scored-overflow-3",
+          "kaushikreddyxyz/climbmix-scored-overflow-4",
+          "kaushikreddyxyz/climbmix-scored-overflow-5",
+          "kaushikreddyxyz/climbmix-scored-overflow-6",
+          "kaushikreddyxyz/climbmix-scored-overflow-7"
+        ],
+        "per_repo": 25,
+        "ahead": 3,
+        "keep_behind": 1,
+        "streams": 4
+      }
+    }
+  }
+}
