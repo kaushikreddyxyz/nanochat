@@ -19,8 +19,8 @@ pre-injection..HEAD`):
 11. **runtime probe-score injection** (`RuntimeProbeScoreSource` /
     `LiveProbeScoreSource`, positional ride-along join, `probe-scores-runtime`
     wiring; the `repackage-probe-scores` skeleton deleted)
-12. **injection-stack amendments** — (1) alignment default = **overlap MEAN**
-    over covering gemma tokens (`align_policy: "mean"|"last"`) + opt-in
+12. **injection-stack amendments** — (1) alignment default = **overlap MAX**
+    over covering gemma tokens (`align_policy: "max"|"mean"|"last"`) + opt-in
     **compact-tokens** mode (`compact.py`, `--compact-tokens`); (2) **staying-ahead**
     metrics + starvation monitor + startup throughput verdict
     (`activation_dataloader.py` stats, `injection_train.py`); (3) **rolling shard
@@ -163,9 +163,30 @@ same token — the multi-family case, e.g. a date token that is winter + january
 the per-channel scale comes out ~`1/sqrt(n)` smaller and the injected total still lands
 on target, instead of `n`-ing up. Multi-family needs no new machinery.
 
-Channels that fire fewer than `--dose-min-events` times in the calibration sample get the
-**median well-measured `E_c`** imputed (unit-consistent — still a `1/E`), logged loudly
-with the count. A channel that never fires gets `channel_scale = 0`.
+### What the calibration sample is allowed to conclude
+
+Under-measured channels get the **median well-measured `E_c`** imputed (unit-consistent —
+still a `1/E`), logged loudly with the count. A channel counts as under-measured when it
+fires in fewer than `--dose-min-channel-docs` **distinct source documents** (default 8)
+*or* fewer than `--dose-min-events` **tokens** (default 50). Documents are the load-bearing
+test: concepts are bursty, so one weekday-heavy document can fire hundreds of times and
+clear a per-token floor on a scale that actually rests on a single document. The token
+count stays in `meta["n_events"]` as a diagnostic.
+
+A channel that never crosses the threshold in the sample is a **hard startup error**.
+`channel_scale = 0` means that concept injects nothing for the entire run — an `r=7` site
+silently becomes `r=6`, which is not the experiment that was configured, and the realized
+check medians across channels so one dead channel barely moves p50. Pass
+`--allow-dead-channels` to accept it deliberately.
+
+The sample itself is drawn from the **lowest `--loudness-calib-shards` shards** (default 4,
+floored at 2) rather than striped across every configured shard. Calibration runs *before*
+the shard prefetcher attaches, so every shard it opens is a full multi-GB download against
+the primary repo on every rank's node, and a shard living in an overflow repo 404s. Striping
+`ceil(k/n)` docs over a handful of shards keeps the `--loudness-k` doc budget while touching
+a fixed, low, primary-resident set; drawing from ≥2 shards keeps one shard's idiosyncrasy
+from setting the run's scale. `injection_train.py` refuses at startup if a source's
+calibration shards map outside the primary repo under its `prefetch.per_repo`.
 
 ### Threshold semantics
 
@@ -219,23 +240,47 @@ duplicated name is a hard error.
 ### Alignment caveat (measured, not assumed)
 
 Calibration samples *pre-alignment* gemma rows; the site sees *post-alignment* nanochat
-rows. `align_policy="mean"` pools covering gemma tokens, and since relu is convex,
-`relu(mean(z)-z0) ≤ mean(relu(z-z0))` — pooling a firing token with sub-threshold
-neighbours drags it under the knee, so the site runs **quieter** than calibration
-predicted. Measured on a synthetic source (fires at 4σ, `z0=2σ`, target 0.03):
+rows, so the pool op moves the realized dose. Measured on a synthetic source (fires at
+4σ, `z0=2σ`, 50% of tokens per channel — a deliberately dense fixture):
 
-| gemma tokens pooled per nanochat token | realized p50 | vs target | dial correction |
-|---|---|---|---|
-| 1 (no pooling) | 0.0300 | +0.0% | 1.00 |
-| 2 | 0.0212 | −29.3% | 1.41 |
-| 4 | 0.0150 | −50.0% | 2.00 |
-| 8 | 0.0106 | −64.6% | 2.83 |
+| gemma tokens pooled per nanochat token | mean: vs target | mean: correction | max: vs target | max: correction |
+|---|---|---|---|---|
+| 1 (no pooling) | +0.0% | 1.00 | +0.0% | 1.00 |
+| 2 | −29.3% | 1.41 | +22.5% | 0.82 |
+| 4 | −50.0% | 2.00 | +41.4% | 0.71 |
+| 8 | −64.6% | 2.83 | +41.4% | 0.71 |
+
+The two errors have **opposite signs and different causes**. `mean` is *dilution*: relu
+is convex, so `relu(mean(z)-z0) ≤ mean(relu(z-z0))` and a firing token pooled with
+sub-threshold neighbours is dragged under the knee. `max` loses no peak at all —
+`relu(max(z)-z0) == max(relu(z-z0))` per channel — but it *concentrates* co-firing:
+pool two gemma tokens that fired on different channels and one nanochat row now has
+both live, and loudness adds in quadrature. That residual scales with firing density,
+so at the realistic rates the real sites run at it is small while `mean` is
+catastrophic (same fixture, magnitudes jittered ±50%):
+
+| per-channel firing rate | row-active frac | depth 2 mean / max | depth 4 mean / max | depth 8 mean / max |
+|---|---|---|---|---|
+| 0.50 | 0.94 | −33.7% / +32.9% | −56.6% / +68.5% | −69.6% / +99.8% |
+| 0.20 | 0.59 | −75.7% / +19.0% | −83.4% / +53.4% | −89.8% / +100.3% |
+| 0.05 | 0.18 | −81.7% / +4.5% | −87.3% / +13.1% | −93.3% / +32.5% |
+| 0.02 | 0.08 | −82.3% / +1.0% | −87.0% / +3.9% | −95.6% / +11.6% |
+
+(The weekday campaign measured a row-active fraction of 0.117, i.e. the bottom two rows.)
 
 `injection_train.py` therefore runs a **realized-loudness check** on the real stream at
 startup: it peeks batches (replayed into training — no data skipped), logs the realized
 ladder beside the calibration and donor ladders, and WARNs with the exact correction
 factor when realized p50 misses the target by more than `--dose-check-tol` (default 25%).
 It never auto-corrects — the dial is the user's decision. Skipped on resume.
+
+Beside the ladder it logs the **pooling-depth distribution** (p50/p90/p99/max and a
+histogram of how many gemma tokens each nanochat token pools, plus the fraction covered by
+no gemma token at all). Depth is the *mechanism* the ladder is the *symptom* of: under
+`max` both the co-firing concentration and the raised false-firing floor
+(`P(fire) = 1 − Φ(z0)^depth`) grow with it, under `mean` the dilution does. Depth 1
+everywhere means neither concern is live for this tokenizer pair; a fat tail means read
+the deviation as real. It is accumulated during alignment, so it costs nothing.
 ## Activation sources (`sources.py`)
 
 The per-token content is called **activations** everywhere user-facing.
@@ -323,13 +368,39 @@ coverage), plus `quant.json`/`corpus_stats.json`/`columns.json`. Per doc:
   then map each nanochat token to the gemma tokens whose **char span OVERLAPS**
   it. A nanochat token nested inside one big gemma token inherits that token's
   score (broadcast); a nanochat token spanning several gemma tokens pools them.
-  `align_policy` (source config, **default `"mean"`**) picks the pool op:
-  - **`"mean"`** (default) averages the covering z-scores. These are standardized
-    scores, so averaging over *k* covering tokens **shrinks variance** — this is
-    the intended semantics (the mean IS the signal); the result is **NOT
-    re-standardized**.
+  `align_policy` (source config, **default `"max"`**) picks the pool op. None of
+  the three re-standardizes.
+  - **`"max"`** (default, standard) takes the **per-channel maximum** over the
+    covering z-scores. The site applies `relu(a − z0)`, so the question a span
+    answers is whether it **contains** the concept, not how concept-y it is on
+    average; max is the pool that makes those two the same question. Concretely,
+    covering z-scores `[4.0, 0.1]` give 4.0 under max (`relu(·−2)` = 2.0) but 2.05
+    under mean (`relu(·−2)` = 0.05, 40× quieter), and a lone firing token keeps its
+    full value at any pool depth. Implemented with `np.maximum.reduceat` over
+    interleaved range starts/ends.
+  - **`"mean"`** averages the covering z-scores. Standardized inputs, so averaging
+    over *k* tokens shrinks variance — which also **dilutes peaks**, and is why it
+    is no longer the default (table above).
   - **`"last"`** keeps only the rightmost covering gemma token (the historical
     behavior for the multi-gemma→one-nano direction), for per-experiment override.
+
+  **The cost of max: a raised noise floor.** The maximum of *k* draws is biased
+  upward (≈`sqrt(2 ln k)` for gaussians), so a nanochat token covering many gemma
+  tokens is likelier to cross `z0=2.0` on background alone. Measured on an N(0,1)
+  source (exact: `1 − Φ(2)^k` for max, `1 − Φ(2√k)` for mean):
+
+  | pool depth *k* | mean: P(fire) | max: P(fire) |
+  |---|---|---|
+  | 1 | 0.0228 | 0.0228 |
+  | 2 | 0.00234 | 0.0450 |
+  | 4 | 0.0000317 | 0.0879 |
+  | 8 | ~8e-9 | 0.1682 |
+
+  So max roughly doubles the per-channel false-firing rate every time pool depth
+  doubles, where mean drove it to zero. Mean's "low false-firing rate" was never a
+  feature — it came from suppressing true firings just as hard (the loudness table
+  above). Max buys peak fidelity and pays in background events; at *r*=7 channels
+  and depth 4, 47.5% of pure-noise rows have at least one channel over threshold.
 
   A nanochat token that overlaps **no** gemma token (a char the gemma tokenizer
   dropped) stays an **exact zero row**. Overlap is causal except in the genuine
@@ -349,7 +420,7 @@ coverage), plus `quant.json`/`corpus_stats.json`/`columns.json`. Per doc:
   gemma passes per doc); sharing the offsets through the loader — and, since
   compact makes alignment 1:1, skipping the source's gemma retokenize entirely —
   is a follow-up. The default path stays standard nanochat tokenization +
-  overlap-mean alignment; core nanochat modules are untouched (the ride-along
+  overlap-max alignment; core nanochat modules are untouched (the ride-along
   loader already accepts an injected tokenizer).
 - **Dequantize + standardize** one layer's columns (`layer` config field,
   default 8; default all 54 in `columns.json` order, or a `concepts` subset)
@@ -503,9 +574,19 @@ python -m scripts.injection_train -- --activation-store <store_dir> \
 One site named `"acts"`: frozen direction pinned to the store's `P.npy` when
 present (else seeded orthonormal via the store's `p_seed`), source opened by
 `meta.json` kind. `--loudness` grammar (dial / `abs:` — see the loudness section
-above); `--loudness-k`/`--loudness-min-docs` tune the sampled calibration,
-`--loudness-json` points the dial at a specific artifact, `--lookup-workers N`
-overlaps runtime scoring with training.
+above); `--loudness-k`/`--loudness-min-docs`/`--loudness-calib-shards` tune the
+sampled calibration, `--loudness-json` points the dial at a specific artifact,
+`--lookup-workers N` overlaps runtime scoring with training.
+
+`--loudness`, `--after-block` and `--noise-sigma` belong to THIS branch only: the
+multi-site form below carries them per site, so passing a non-default value
+alongside `--activation-config` is a hard error rather than a silent no-op.
+
+A `file:` direction whose npz declares its own row order (`store_order` or
+`weekday_store_order` — both spellings exist in the committed artifacts) is
+hard-checked against the site's `concepts` list at startup. Row *i* of `D` is
+concept *i*, so reordering a config's `concepts` would otherwise silently permute
+the geometry.
 
 **General multi-site form**:
 
@@ -536,7 +617,7 @@ length-r list is an absolute per-channel vector); `sources` keys must match site
 names; `FnSource` and `LiveProbeScoreSource` remain programmatic. The `probe-scores-runtime`
 source takes `score_shards_dir_or_repo` (local dir or HF dataset repo),
 `shards`, `layer`, optional `concepts` subset / `climbmix_dir` /
-`index_path` / `build_hash_index`, `align_policy` (`"mean"` default / `"last"`),
+`index_path` / `build_hash_index`, `align_policy` (`"max"` default / `"mean"` / `"last"`),
 and a `prefetch` block (rolling shard prefetch, above). Exactly one of
 `--activation-store`/`--activation-config` is required. The startup banner
 prints each site's source kind, doc coverage, and resolved (incl. calibrated)
@@ -566,6 +647,16 @@ injection_train and `checkpoint_manager.build_model` already do this.
   `injection_sites_config` (+ `injection_source_specs`) in the meta json;
   `checkpoint_manager.build_model` rebuilds the sites from meta so eval
   scripts load them (sites stay dormant — eval is activations-off).
+- A **resume** reuses the persisted `channel_scale` and never re-runs calibration
+  (loudness.json / the shard set may have moved since). The checkpoint's
+  `gate_calibration` record is carried forward into the resumed run's provenance,
+  so later checkpoints keep the dial / `L_ref` / layer / dead-channel count the
+  surviving vector was actually fit under.
+- Persisted calibration is keyed by **site name**. Renaming a site — or warm-starting
+  from a checkpoint whose meta has no `channel_scale` — therefore recalibrates
+  *fresh* against today's artifacts and may not reproduce the vector the checkpoint
+  was trained with. `injection_train.py` says so loudly rather than logging it as a
+  normal first calibration.
 - **Warm-start from a vanilla checkpoint** into an injected run is allowed:
   only `injection_sites.*` keys may be missing (they keep their fresh init).
   Frozen directions leave the optimizer groups identical to vanilla, so the

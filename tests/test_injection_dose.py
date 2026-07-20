@@ -20,10 +20,14 @@ from nanochat.injection.sites import (  # noqa: E402
     InjectionCfg,
     InjectionSite,
     calibrate_dose_gate,
+    ignored_cli_flags,
     loudness_vector_hash,
+    log_pool_depth,
     log_realized_loudness,
     realized_loudness_report,
     reassert_optimizability,
+    resolve_persisted_loudness,
+    validate_direction_file_order,
     build_sites,
 )
 
@@ -261,13 +265,96 @@ def test_all_channels_under_min_events_is_a_hard_error():
                             seed=0, min_events=50, log=lambda *_: None)
 
 
-def test_dead_channel_gets_zero_scale_and_a_loud_log():
+def test_a_dead_channel_is_a_hard_error_at_startup():
+    # A zero channel_scale means that concept injects NOTHING for the whole run: an r=4
+    # site silently becomes r=3. It used to be a log line nothing re-checked.
+    src = _SyntheticSource(rates=[0.5, 0.5, 0.5, 0.0], mags=[1.0, 1.0, 1.0, 1.0])
+    with pytest.raises(RuntimeError, match="never crossed threshold") as e:
+        calibrate_dose_gate(src, _loudness(), _identity_direction(4),
+                            dial=1.0, threshold=2.0, seed=0, log=lambda *_: None)
+    assert "c3" in str(e.value) and "allow-dead-channels" in str(e.value)
+
+
+def test_dead_channel_gets_zero_scale_and_a_loud_log_when_explicitly_allowed():
     src = _SyntheticSource(rates=[0.5, 0.5, 0.5, 0.0], mags=[1.0, 1.0, 1.0, 1.0])
     logs = []
-    scale, meta = calibrate_dose_gate(src, _loudness(), _identity_direction(4),
-                                      dial=1.0, threshold=2.0, seed=0, log=logs.append)
+    scale, meta = calibrate_dose_gate(src, _loudness(), _identity_direction(4), dial=1.0,
+                                      threshold=2.0, seed=0, allow_dead=True, log=logs.append)
     assert scale[3] == 0.0 and meta["n_dead"] == 1
     assert any("DEAD" in m and "c3" in m for m in logs)
+
+
+class _DocSource(_SyntheticSource):
+    """_SyntheticSource that also exposes last_sample_doc_index, and can confine a
+    channel's firing to the first ``burst_docs`` documents (bursty, not rare)."""
+
+    def __init__(self, *a, burst_channel=None, burst_docs=3, **kw):
+        super().__init__(*a, **kw)
+        self.burst_channel, self.burst_docs = burst_channel, burst_docs
+
+    def sample_activation_rows(self, k, seed):
+        rng = np.random.default_rng(seed)
+        per_doc = []
+        for doc in range(min(k, self._n_docs)):
+            z = np.zeros((self._n_per, self.r), np.float32)
+            for c in range(self.r):
+                if c == self.burst_channel and doc >= self.burst_docs:
+                    continue                       # this concept is absent from most docs
+                fire = rng.random(self._n_per) < self.rates[c]
+                z[fire, c] = self._th + abs(self.mags[c])
+            per_doc.append(z)
+        pooled = np.concatenate(per_doc)
+        self.last_sample_doc_index = np.repeat(np.arange(len(per_doc)), self._n_per)
+        return pooled, len(per_doc), pooled.shape[0]
+
+
+def test_min_events_counts_documents_not_tokens_for_a_bursty_channel():
+    # Channel 3 fires on EVERY token of 3 documents: ~120 events, far past min_events=50,
+    # but its scale rests on 3 documents. The per-token test called that well-measured.
+    src = _DocSource(rates=[0.5, 0.5, 0.5, 1.0], mags=[1.0, 2.0, 4.0, 9.0],
+                     burst_channel=3, burst_docs=3, n_docs=64, n_per_doc=40)
+    logs = []
+    _, meta = calibrate_dose_gate(src, _loudness(), _identity_direction(4), dial=1.0,
+                                  threshold=2.0, seed=0, min_events=50, min_channel_docs=8,
+                                  log=logs.append)
+    assert meta["n_events"][3] > 50                      # would have sailed past the token test
+    assert meta["n_channel_docs"][3] == 3                # but only 3 documents back it
+    assert meta["n_imputed"] == 1 and meta["event_rms"][3] == pytest.approx(2.0, rel=1e-6)
+    assert any("min_channel_docs=8" in m and "c3" in m for m in logs)
+    # The well-measured channels are untouched, and the token count survives as a diagnostic.
+    assert meta["n_channel_docs"][:3] == [64, 64, 64] and meta["min_channel_docs"] == 8
+
+
+def test_non_finite_activation_names_the_offending_channel():
+    # One inf column zeroes its own weight (1/inf) and then NaNs EVERY output channel
+    # through u @ d_hat. It used to surface as "injects on 0 of N sampled tokens".
+    src = _SyntheticSource(rates=[0.5] * 4, mags=[1.0] * 4)
+    rows, n_docs, n_tokens = src.sample_activation_rows(256, 0)
+    rows[:, 2] = np.inf
+    src.sample_activation_rows = lambda k, seed: (rows, n_docs, n_tokens)
+    with pytest.raises(ValueError, match="non-finite") as e:
+        calibrate_dose_gate(src, _loudness(), _identity_direction(4), dial=1.0,
+                            threshold=2.0, seed=0, log=lambda *_: None)
+    assert "'c2'" in str(e.value) and "corpus_stats" in str(e.value)
+    assert "threshold" not in str(e.value)               # must not misdiagnose as a knee problem
+
+
+def test_zeros_direction_is_refused_by_name_not_blamed_on_the_threshold():
+    src = _SyntheticSource(rates=[0.5] * 4, mags=[1.0] * 4)
+    zeros = torch.zeros(4, N_EMBD)
+    with pytest.raises(ValueError, match="all-zero direction") as e:
+        calibrate_dose_gate(src, _loudness(), zeros, dial=1.0, threshold=2.0,
+                            seed=0, log=lambda *_: None)
+    assert "direction_init='zeros'" in str(e.value)
+    assert "injects on 0 of" not in str(e.value)         # the old, misleading message
+
+
+def test_short_sample_versus_requested_k_is_logged():
+    src = _SyntheticSource(rates=[0.5] * 4, mags=[1.0] * 4, n_docs=20)
+    logs = []
+    calibrate_dose_gate(src, _loudness(), _identity_direction(4), dial=1.0, threshold=2.0,
+                        k=256, seed=0, min_docs=16, log=logs.append)
+    assert any("sampled 20 docs, 256 requested" in m for m in logs)
 
 
 def test_calibration_is_deterministic_across_simulated_ranks():
@@ -386,12 +473,14 @@ def test_calibration_targets_total_per_token_loudness_not_per_channel(n_cofire):
     rms(u @ D_hat) per token on the REAL firing pattern, so the calibration
     self-corrects for co-firing and multi-family needs no new machinery."""
     d = _identity_direction(4)
+    # allow_dead: this fixture fires only the first n_cofire channels by construction.
     scale, meta = calibrate_dose_gate(_CoFireSource(n_cofire), _loudness(), d, dial=1.0,
-                                      threshold=2.0, seed=0, min_events=1, log=lambda *_: None)
+                                      threshold=2.0, seed=0, min_events=1, allow_dead=True,
+                                      log=lambda *_: None)
     assert meta["injected_loudness"]["p50"] == pytest.approx(meta["target_median"], rel=1e-6)
     # Per-channel scale absorbs the co-firing: it shrinks as 1/sqrt(n) (quadrature).
     single = calibrate_dose_gate(_CoFireSource(1), _loudness(), d, dial=1.0, threshold=2.0,
-                                 seed=0, min_events=1, log=lambda *_: None)[0]
+                                 seed=0, min_events=1, allow_dead=True, log=lambda *_: None)[0]
     assert scale[0] == pytest.approx(single[0] / np.sqrt(n_cofire), rel=1e-6)
 
     # And the SITE reproduces that total on the same rows — not n_cofire x it.
@@ -443,9 +532,15 @@ def test_threshold_vector_of_the_wrong_length_is_refused():
 # --------------------------------------------------------------------------- #
 def _mean_pool_align(rows, k):
     """Collapse each group of k gemma rows into one nanochat row by MEAN — the
-    align_policy='mean' shrinkage that makes calibration under-estimate."""
+    align_policy='mean' peak dilution that makes calibration OVER-estimate the dose."""
     n = (rows.shape[0] // k) * k
     return rows[:n].reshape(-1, k, rows.shape[1]).mean(1)
+
+
+def _max_pool_align(rows, k):
+    """The align_policy='max' default: per-channel maximum over the covering rows."""
+    n = (rows.shape[0] // k) * k
+    return rows[:n].reshape(-1, k, rows.shape[1]).max(1)
 
 
 def test_realized_report_matches_the_site_on_the_same_rows():
@@ -487,6 +582,61 @@ def test_mean_pool_alignment_makes_the_site_quieter_than_calibration_predicted()
     # Sanity: the SAME rows unpooled do hit the target, so pooling is the whole effect.
     assert realized_loudness_report([rows], 2.0, scale, d, meta["target_median"],
                                     min_firing_tokens=10 ** 9)["within_tol"]
+
+
+def test_max_pool_alignment_keeps_the_calibrated_loudness_where_mean_destroys_it():
+    # Why max is the default. relu is monotone, so relu(max(z)-z0) == max(relu(z-z0)):
+    # max-pooling commutes with the knee PER CHANNEL, and a firing gemma token keeps its
+    # full a_eff no matter how many quiet neighbours it is pooled with. Sparse firing
+    # (2%/channel, the realistic regime) so cross-channel co-firing stays rare.
+    src = _SyntheticSource([0.02] * 4, [2.0] * 4, n_docs=200, n_per_doc=200, jitter=0.5)
+    d = _identity_direction(4)
+    scale, meta = calibrate_dose_gate(src, _loudness(), d, dial=1.0, threshold=2.0,
+                                      seed=0, log=lambda *_: None)
+    rows, _, _ = src.sample_activation_rows(200, 0)
+    target = meta["target_median"]
+    for k in (2, 4, 8):
+        rep_max = realized_loudness_report([_max_pool_align(rows, k)], 2.0, scale, d, target,
+                                           min_firing_tokens=10 ** 9)
+        rep_mean = realized_loudness_report([_mean_pool_align(rows, k)], 2.0, scale, d, target,
+                                            min_firing_tokens=10 ** 9)
+        assert rep_max["within_tol"], (k, rep_max["rel_dev"])
+        assert not rep_mean["within_tol"] and rep_mean["rel_dev"] < -0.5, (k, rep_mean["rel_dev"])
+        assert rep_max["realized_p50"] > 4 * rep_mean["realized_p50"], k
+        # Max never loses a peak, so it can only sit AT or ABOVE the calibrated dose.
+        assert rep_max["realized_p50"] >= target * 0.999, (k, rep_max["realized_p50"])
+
+
+def test_max_pool_alignment_overshoots_when_channels_co_fire():
+    # The residual error under max is CONCENTRATION, not dilution: pooling two gemma
+    # tokens that fired on different channels gives one nanochat row with both channels
+    # live, and loudness adds in quadrature. Dense firing makes this the common case —
+    # which is why the realized check stays wired even now that max is the default.
+    src = _SyntheticSource([0.5] * 4, [2.0] * 4)
+    d = _identity_direction(4)
+    scale, meta = calibrate_dose_gate(src, _loudness(), d, dial=1.0, threshold=2.0,
+                                      seed=0, log=lambda *_: None)
+    rows, _, _ = src.sample_activation_rows(256, 0)
+    rep = realized_loudness_report([_max_pool_align(rows, 4)], 2.0, scale, d,
+                                   meta["target_median"], min_firing_tokens=10 ** 9)
+    assert rep["realized_p50"] > meta["target_median"]   # LOUDER, the opposite of mean
+    assert rep["correction"] < 1.0                       # the dial must come DOWN
+    assert not rep["within_tol"]
+
+
+def test_realized_warning_names_both_pooling_directions_not_just_dilution():
+    # The warning text predates max-pooling, when calibration could only OVER-estimate.
+    # Under max it can miss either way, and the operator acts on this string.
+    d = _identity_direction(4)
+    rows = np.full((2000, 4), 4.0, np.float32)
+    rep = realized_loudness_report([rows], 2.0, [1.0, 0.0, 0.0, 0.0], d, 0.005,
+                                   min_firing_tokens=10 ** 9)
+    logs = []
+    log_realized_loudness(rep, "acts", None, None, logs.append)
+    joined = "\n".join(logs)
+    assert rep["realized_p50"] > rep["target"] and rep["correction"] < 1.0
+    assert "max concentrates co-firing UP" in joined and "mean dilutes peaks DOWN" in joined
+    assert "mean(relu) >= relu(mean)" not in joined       # the retired mean-only claim
 
 
 def test_realized_check_warns_loudly_and_reports_a_correction_without_applying_it():
@@ -635,3 +785,103 @@ def test_dose_gradients_reach_a_trainable_direction_but_not_the_scale():
     s(x, a).sum().backward()
     assert s.direction.grad is not None and s.direction.grad.abs().sum() > 0
     assert s.channel_scale.grad is not None      # loggable want-signal, never stepped
+
+
+# --------------------------------------------------------------------------- #
+# Startup guards: file: direction row identity, silently-ignored CLI flags, and
+# the resume/warm-start split of persisted calibration.
+# --------------------------------------------------------------------------- #
+def test_direction_file_row_order_must_equal_the_sites_concepts(tmp_path):
+    # The npz carries the answer and nothing read it: initial_direction checks SHAPE
+    # only, so reordering a config's `concepts` silently permutes the geometry.
+    p = tmp_path / "d.npz"
+    order = ["autumn", "spring", "summer", "winter"]
+    np.savez(p, D=np.zeros((4, N_EMBD), np.float32), store_order=np.array(order))
+    assert validate_direction_file_order(f"file:{p}", order, "seasons") == "store_order"
+    with pytest.raises(ValueError, match="row order") as e:
+        validate_direction_file_order(f"file:{p}", ["spring", "autumn", "summer", "winter"], "seasons")
+    assert "silently attaches" in str(e.value)
+
+
+def test_direction_file_order_handles_both_spellings_and_missing_keys(tmp_path):
+    # The two committed artifacts disagree: weekdays says "weekday_store_order",
+    # seasons says "store_order". Both must be honoured.
+    wk = tmp_path / "w.npz"
+    np.savez(wk, D=np.zeros((2, N_EMBD), np.float32),
+             weekday_store_order=np.array(["monday", "tuesday"]))
+    assert validate_direction_file_order(f"file:{wk}", ["monday", "tuesday"], "w") == \
+        "weekday_store_order"
+    with pytest.raises(ValueError, match="row order"):
+        validate_direction_file_order(f"file:{wk}", ["tuesday", "monday"], "w")
+    # No declared order, and non-file inits, are silently fine (nothing to check).
+    bare = tmp_path / "b.npz"
+    np.savez(bare, D=np.zeros((2, N_EMBD), np.float32))
+    assert validate_direction_file_order(f"file:{bare}", ["monday", "tuesday"], "b") is None
+    assert validate_direction_file_order("orthonormal", ["monday", "tuesday"], "b") is None
+
+
+def test_the_real_committed_direction_artifacts_match_their_arm_configs():
+    for cfg_path, npz in (("runs/weekdays/exp3_config.json", "weekday_store_order"),
+                          ("runs/seasons/exp_sphere_L0.json", "store_order")):
+        with open(os.path.join(REPO, cfg_path)) as f:
+            spec = json.load(f)
+        site = spec["sites"][0]
+        concepts = spec["sources"][site["name"]]["concepts"]
+        prev = os.getcwd()
+        os.chdir(REPO)                     # file: paths resolve from the launch CWD
+        try:
+            assert validate_direction_file_order(site["direction_init"], concepts,
+                                                 site["name"]) == npz
+        finally:
+            os.chdir(prev)
+
+
+def test_activation_config_refuses_flags_it_would_silently_ignore():
+    import types
+    defaults = {"loudness": "1.0", "after_block": 7, "noise_sigma": 0.15, "seed": 1337}
+    names = ("loudness", "after_block", "noise_sigma")
+    assert ignored_cli_flags(types.SimpleNamespace(**defaults), defaults, names) == []
+    args = types.SimpleNamespace(**{**defaults, "loudness": "2.0", "noise_sigma": 0.0})
+    assert ignored_cli_flags(args, defaults, names) == ["--loudness='2.0'", "--noise-sigma=0.0"]
+
+
+def test_resume_carries_the_gate_calibration_record_forward():
+    # The vector survived a resume but its provenance did not: _loudness_provenance was
+    # only written inside the calibration loop, so later checkpoints saved {} and the
+    # log printed mode=None dial=None L_ref=None.
+    prov = {"mode": "dial", "dial": 1.0, "L_ref": 0.0273, "layer": 8, "n_dead": 0}
+    meta = {"injection_sites_config": [{"name": "weekdays", "channel_scale": [0.5] * 7,
+                                        "threshold": 2.0}],
+            "gate_calibration": {"weekdays": prov}}
+    reused, warm = resolve_persisted_loudness(meta, ["weekdays"])
+    assert warm == [] and reused["weekdays"]["channel_scale"] == [0.5] * 7
+    assert reused["weekdays"]["threshold"] == 2.0
+    assert reused["weekdays"]["provenance"] == prov          # not {}
+    # A checkpoint with the vector but no record still resumes; provenance is just empty.
+    del meta["gate_calibration"]
+    assert resolve_persisted_loudness(meta, ["weekdays"])[0]["weekdays"]["provenance"] == {}
+
+
+def test_warm_start_and_renamed_sites_are_reported_as_needing_fresh_calibration():
+    meta = {"injection_sites_config": [{"name": "weekdays", "channel_scale": [0.5] * 7}],
+            "gate_calibration": {"weekdays": {"mode": "dial"}}}
+    # Renaming a site makes its persisted calibration unreachable — it is keyed by NAME.
+    reused, warm = resolve_persisted_loudness(meta, ["weekdays_v2"])
+    assert reused == {} and warm == ["weekdays_v2"]
+    # A vanilla checkpoint carries no sites at all.
+    assert resolve_persisted_loudness({}, ["weekdays"]) == ({}, ["weekdays"])
+    # And a site whose entry exists but has no scale must not be treated as resumable.
+    assert resolve_persisted_loudness(
+        {"injection_sites_config": [{"name": "s", "channel_scale": None}]}, ["s"]) == ({}, ["s"])
+
+
+def test_pool_depth_report_surfaces_the_distribution_and_survives_no_data():
+    logs = []
+    log_pool_depth({"n_tokens": 1000, "p50": 1, "p90": 2, "p99": 4, "max": 9, "mean": 1.37,
+                    "zero_coverage_rate": 0.01, "hist": {1: 800, 2: 150, 4: 50}}, "acts", logs.append)
+    joined = "\n".join(logs)
+    assert "p50=1" in joined and "p99=4" in joined and "max=9" in joined
+    assert "80.00%" in joined and "1.00% covered by no gemma token" in joined
+    logs.clear()
+    log_pool_depth(None, "acts", logs.append)
+    assert "no aligned tokens" in logs[0]

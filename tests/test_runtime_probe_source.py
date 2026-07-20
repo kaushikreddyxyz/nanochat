@@ -7,6 +7,8 @@ drives the REAL code path:
   [A] RuntimeProbeScoreSource.lookup_by_row alignment: dequant+standardize +
       prefix align gemma->nanochat, with hand-checkable multi-gemma->one-nano and
       one-gemma->multi-nano cases, unmapped->exact-zero, and drift/miss->None.
+  [A2] why align_policy='max' is the default: peak preservation vs mean's dilution,
+      and the noise floor it costs.
   [B] positional join == content-hash join (the (shard,row) keying is exact).
   [C] the ride-along loader's (shard,row) cursor drives lookup_by_row correctly.
   [D] LiveProbeScoreSource with a stub score_fn; gate='auto' unsupported.
@@ -15,6 +17,7 @@ drives the REAL code path:
 Standalone: `python tests/test_runtime_probe_source.py`.
 """
 import json
+import math
 import os
 import re
 import sys
@@ -112,18 +115,23 @@ with open(os.path.join(STORE, "docs_00000.jsonl"), "w") as f:
         _off += n
 
 enc = FakeNanoEnc()
-# Amendment 1: MEAN over covering gemma tokens is the DEFAULT; 'last' is opt-in.
+# Per-channel MAX over covering gemma tokens is the DEFAULT (the site's relu asks
+# whether the span CONTAINS the concept); 'mean' and 'last' are opt-in.
 SRC = RuntimeProbeScoreSource(STORE, shards=[0], layer=8, nano_enc=enc,
                               gemma_encode=char_gemma_encode, noise_sigma=0.0)
+SRC_MEAN = RuntimeProbeScoreSource(STORE, shards=[0], layer=8, nano_enc=FakeNanoEnc(),
+                                   gemma_encode=char_gemma_encode, noise_sigma=0.0,
+                                   align_policy="mean")
 SRC_LAST = RuntimeProbeScoreSource(STORE, shards=[0], layer=8, nano_enc=FakeNanoEnc(),
                                    gemma_encode=char_gemma_encode, noise_sigma=0.0,
                                    align_policy="last")
-check(SRC.align_policy == "mean", "default align_policy is 'mean'")
+check(SRC.align_policy == "max", "default align_policy is 'max'")
 
 
-def _expected(text, policy="mean"):
+def _expected(text, policy="max"):
     """Reference: each nano token's covering set = gemma tokens whose CHAR SPAN
-    OVERLAPS it; 'mean' averages them, 'last' takes the rightmost; no overlap -> 0."""
+    OVERLAPS it; 'max' takes the per-channel maximum, 'mean' averages them, 'last'
+    takes the rightmost; no overlap -> 0."""
     nano_ids = enc.encode_ordinary(text)
     nano_off = np.asarray(nanochat_char_offsets(enc, nano_ids, text), np.int64)
     g_ids, g_off = char_gemma_encode(text)
@@ -137,15 +145,18 @@ def _expected(text, policy="mean"):
         cov = [gi for gi, (gs, ge) in enumerate(g_off) if ge > gs and gs < ne and ge > ns]
         if not cov:
             continue
-        out[i] = zg[cov[-1]] if policy == "last" else zg[cov].mean(0)
+        out[i] = {"last": zg[cov[-1]], "mean": zg[cov].mean(0)}.get(policy, zg[cov].max(0))
     return out, len(nano_ids)
 
 
 # --------------------------------------------------------------------------- #
-print("\n[A] lookup_by_row overlap alignment + standardization (mean default + last)")
+print("\n[A] lookup_by_row overlap alignment + standardization (max default + mean + last)")
 for di, text in enumerate(DOCS):
-    exp_m, n_nano = _expected(text, "mean")
-    got_m, key = SRC.lookup_by_row(0, di, text, n_nano)
+    exp_x, n_nano = _expected(text, "max")
+    got_x, key = SRC.lookup_by_row(0, di, text, n_nano)
+    check(got_x is not None and np.array_equal(got_x, exp_x), f"doc {di!r} MAX rows match reference")
+    exp_m, _ = _expected(text, "mean")
+    got_m, _ = SRC_MEAN.lookup_by_row(0, di, text, n_nano)
     check(got_m is not None and np.allclose(got_m, exp_m, atol=1e-6), f"doc {di!r} MEAN rows match reference")
     exp_l, _ = _expected(text, "last")
     got_l, _ = SRC_LAST.lookup_by_row(0, di, text, n_nano)
@@ -155,15 +166,18 @@ for di, text in enumerate(DOCS):
 # hand-checked: "ab cd" nano ["ab"," ","cd"] -> gemma chars a,b,c,d (z=1,2,3,4).
 # overlap sets: "ab"@(0,2) covers {a,b}; " "@(2,3) covers NONE (whitespace char, gemma
 # dropped it) -> zero; "cd"@(3,5) covers {c,d}.
-gm, _ = SRC.lookup_by_row(0, 0, "ab cd", 3)
+gx, _ = SRC.lookup_by_row(0, 0, "ab cd", 3)
+check(np.array_equal(gx, np.array([[2] * K, [0] * K, [4] * K], np.float32)),
+      "MAX: 'ab'->max(a,b)=2, ' '->0 (no overlap), 'cd'->max(c,d)=4")
+gm, _ = SRC_MEAN.lookup_by_row(0, 0, "ab cd", 3)
 check(np.allclose(gm, np.array([[1.5] * K, [0] * K, [3.5] * K], np.float32)),
       "MEAN: 'ab'->mean(a,b)=1.5, ' '->0 (no overlap), 'cd'->mean(c,d)=3.5")
 gl, _ = SRC_LAST.lookup_by_row(0, 0, "ab cd", 3)
 check(np.array_equal(gl, np.array([[2] * K, [0] * K, [4] * K], np.float32)),
       "LAST: 'ab'->b=2, ' '->0, 'cd'->d=4 (rightmost overlapping gemma)")
-# " x" nano [" ","x"]; leading space overlaps NO gemma -> exact zero row (both policies)
-gx, _ = SRC.lookup_by_row(0, 1, " x", 2)
-check(np.array_equal(gx[0], np.zeros(K, np.float32)) and not np.array_equal(gx[1], np.zeros(K, np.float32)),
+# " x" nano [" ","x"]; leading space overlaps NO gemma -> exact zero row (every policy)
+gz, _ = SRC.lookup_by_row(0, 1, " x", 2)
+check(np.array_equal(gz[0], np.zeros(K, np.float32)) and not np.array_equal(gz[1], np.zeros(K, np.float32)),
       "unmapped nanochat token (no overlapping gemma) -> EXACT zero row")
 
 # nested broadcast: ONE big gemma token spanning 3 nano tokens -> all three inherit it
@@ -184,7 +198,7 @@ json.dump({"mean": [[0.0] * K for _ in LAYERS], "std": [[1.0] * K for _ in LAYER
 sc1 = np.zeros((1, 3, K), np.int8); sc1[0, 1, :] = 7   # single gemma token, z=7
 np.save(os.path.join(STORE1, "scores_00000.npy"), sc1)
 open(os.path.join(STORE1, "docs_00000.jsonl"), "w").write(json.dumps({"doc": 0, "start": 0, "n": 1}) + "\n")
-for pol in ("mean", "last"):
+for pol in ("max", "mean", "last"):
     s1 = RuntimeProbeScoreSource(STORE1, shards=[0], layer=8, nano_enc=WordNano2(),
                                  gemma_encode=one_gemma_encode, noise_sigma=0.0, align_policy=pol)
     g1, _ = s1.lookup_by_row(0, 0, "XYZABC", 3)
@@ -197,6 +211,63 @@ check(SRC.lookup_by_row(0, 999, "ab cd", 3)[0] is None, "row out of range -> Non
 check(SRC.lookup_by_row(7, 0, "ab cd", 3)[0] is None, "shard not configured -> None")
 st = SRC.stats()
 check(st["miss_row"] >= 1 and st["miss_shard"] >= 1 and st["drift"] >= 1, f"fallbacks counted: {st}")
+
+
+# --------------------------------------------------------------------------- #
+print("\n[A2] MAX pooling preserves peaks (the reason it is the default)")
+# The site applies relu(a - z0), so a span's CONCEPT PRESENCE is what matters, not
+# its average concept-ness. Live backend used here so the z-scores are exact floats
+# (no int8 quantization between the fixture and the assertion).
+
+
+def _peak_score_fn(rows):
+    """score_fn factory: one doc, one raw z per gemma token, broadcast over columns."""
+    def fn(texts):
+        assert len(texts) == 1
+        raw = np.zeros((len(rows), len(LAYERS), K), np.float32)
+        raw[:, 1, :] = np.asarray(rows, np.float32)[:, None]     # axis1 index 1 == L8
+        return [raw]
+    return fn
+
+
+def _pool(rows, text, policy):
+    src = LiveProbeScoreSource(_peak_score_fn(rows), STORE, layer=8, nano_enc=FakeNanoEnc(),
+                               gemma_encode=char_gemma_encode, align_policy=policy)
+    return src.lookup(text, 1)[0][0]        # (1, K) -> the single nano token's row
+
+
+# "xy" = 2 gemma chars under 1 nano token; z = [4.0, 0.1].
+check(np.allclose(_pool([4.0, 0.1], "xy", "max"), 4.0),
+      "MAX keeps the peak: [4.0, 0.1] -> 4.0 (relu(a-2) fires at 2.0)")
+check(np.allclose(_pool([4.0, 0.1], "xy", "mean"), 2.05),
+      "MEAN dilutes it: [4.0, 0.1] -> 2.05 (relu(a-2) fires at 0.05 — 40x quieter)")
+# k covering gemma tokens, exactly one firing: max is invariant in k, mean decays as 1/k.
+for k in (2, 4, 8):
+    rows = [0.1] * k
+    rows[k // 2] = 4.0
+    text = "abcdefgh"[:k]
+    check(np.allclose(_pool(rows, text, "max"), 4.0),
+          f"k={k}: one strong gemma token keeps its FULL value under max")
+    check(np.allclose(_pool(rows, text, "mean"), sum(rows) / k),
+          f"k={k}: mean drags it to {sum(rows) / k:.4f}")
+# Per-channel, not per-row: the max is taken independently in each column.
+_raw = np.zeros((2, len(LAYERS), K), np.float32)
+_raw[0, 1] = [5.0, 0.0, 3.0, 0.0]
+_raw[1, 1] = [0.0, 6.0, 0.0, 1.0]
+_mixed = LiveProbeScoreSource(lambda texts: [_raw], STORE, layer=8, nano_enc=FakeNanoEnc(),
+                              gemma_encode=char_gemma_encode)
+check(np.array_equal(_mixed.lookup("xy", 1)[0][0], np.array([5.0, 6.0, 3.0, 1.0], np.float32)),
+      "MAX is per-channel: each column takes its own covering maximum")
+
+# The price: max over k draws is biased upward, so background crosses z0 more often.
+# Locks the noise-floor table in nanochat/injection/README.md to its closed form.
+_PHI2 = 0.5 * math.erfc(-2.0 / math.sqrt(2.0))              # P(N(0,1) <= 2)
+_rng = np.random.default_rng(0)
+for _k, _want in ((1, 0.0228), (2, 0.0450), (4, 0.0879), (8, 0.1682)):
+    _exact = 1.0 - _PHI2 ** _k
+    _emp = float((_rng.standard_normal((400_000, _k)).max(1) > 2.0).mean())
+    check(abs(_exact - _want) < 5e-4 and abs(_emp - _exact) < 3e-3,
+          f"noise floor under max, k={_k}: {_exact:.4f} (README) vs {_emp:.4f} sampled")
 
 
 # --------------------------------------------------------------------------- #
@@ -329,10 +400,10 @@ def stub_score_fn(texts):
 
 LIVE = LiveProbeScoreSource(stub_score_fn, STORE, layer=8, nano_enc=FakeNanoEnc(),
                             gemma_encode=char_gemma_encode)
-# "ab cd": live per-doc gemma z = [1,2,3,4]; overlap-mean -> ['ab'->1.5, ' '->0, 'cd'->3.5]
+# "ab cd": live per-doc gemma z = [1,2,3,4]; overlap-max -> ['ab'->2, ' '->0, 'cd'->4]
 lv, _ = LIVE.lookup("ab cd", 3)
-check(np.allclose(lv, np.array([[1.5] * K, [0] * K, [3.5] * K], np.float32)),
-      "live backend aligns on-the-fly scores identically to the stored backend (mean)")
+check(np.array_equal(lv, np.array([[2] * K, [0] * K, [4] * K], np.float32)),
+      "live backend aligns on-the-fly scores identically to the stored backend (max default)")
 LIVE_L = LiveProbeScoreSource(stub_score_fn, STORE, layer=8, nano_enc=FakeNanoEnc(),
                               gemma_encode=char_gemma_encode, align_policy="last")
 lvl, _ = LIVE_L.lookup("ab cd", 3)
@@ -436,7 +507,7 @@ finally:
     os.chdir(_prev_cwd)
 
 # behavioral: a source-level present_z zeroes post-alignment rows whose max z falls
-# under it, EXACTLY (>= is kept verbatim). "ab cd" mean-aligns to rows [1.5, 0, 3.5] per
+# under it, EXACTLY (>= is kept verbatim). "ab cd" max-aligns to rows [2, 0, 4] per
 # channel (section [A]). Set explicitly here, NOT read from a config: the dose configs
 # ship present_z=0 because the site's relu thresholds instead, but the row-gate behavior
 # is still part of the source's contract.
@@ -450,14 +521,14 @@ try:
         return _cls2(STORE, [0], layer=8, nano_enc=FakeNanoEnc(),
                      gemma_encode=char_gemma_encode, noise_sigma=0.0, present_z=present_z)
 
-    _wsrc, _wsrc_cfg = _mk(2.0), _mk(float(_spec2["kwargs"]["present_z"]))
+    _wsrc, _wsrc_cfg = _mk(3.0), _mk(float(_spec2["kwargs"]["present_z"]))
 finally:
     os.chdir(_prev_cwd)
 _wz, _ = _wsrc.lookup_by_row(0, 0, "ab cd", 3)
-check(np.array_equal(_wz, np.array([[0] * K, [0] * K, [3.5] * K], np.float32)),
-      "present_z=2.0 zeroes rows with max z < 2.0 and keeps rows >= 2.0 verbatim")
+check(np.array_equal(_wz, np.array([[0] * K, [0] * K, [4] * K], np.float32)),
+      "present_z=3.0 zeroes rows with max z < 3.0 and keeps rows >= 3.0 verbatim")
 _wz0, _ = _wsrc_cfg.lookup_by_row(0, 0, "ab cd", 3)
-check(np.array_equal(_wz0, np.array([[1.5] * K, [0] * K, [3.5] * K], np.float32)),
+check(np.array_equal(_wz0, np.array([[2] * K, [0] * K, [4] * K], np.float32)),
       "the config's present_z=0 passes every aligned row through untouched")
 
 
@@ -468,3 +539,91 @@ if __name__ == "__main__":
 
 def test_runtime_probe_source():
     assert not fails, f"{len(fails)} failures: {fails}"
+
+
+# --------------------------------------------------------------------------- #
+# [F] Calibration sampling must stay inside a BOUNDED, LOW set of shards.
+# Calibration runs before _attach_prefetchers, so each shard it opens is a real
+# ~GB download against the PRIMARY repo — and shards past per_repo live in
+# overflow repos that 404. Striping one doc per shard walked all 185.
+# --------------------------------------------------------------------------- #
+def _multi_shard_store(n_shards, docs_per_shard=40):
+    """A store with ``n_shards`` shards; every doc is the single gemma token "z"."""
+    d = tempfile.mkdtemp(prefix="calib_shards_")
+    json.dump({"concepts": CONCEPTS, "layers": LAYERS, "families": {c: "fam" for c in CONCEPTS}},
+              open(os.path.join(d, "columns.json"), "w"))
+    json.dump({"zero": [[0.0] * K for _ in LAYERS], "scale": [[1.0] * K for _ in LAYERS]},
+              open(os.path.join(d, "quant.json"), "w"))
+    json.dump({"mean": [[0.0] * K for _ in LAYERS], "std": [[1.0] * K for _ in LAYERS]},
+              open(os.path.join(d, "corpus_stats.json"), "w"))
+    for sid in range(n_shards):
+        sc = np.full((docs_per_shard, len(LAYERS), K), (sid % 100) + 1, np.int8)
+        np.save(os.path.join(d, f"scores_{sid:05d}.npy"), sc)
+        with open(os.path.join(d, f"docs_{sid:05d}.jsonl"), "w") as f:
+            for row in range(docs_per_shard):
+                f.write(json.dumps({"doc": row, "start": row, "n": 1}) + "\n")
+    return d
+
+
+class _CountingSource(RuntimeProbeScoreSource):
+    """Records every shard whose files were actually opened (the download surface)."""
+
+    def _shard_file(self, sid, name):
+        self.opened = getattr(self, "opened", set()) | {sid}
+        return super()._shard_file(sid, name)
+
+
+def _calib_source(n_shards=185, **kw):
+    return _CountingSource(_multi_shard_store(n_shards), shards=list(range(n_shards)), layer=8,
+                           nano_enc=FakeNanoEnc(), gemma_encode=char_gemma_encode,
+                           noise_sigma=0.0, **kw)
+
+
+def test_calibration_sampling_touches_only_a_bounded_shard_set():
+    src = _calib_source(185, n_calib_shards=4)
+    rows, n_docs, n_tokens = src.sample_activation_rows(256, seed=0)
+    assert src.opened <= {0, 1, 2, 3}, f"calibration opened {sorted(src.opened)}"
+    assert src.last_sample_shards == [0, 1, 2, 3]
+    assert n_docs == 160 and rows.shape == (160, K)   # 4 shards x 40 docs, capped by supply
+
+
+def test_calibration_meets_the_requested_doc_budget():
+    # The old `per = k // n_shards` gave per=1 for k=256/185 shards: n_docs never
+    # reached k, so --loudness-k was silently ignored and you got n_shards docs.
+    src = _calib_source(185, n_calib_shards=4)
+    _, n_docs, _ = src.sample_activation_rows(64, seed=0)
+    assert n_docs == 64, "--loudness-k must be honoured, not floored to the shard count"
+    assert len(src.opened) <= 4
+
+
+def test_calibration_sample_spans_at_least_two_shards():
+    src = _calib_source(185, n_calib_shards=4)
+    src.sample_activation_rows(8, seed=0)
+    assert len(src.last_sample_shards) >= 2, "one shard's idiosyncrasy must not set the run's scale"
+    # n_calib_shards is floored at 2 for the same reason, even if a config asks for 1.
+    assert _calib_source(185, n_calib_shards=1).n_calib_shards == 2
+
+
+def test_calibration_rows_carry_their_source_document_index():
+    src = _calib_source(8, n_calib_shards=4)
+    rows, n_docs, _ = src.sample_activation_rows(32, seed=0)
+    di = src.last_sample_doc_index
+    assert di.shape == (rows.shape[0],) and len(np.unique(di)) == n_docs
+
+
+# --------------------------------------------------------------------------- #
+# [G] Pooling depth: the mechanism behind any realized-vs-calibrated gap.
+# --------------------------------------------------------------------------- #
+def test_pool_depth_distribution_is_recorded_during_alignment():
+    src = RuntimeProbeScoreSource(STORE, shards=[0], layer=8, nano_enc=FakeNanoEnc(),
+                                  gemma_encode=char_gemma_encode, noise_sigma=0.0)
+    assert src.pool_depth_stats() is None            # nothing aligned yet
+    # "ab cd" -> nano ["ab", " ", "cd"]; the char-gemma stand-in skips whitespace, so
+    # "ab" pools 2 gemma chars, " " pools none (exact-zero row), "cd" pools 2.
+    src.lookup_by_row(0, 0, "ab cd", 3)
+    st = src.pool_depth_stats()
+    assert st["n_tokens"] == 3 and st["max"] == 2
+    assert st["hist"] == {0: 1, 2: 2} and st["zero_coverage_rate"] == 1 / 3
+    assert st["mean"] == (0 + 2 + 2) / 3
+    src.lookup_by_row(0, 3, "single", 1)             # 6 chars -> one nano token, depth 6
+    assert src.pool_depth_stats()["max"] == 6 and src.pool_depth_stats()["n_tokens"] == 4

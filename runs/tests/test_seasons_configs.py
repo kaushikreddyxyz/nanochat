@@ -48,7 +48,7 @@ def test_source_columns_are_the_registry_store_order(arm):
     assert src["concepts"] != list(SEASONS.cycle_order)
     assert src["layer"] == 8
     assert src["kind"] == "probe-scores-runtime"
-    assert src["align_policy"] == "mean" and src["noise_sigma"] == 0.0
+    assert src["align_policy"] == "max" and src["noise_sigma"] == 0.0
 
 
 def test_source_wires_the_shared_library_class(arm):

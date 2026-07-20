@@ -38,7 +38,9 @@ from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
 from nanochat.injection.sites import (InjectionCfg, reassert_optimizability, classify_loudness_spec,
                                        discover_loudness_json, assert_loudness_identical_across_ranks,
                                        calibrate_dose_gate, initial_direction,
-                                       realized_loudness_report, log_realized_loudness)
+                                       realized_loudness_report, log_realized_loudness,
+                                       validate_direction_file_order, log_pool_depth,
+                                       ignored_cli_flags, resolve_persisted_loudness)
 from nanochat.injection.sources import open_store, RuntimeProbeScoreSource, load_source_class
 from nanochat.injection.activation_dataloader import acts_data_loader_buffered
 from nanochat.injection.buffering import coordinate_rebuffer, duty_cycle_forecast, rebuffer_progress, shard_cover_seconds, size_prefetch_streams
@@ -106,15 +108,18 @@ parser.add_argument("--after-block", type=int, default=7, help="0-based block in
 parser.add_argument("--loudness", type=str, default="1.0", help="Site loudness. A plain number is a DIAL in donor units: dial 1.0 means the median firing event injects at gemma's own median PER-CONCEPT active loudness for this site's concepts (loudness.json ridge.active_loudness[L].p50, medianed over the site's subset — NOT subspace_total, which is the whole 54-concept packet and would over-inject an r-concept site by ~sqrt(54/r)). Requires loudness.json + a source gemma layer. Escape hatch: 'abs:<n>' sets that median directly as a fraction of residual RMS (no loudness.json needed).")
 parser.add_argument("--loudness-k", type=int, default=256, help="docs sampled (seeded) for loudness calibration")
 parser.add_argument("--loudness-min-docs", type=int, default=16, help="fail calibration if the source yields fewer sample docs than this")
+parser.add_argument("--loudness-calib-shards", type=int, default=4, help="shards the calibration sample is drawn from (lowest-numbered first). Calibration runs BEFORE the shard prefetcher attaches, so each shard here is a full download against the PRIMARY repo — keep it small and primary-resident. Minimum 2, so the sample is never one shard's idiosyncrasy.")
 parser.add_argument("--dose-min-events", type=int, default=50, help="a channel firing fewer times than this in the calibration sample gets the median well-measured E_c imputed (logged loudly)")
+parser.add_argument("--dose-min-channel-docs", type=int, default=8, help="a channel firing in fewer DISTINCT calibration DOCUMENTS than this gets the median well-measured E_c imputed. Documents, not tokens, are the independent samples: a bursty concept can clear --dose-min-events inside 3 documents.")
+parser.add_argument("--allow-dead-channels", action="store_true", help="permit channels that never crossed the threshold in the calibration sample (channel_scale 0 = that concept injects NOTHING all run, silently shrinking the site's effective r). Default is a hard error at startup.")
 parser.add_argument("--dose-check-tokens", type=int, default=50000, help="firing tokens to measure for the post-alignment realized-loudness check (0 disables). Batches are peeked and replayed — no training data is skipped.")
 parser.add_argument("--dose-check-tol", type=float, default=0.25, help="warn if realized median injected loudness deviates from dial x L_ref by more than this fraction")
 parser.add_argument("--dose-check-max-batches", type=int, default=32, help="cap on batches peeked for the realized-loudness check (bounds the replay buffer if the firing rate is very low)")
 parser.add_argument("--loudness-json", type=str, default="", help="dial/donor gates: loudness.json location (local file/dir OR HF dataset repo id). Empty = the source's own store root, else fall back to kaushikreddyxyz/climbmix-scored (logged loudly; unavailable = hard error).")
 parser.add_argument("--lookup-workers", type=int, default=0, help="threads for per-doc activation lookups in the ride-along loader (0=serial); overlaps runtime gemma scoring with training")
 parser.add_argument("--noise-sigma", type=float, default=0.15, help="gaussian noise std on standardized activations at load time, deterministic per doc-content hash; 0 disables")
-parser.add_argument("--activation-config", type=str, default="", help="JSON for the multi-site form: {\"sites\": [InjectionCfg dicts], \"sources\": {site: {\"kind\": \"qwen-encoder\"|\"probe-scores\", \"dir\": ..., \"noise_sigma\": ..., \"align_policy\": \"mean\"|\"last\"}}}; mutually exclusive with --activation-store. See nanochat/injection/README.md")
-parser.add_argument("--compact-tokens", action="store_true", help="OPT-IN: cut nanochat tokens at gemma boundaries so each nests in one gemma token (needs a probe-scores-runtime source). CHANGES the training token stream (inflates token count) — not baseline-comparable. Default OFF (standard tokenization + overlap-mean alignment).")
+parser.add_argument("--activation-config", type=str, default="", help="JSON for the multi-site form: {\"sites\": [InjectionCfg dicts], \"sources\": {site: {\"kind\": \"qwen-encoder\"|\"probe-scores\", \"dir\": ..., \"noise_sigma\": ..., \"align_policy\": \"max\"|\"mean\"|\"last\"}}}; mutually exclusive with --activation-store. See nanochat/injection/README.md")
+parser.add_argument("--compact-tokens", action="store_true", help="OPT-IN: cut nanochat tokens at gemma boundaries so each nests in one gemma token (needs a probe-scores-runtime source). CHANGES the training token stream (inflates token count) — not baseline-comparable. Default OFF (standard tokenization + overlap-max alignment).")
 # Staying-ahead guarantees (Amendment 2): the activation source must keep up with training.
 parser.add_argument("--starvation-threshold", type=float, default=0.15, help="warn if time-blocked-waiting-on-activations exceeds this fraction of step time over the window")
 parser.add_argument("--starvation-window", type=int, default=50, help="rolling window (steps) for the blocked-fraction starvation check")
@@ -245,10 +250,11 @@ def _open_injection_source(name, spec, cfg, tok, seed, nano_enc=None, gemma_enco
             spec["score_shards_dir_or_repo"], shards, layer=int(spec.get("layer", 8)),
             nano_enc=nano_enc or tok.enc, gemma_encode=gemma_encode, concepts=spec.get("concepts"),
             gemma_model=spec.get("gemma_model", "google/gemma-2-2b"),
-            align_policy=spec.get("align_policy", "mean"),
+            align_policy=spec.get("align_policy", "max"),
             climbmix_dir=spec.get("climbmix_dir"), index_path=spec.get("index_path"),
             build_hash_index=bool(spec.get("build_hash_index", False)),
             noise_sigma=float(spec.get("noise_sigma", 0.15)), seed=seed, name=name,
+            n_calib_shards=int(spec.get("n_calib_shards", args.loudness_calib_shards)),
             **dict(spec.get("kwargs") or {}))
     return open_store(spec["dir"], noise_sigma=float(spec.get("noise_sigma", 0.15)),
                       seed=seed, name=name, expect_kind=kind)
@@ -274,10 +280,17 @@ if args.activation_store:
                                        "dir": args.activation_store,
                                        "noise_sigma": args.noise_sigma}}
 else:
+    # --activation-config carries loudness / after_block / noise_sigma PER SITE, so these
+    # three CLI flags do nothing on this path. Silently ignoring an explicitly-passed
+    # --loudness would run a different experiment than the one the operator typed.
+    _ignored = ignored_cli_flags(args, {n: parser.get_default(n) for n in vars(args)},
+                                 ("loudness", "after_block", "noise_sigma"))
+    assert not _ignored, (
+        f"--activation-config sets loudness/after_block/noise_sigma per site, so {_ignored} "
+        f"would be SILENTLY IGNORED. Remove the flag(s), or set the value in the config's "
+        f"'sites'/'sources' entries.")
     with open(args.activation_config) as f:
         _inj_spec = json.load(f)
-    # Each site's loudness comes from ITS OWN dict here; the --loudness CLI flag is
-    # IGNORED on this path (it only feeds the --activation-store branch above).
     injection_cfgs = [InjectionCfg(**d) for d in _inj_spec["sites"]]
     injection_source_specs = dict(_inj_spec["sources"])
     assert set(injection_source_specs) == {c.name for c in injection_cfgs}, \
@@ -304,18 +317,32 @@ for _cfg in injection_cfgs:
 # calibrates fresh below. Resumes reuse the PERSISTED vector and never re-resolve
 # (loudness.json may have changed since).
 _loudness_pending = dict(_loudness_specs)
+_resumed_provenance = {}    # name -> the checkpoint's gate_calibration, for reused vectors
 if resuming:
     with open(os.path.join(checkpoint_dir, f"meta_{args.resume_from_step:06d}.json")) as f:
-        _ckpt_sites = {c["name"]: c for c in json.load(f).get("injection_sites_config", [])}
-    for _name in list(_loudness_pending):
-        _saved = _ckpt_sites.get(_name, {})
-        if isinstance(_saved.get("channel_scale"), (list, tuple)):
-            _cfg = next(c for c in injection_cfgs if c.name == _name)
-            _cfg.channel_scale = [float(v) for v in _saved["channel_scale"]]
-            _cfg.threshold = _saved.get("threshold", _cfg.threshold)   # the relu that scale was fit to
-            del _loudness_pending[_name]
-            print0(f"[loudness] {_name!r}: reusing the persisted channel_scale from checkpoint meta "
-                   f"(no re-calibrate)")
+        _ckpt_meta = json.load(f)
+    _reused, _warm = resolve_persisted_loudness(_ckpt_meta, list(_loudness_pending))
+    for _name, _r in _reused.items():
+        _cfg = next(c for c in injection_cfgs if c.name == _name)
+        _cfg.channel_scale = _r["channel_scale"]
+        if _r["threshold"] is not None:
+            _cfg.threshold = _r["threshold"]        # the relu that scale was fit to
+        del _loudness_pending[_name]
+        _p = _resumed_provenance[_name] = dict(_r["provenance"], reused_from_step=args.resume_from_step)
+        print0(f"[loudness] {_name!r}: reusing the persisted channel_scale from checkpoint meta "
+               f"(no re-calibrate; original mode={_p.get('mode')} dial={_p.get('dial')} "
+               f"L_ref={_p.get('L_ref')} layer={_p.get('layer')})")
+        if not _p.get("mode"):
+            print0(f"[loudness] {_name!r}: checkpoint carries no gate_calibration record for this site "
+                   f"— the vector is intact but its provenance is not recoverable")
+    for _name in _warm:
+        print0("!" * 80)
+        print0(f"[loudness] {_name!r}: WARM START — checkpoint meta_{args.resume_from_step:06d}.json "
+               f"has NO persisted channel_scale for this site. Calibration will run FRESH against the "
+               f"current loudness.json and shard set, which may not reproduce the vector the checkpoint "
+               f"was trained with. Persisted calibration is keyed by site NAME, so if you renamed a "
+               f"site, rename it back to inherit its calibration.")
+        print0("!" * 80)
 
 # Compact-tokens mode (opt-in): a gemma-boundary-respecting tokenizer used for
 # BOTH the training token stream (loader) and the runtime source alignment. OFF
@@ -352,6 +379,25 @@ for _name, _spec in injection_source_specs.items():
             f"site {_name!r}: configured class {_spec['class']!r} was not constructed (got {type(_src).__name__})"
     print0(f"[injection] site {_name!r}: source={type(_src).__name__} "
            f"(kind={_spec.get('kind')}, class={_spec.get('class') or '-'}) r={_src.r}")
+    # Row identity of a file: direction, against the concepts THIS site actually feeds.
+    _concepts = getattr(_src, "concepts", None) or _spec.get("concepts")
+    if _concepts:
+        _key = validate_direction_file_order(_cfg.direction_init, _concepts, _name)
+        if _key:
+            print0(f"[injection] site {_name!r}: direction file row order verified against "
+                   f"'{_key}' ({len(_concepts)} concepts)")
+    # Calibration samples the LOWEST n shards and runs before _attach_prefetchers, so it
+    # reads them from the primary repo directly. If the prefetch map puts those shards in
+    # an overflow repo, that read 404s mid-startup — catch it here, not 20 minutes in.
+    _pf = _spec.get("prefetch") or {}
+    if _pf.get("repos") and _pf.get("per_repo") and hasattr(_src, "n_calib_shards"):
+        _calib_sids = sorted(_src.shards)[:_src.n_calib_shards]
+        _outside = [s for s in _calib_sids if s // int(_pf["per_repo"]) != 0]
+        assert not _outside, (
+            f"site {_name!r}: calibration shards {_outside} map to overflow repo(s) under "
+            f"per_repo={_pf['per_repo']}, but calibration reads from the primary repo "
+            f"{_spec['score_shards_dir_or_repo']!r} before prefetch attaches — it would 404. "
+            f"Include low-numbered shards in this source's 'shards' range.")
     injection_sources[_name] = _src
 
 # Gate calibration (auto + donor) — ENTIRELY at startup, BEFORE sites/prefill/
@@ -359,7 +405,7 @@ for _name, _spec in injection_source_specs.items():
 # cannot race prefill). Deterministic in (source, seed) => every DDP rank agrees;
 # we assert bit-identical gate vectors across ranks. Provenance is persisted in
 # checkpoint meta so resumes reuse the vector and never rescore.
-_loudness_provenance = {}   # name -> calibration meta (saved to checkpoint)
+_loudness_provenance = dict(_resumed_provenance)   # name -> calibration meta (saved to checkpoint)
 
 
 def _ddp_all_gather_hash(h):
@@ -407,7 +453,8 @@ for _name, _spec in _loudness_pending.items():
                                     dial=_spec.get("dial", 1.0), abs_target=_spec.get("abs_target"),
                                     threshold=_cfg.threshold, k=args.loudness_k, seed=args.seed,
                                     min_events=args.dose_min_events, min_docs=args.loudness_min_docs,
-                                    log=print0)
+                                    min_channel_docs=args.dose_min_channel_docs,
+                                    allow_dead=args.allow_dead_channels, log=print0)
     _cfg.channel_scale = _cs
     _dur = time.time() - _t0
     _cal["scale_hash"] = assert_loudness_identical_across_ranks(_cs, _name, print0, _ddp_all_gather_hash)
@@ -427,7 +474,11 @@ for _name, _spec in _loudness_pending.items():
                f"{_cal['target_median']:.4f} (no loudness.json needed)")
     print0(f"[loudness] {_name!r}: {_cal['n_firing_tokens']} firing / {_cal['n_tokens']} calibration "
            f"tokens ({100 * _cal['firing_token_rate']:.2f}%); {_cal['n_imputed']} imputed-E / "
-           f"{_cal['n_dead']} dead of {_cfg.r} channels ({_cal['n_docs']} docs; {_dur:.1f}s)")
+           f"{_cal['n_dead']} dead of {_cfg.r} channels ({_cal['n_docs']}/{_cal['n_docs_requested']} "
+           f"docs from shards {_cal['sample_shards']}; {_dur:.1f}s)")
+    if _cal["n_channel_docs"] is not None:
+        print0(f"[loudness] {_name!r}: distinct source docs per channel (min {_cal['min_channel_docs']}) "
+               + ", ".join(f"{_c}={_n}" for _c, _n in zip(_cal["concepts"], _cal["n_channel_docs"])))
     print0(f"[loudness] {_name!r}: channel_scale=" +
            ", ".join(f"{_c}={_v:.4g}" for _c, _v in zip(_cal["concepts"], _cs)))
     _ilad, _dlad = _cal["injected_loudness"], _cal["donor_loudness"] or {}
@@ -797,9 +848,13 @@ if args.dose_check_tokens > 0 and not resuming:
             _site.channel_scale.detach().float().cpu().numpy(),
             _site.direction.detach().float(), _cal.get("target_median", 0.0),
             min_firing_tokens=args.dose_check_tokens, tol=args.dose_check_tol)
+        # Pool depth first: it is the mechanism, the loudness deviation is the symptom.
+        _depth = getattr(injection_sources[_name], "pool_depth_stats", lambda: None)()
+        log_pool_depth(_depth, _name, print0)
         log_realized_loudness(_rep, _name, _cal.get("injected_loudness"),
                               _cal.get("donor_loudness"), print0)
         _cal["realized"] = _rep
+        _cal["pool_depth"] = _depth
     if _peeked:
         train_loader = itertools.chain(_peeked, train_loader)
 

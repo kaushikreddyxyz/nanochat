@@ -88,13 +88,13 @@ def test_loudness_scale_zero_is_exact_noop_and_restores():
 
 
 # --------------------------------------------------------------------------- #
-# 3 + 4. build_acts alignment (broadcast + mean) and threshold zeroing
+# 3 + 4. build_acts alignment (broadcast + pool policies) and threshold zeroing
 # --------------------------------------------------------------------------- #
 def _align_fixture():
     # text: gemma tokens "monday"(0,6)=g0, " "(6,7)=g1, "tue"(7,10)=g2;
     # nano tokens "mon"(0,3), "day"(3,6), " tue"(6,10).
     #   nano0,nano1 nest inside gemma "monday" -> both BROADCAST g0
-    #   nano2 " tue" spans gemma " " + "tue"   -> MEAN(g1, g2)
+    #   nano2 " tue" spans gemma " " + "tue"   -> pooled over (g1, g2)
     text = "monday tue"
     enc = FakeEnc(["mon", "day", " tue"])
     nano_ids = enc.encode_ordinary(text)
@@ -107,15 +107,19 @@ def _align_fixture():
     return text, enc, nano_ids, offsets, gemma_z, (g0, g1, g2)
 
 
-def test_build_acts_alignment_broadcast_and_mean():
+def test_build_acts_alignment_broadcast_and_pooling():
     text, enc, nano_ids, offsets, gemma_z, (g0, g1, g2) = _align_fixture()
     # threshold off (-inf) so we can inspect the raw pooled values.
-    out = harness.build_acts(text, nano_ids, gemma_z, offsets, threshold=-1e9,
-                             policy="mean", nano_enc=enc)
+    out = harness.build_acts(text, nano_ids, gemma_z, offsets, threshold=-1e9, nano_enc=enc)
     assert out.shape == (3, 7)
     assert np.array_equal(out[0], g0), "nano0 must broadcast gemma 'monday'"
     assert np.array_equal(out[1], g0), "nano1 must broadcast gemma 'monday'"
-    assert np.allclose(out[2], (g1 + g2) / 2.0), "nano2 must be the MEAN over covering gemma tokens"
+    assert np.array_equal(out[2], np.maximum(g1, g2)), \
+        "default policy must be the per-channel MAX over covering gemma tokens"
+
+    out_mean = harness.build_acts(text, nano_ids, gemma_z, offsets, threshold=-1e9,
+                                  policy="mean", nano_enc=enc)
+    assert np.allclose(out_mean[2], (g1 + g2) / 2.0), "'mean' policy must average the covering tokens"
 
     # 'last' policy keeps the rightmost covering gemma token for the multi span.
     out_last = harness.build_acts(text, nano_ids, gemma_z, offsets, threshold=-1e9,

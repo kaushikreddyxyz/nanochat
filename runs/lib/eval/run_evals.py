@@ -377,7 +377,7 @@ def _make_prescored_source(sid, nano_enc, gemma_encode, layer, threshold, stagin
     local = _stage_scored_shard(sid, staging_dir)
     return H.ConceptProbeScoreSource(
         local, [sid], layer=layer, nano_enc=nano_enc, family=family,
-        gemma_encode=gemma_encode, concepts=concepts, align_policy="mean",
+        gemma_encode=gemma_encode, concepts=concepts, align_policy="max",
         noise_sigma=0.0, present_z=threshold, name=f"{family}-valbpb")
 
 

@@ -33,7 +33,7 @@
         "tuesday",
         "wednesday"
       ],
-      "align_policy": "mean",
+      "align_policy": "max",
       "noise_sigma": 0.0,
       "prefetch": {
         "staging_dir": "/workspace/scores_staging",

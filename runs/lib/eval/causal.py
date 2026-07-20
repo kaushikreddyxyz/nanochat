@@ -490,7 +490,7 @@ def _prepare_items(items, enc, scorer, harness, bos):
         if it["family"] == "mention":
             gz, off = scorer.score_with_offsets([it["prompt"]])[0]
             acts = np.asarray(harness.build_acts(it["prompt"], nano_ids, gz, off,
-                              threshold=PRESENT_Z, policy="mean", nano_enc=enc), np.float32)
+                              threshold=PRESENT_Z, policy="max", nano_enc=enc), np.float32)
             r = len(STORE_ORDER)
             assert acts.shape == (T, r), f"build_acts {acts.shape} != {(T, r)} for {it['id']}"
             ids, acts, _ = with_bos(bos, nano_ids, acts)

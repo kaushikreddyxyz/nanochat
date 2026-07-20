@@ -52,10 +52,20 @@ class ActivationSource(abc.ABC):
     def sample_activation_rows(self, k: int, seed: int):
         """Pooled ((n, r) rows, n_docs, n_tokens) over a seeded sample of up to ``k``
         docs — the raw rows dose calibration needs. Sources that cannot be sampled
-        (e.g. FnSource) leave this unimplemented."""
+        (e.g. FnSource) leave this unimplemented.
+
+        Implementations MUST also set ``last_sample_doc_index``: an (n,) int array
+        giving each pooled row's SOURCE DOCUMENT ordinal. calibrate_dose_gate uses it
+        to count distinct documents per channel — a bursty concept can rack up
+        thousands of firing tokens inside 3 documents, and a per-token count calls
+        that well-measured when its scale rests on 3 samples. Sources that sample
+        across shards should also set ``last_sample_shards``."""
         raise NotImplementedError(
             f"{type(self).__name__} does not support gate='auto' / amplitude='dose' "
             f"(no sampleable statistics)")
+
+    last_sample_doc_index = None   # (n,) source-doc ordinal per pooled row; see above
+    last_sample_shards = None      # shard ids the sample was drawn from, when sharded
 
     def sample_activation_stats(self, k: int, seed: int):
         """(per-channel rms, per-channel nonzero-rate, n_docs, n_tokens) over the SAME
@@ -81,6 +91,18 @@ def hash_seeded_noise(z: np.ndarray, key: int, sigma: float, seed: int) -> np.nd
         return z
     rng = np.random.default_rng([seed & 0x7FFFFFFF, key & 0xFFFFFFFFFFFFFFFF])
     return z + rng.normal(0.0, sigma, size=z.shape).astype(np.float32)
+
+
+def _pool_doc_rows(per_doc, r):
+    """[(n_i, r) per-doc arrays] -> (pooled (n, r), doc_index (n,), n_docs, n_tokens).
+    doc_index labels every pooled row with the ordinal of the document it came from,
+    which is what lets calibration count DOCUMENTS rather than tokens per channel."""
+    if not per_doc:
+        return np.zeros((0, r), np.float32), np.zeros(0, np.int64), 0, 0
+    pooled = np.concatenate(per_doc, axis=0)
+    doc_index = np.repeat(np.arange(len(per_doc), dtype=np.int64),
+                          [z.shape[0] for z in per_doc])
+    return pooled, doc_index, len(per_doc), pooled.shape[0]
 
 
 def _channel_stats(rows: np.ndarray):
@@ -168,10 +190,9 @@ class _StoreSource(ActivationSource):
             off, n = self._index[keys[int(i)]]
             if n > 0:
                 rows.append(self.mm[off:off + n].astype(np.float32) * self.scale)
-        if not rows:
-            return np.zeros((0, self.r), np.float32), 0, 0
-        pooled = np.concatenate(rows, axis=0)
-        return pooled, len(rows), pooled.shape[0]
+        pooled, doc_index, n_docs, n_tokens = _pool_doc_rows(rows, self.r)
+        self.last_sample_doc_index = doc_index
+        return pooled, n_docs, n_tokens
 
 
 class QwenEncoderSource(_StoreSource):
@@ -252,8 +273,8 @@ class FnSource(ActivationSource):
 # --------------------------------------------------------------------------- #
 # Runtime probe-score sources: apply the gold gemma probe scores per nanochat
 # token AT RUNTIME, nothing stored offline. Both backends share the same
-# gemma->nanochat alignment (char-span OVERLAP; default mean over covering
-# gemma tokens, "last" = last overlapping. A boundary-straddling gemma token
+# gemma->nanochat alignment (char-span OVERLAP; default per-channel MAX over
+# covering gemma tokens, "mean"/"last" opt-in. A boundary-straddling gemma token
 # leaks sub-token future-char content into position t; compact-tokens mode is
 # the leak-free variant)
 # and the same dequant/standardize with the frozen quant/corpus_stats constants;
@@ -277,7 +298,7 @@ class _RuntimeProbeBase(ActivationSource):
     onto the nanochat token grid and enforces the unknown-doc/None contract."""
 
     def _init_layout(self, columns, quant, corpus_stats, layer, concepts, name,
-                     noise_sigma, seed, align_policy="mean"):
+                     noise_sigma, seed, align_policy="max"):
         col_names = list(columns["concepts"])           # score axis-2 order == columns.json
         layers = list(columns["layers"])
         if layer not in layers:
@@ -296,9 +317,49 @@ class _RuntimeProbeBase(ActivationSource):
         self.name = name
         self.noise_sigma = float(noise_sigma)
         self.seed = int(seed)
-        if align_policy not in ("mean", "last"):
-            raise ValueError(f"align_policy must be 'mean' or 'last', got {align_policy!r}")
+        if align_policy not in ("max", "mean", "last"):
+            raise ValueError(f"align_policy must be 'max', 'mean' or 'last', got {align_policy!r}")
         self.align_policy = align_policy
+
+    def _depth_counter(self):
+        """The pooling-depth histogram's lock, allocating both on first use — the eval
+        harness aligns with sources it builds without running _init_layout."""
+        lock = getattr(self, "_depth_lock", None)
+        if lock is None:
+            import threading
+            lock = self._depth_lock = threading.Lock()
+            self._depth_hist = np.zeros(1, np.int64)   # index = gemma tokens pooled per nanochat token
+        return lock
+
+    def _record_pool_depth(self, depths):
+        """Accumulate the per-nanochat-token pooling-depth histogram. Depth is the
+        MECHANISM behind any realized-vs-calibrated loudness gap (max concentrates
+        co-firing, mean dilutes peaks) and behind max's raised noise floor, which both
+        scale with it — so the startup report prints it beside the loudness ladder."""
+        if depths.size == 0:
+            return
+        h = np.bincount(np.maximum(depths, 0).astype(np.int64))
+        with self._depth_counter():
+            if h.size > self._depth_hist.size:
+                self._depth_hist = np.pad(self._depth_hist, (0, h.size - self._depth_hist.size))
+            self._depth_hist[:h.size] += h
+
+    def pool_depth_stats(self):
+        """{n_tokens, p50, p90, p99, max, mean, zero_coverage_rate, hist} over every
+        nanochat token aligned so far, or None if nothing has been aligned yet."""
+        with self._depth_counter():
+            hist = self._depth_hist.copy()
+        n = int(hist.sum())
+        if n == 0:
+            return None
+        depths = np.arange(hist.size)
+        cum = np.cumsum(hist)
+        q = {f"p{p}": int(depths[np.searchsorted(cum, math.ceil(p / 100 * n))])
+             for p in (50, 90, 99)}
+        return {"n_tokens": n, "max": int(depths[hist > 0].max()),
+                "mean": float((depths * hist).sum() / n),
+                "zero_coverage_rate": float(hist[0] / n),
+                "hist": {int(d): int(c) for d, c in enumerate(hist) if c}, **q}
 
     def _standardize(self, raw):
         """raw (n, r) probe scores -> z (n, r); dequant already applied upstream."""
@@ -310,11 +371,14 @@ class _RuntimeProbeBase(ActivationSource):
         tokens whose CHAR SPAN OVERLAPS its own — so a big gemma token broadcasts
         its score to every nanochat token nested inside it, and a big nanochat
         token pools every gemma token it spans. ``align_policy`` picks the pool op:
-        'mean' (default) averages the covering z-scores (variance shrinks over k
-        covering tokens — intended, NOT re-standardized); 'last' keeps only the
-        last (rightmost) covering gemma token (the historical prefix behavior for
-        the multi-gemma->one-nano direction). A nanochat token with NO overlapping
-        gemma token (a char the gemma tokenizer dropped) stays EXACT zero."""
+        'max' (default) takes the per-channel maximum over the covering z-scores —
+        the site's relu asks whether the span CONTAINS the concept, so a peak must
+        survive pooling; 'mean' averages them (dilutes peaks, and the site then runs
+        quieter than calibration predicted — README); 'last' keeps only the last
+        (rightmost) covering gemma token (the historical prefix behavior for the
+        multi-gemma->one-nano direction). None of the three re-standardizes. A
+        nanochat token with NO overlapping gemma token (a char the gemma tokenizer
+        dropped) stays EXACT zero."""
         from nanochat.injection.align import nanochat_char_offsets
         nano_ids = self.nano_enc.encode_ordinary(text)
         if len(nano_ids) != n_tokens:            # drift vs the loader's body-token count
@@ -327,6 +391,7 @@ class _RuntimeProbeBase(ActivationSource):
         g_off = np.asarray(g_off, np.int64).reshape(-1, 2)
         keep = np.where(g_off[:, 1] > g_off[:, 0])[0]   # non-empty gemma spans only cover chars
         if keep.size == 0:
+            self._record_pool_depth(np.zeros(n_tokens, np.int64))
             return out
         gs, ge = g_off[keep, 0], g_off[keep, 1]         # char-monotonic (left-to-right tokenization)
         z_keep = z_gemma[keep]
@@ -334,15 +399,25 @@ class _RuntimeProbeBase(ActivationSource):
         lo = np.searchsorted(ge, ns, side="right")      # first gemma whose end char > nano start
         hi = np.searchsorted(gs, ne, side="left") - 1   # last gemma whose start char < nano end
         has = (lo <= hi) & (ne > ns)                    # >=1 overlapping gemma and non-empty nano span
+        self._record_pool_depth(np.where(has, hi - lo + 1, 0))
         if not has.any():
             return out
         if self.align_policy == "last":
             out[has] = z_keep[hi[has]]
-        else:                                           # mean over the overlapping gemma tokens
+        elif self.align_policy == "mean":               # mean over the overlapping gemma tokens
             csum = np.concatenate([np.zeros((1, self.r), np.float32),
                                    np.cumsum(z_keep, axis=0, dtype=np.float32)], axis=0)
             s, e = lo[has], hi[has] + 1
             out[has] = (csum[e] - csum[s]) / (e - s)[:, None]
+        else:                                           # per-channel max over [lo, hi]
+            # reduceat over interleaved starts/ends: even slots are the real ranges
+            # (always non-empty, since has => lo <= hi), odd slots are the gaps between
+            # them and are discarded. One pad row so an end of exactly n stays in range.
+            s, e = lo[has], hi[has] + 1
+            idx = np.empty(2 * s.size, np.int64)
+            idx[0::2], idx[1::2] = s, e
+            z_pad = np.concatenate([z_keep, np.zeros((1, self.r), np.float32)], axis=0)
+            out[has] = np.maximum.reduceat(z_pad, idx, axis=0)[0::2]
         return out
 
     def add_noise(self, z, key):
@@ -369,7 +444,7 @@ class RuntimeProbeScoreSource(_RuntimeProbeBase):
                  gemma_model="google/gemma-2-2b", concepts=None, noise_sigma=0.15,
                  seed=0, name="probe-scores-runtime", climbmix_dir=None,
                  build_hash_index=False, index_path=None, text_column="text",
-                 align_policy="mean"):
+                 align_policy="max", n_calib_shards=4):
         columns = _read_store_json(score_loc, "columns.json")
         quant = _read_store_json(score_loc, "quant.json")
         corpus_stats = _read_store_json(score_loc, "corpus_stats.json")
@@ -377,6 +452,11 @@ class RuntimeProbeScoreSource(_RuntimeProbeBase):
                           align_policy)
         self.score_loc = score_loc
         self.shards = set(int(s) for s in shards)
+        # Calibration reads whole shards (~GBs each) and runs BEFORE the prefetcher is
+        # attached, so it must touch a BOUNDED, LOW set: unbounded striping across the
+        # configured shards would both download the corpus and 404 on the first shard
+        # living in an overflow repo. >=2 so the sample is never one shard's idiosyncrasy.
+        self.n_calib_shards = max(2, int(n_calib_shards))
         self.climbmix_dir = climbmix_dir
         self.text_column = text_column
         self.nano_enc = nano_enc
@@ -427,27 +507,43 @@ class RuntimeProbeScoreSource(_RuntimeProbeBase):
         sid, start, n = rec
         return self._align_and_gather(text, n_tokens, self._gemma_z(sid, start, n)), h
 
-    def sample_activation_rows(self, k, seed):
+    def sample_activation_rows(self, k, seed, n_calib_shards=None):
         """Standardized GEMMA-grid rows (pre-alignment: this samples the scores, not
-        the nanochat-aligned activations the loader serves)."""
+        the nanochat-aligned activations the loader serves), over the LOWEST
+        ``n_calib_shards`` configured shards only.
+
+        The bound is load-bearing, not a nicety. Calibration runs before
+        _attach_prefetchers, so every shard opened here is a full ~GB
+        hf_hub_download against the PRIMARY repo, on every rank's node — and a shard
+        that lives in an overflow repo raises EntryNotFoundError. Striping ceil(k/n)
+        docs over a handful of shards keeps the k-doc budget while touching a fixed,
+        low, primary-repo-resident set. Same hazard __len__ is documented to avoid."""
+        n_sh = self.n_calib_shards if n_calib_shards is None else max(2, int(n_calib_shards))
+        sids = sorted(self.shards)[:n_sh]
         rng = np.random.default_rng(seed & 0x7FFFFFFF)
-        rows, n_docs = [], 0
-        sids = sorted(self.shards)
-        per = max(1, k // max(len(sids), 1))
+        rows, used = [], []
+        per = -(-int(k) // max(len(sids), 1))    # ceil, so the k-doc budget is met
         for sid in sids:
             docs = self._docs(sid)
             for row in rng.permutation(len(docs))[:min(per, len(docs))]:
                 start, n = docs[int(row)]
                 if n > 0:
-                    rows.append(self._gemma_z(sid, start, n)); n_docs += 1
-                if n_docs >= k:
+                    rows.append(self._gemma_z(sid, start, n))
+                    used.append(sid)
+                if len(rows) >= k:
                     break
-            if n_docs >= k:
+            if len(rows) >= k:
                 break
-        if not rows:
-            return np.zeros((0, self.r), np.float32), 0, 0
-        pooled = np.concatenate(rows, axis=0)
-        return pooled, n_docs, pooled.shape[0]
+        n_shards_used = len(set(used))
+        if len(self.shards) >= 2 and n_shards_used < 2:
+            raise RuntimeError(
+                f"{self.name!r}: calibration sample came from {n_shards_used} shard(s) of "
+                f"{len(sids)} tried ({sorted(set(used))}) — one shard's idiosyncrasy would set "
+                f"the whole run's channel_scale. Raise --loudness-k or n_calib_shards.")
+        pooled, doc_index, n_docs, n_tokens = _pool_doc_rows(rows, self.r)
+        self.last_sample_doc_index = doc_index
+        self.last_sample_shards = sorted(set(used))
+        return pooled, n_docs, n_tokens
 
     # -- internals --
     def _docs(self, sid):
@@ -531,7 +627,7 @@ class LiveProbeScoreSource(_RuntimeProbeBase):
 
     def __init__(self, score_fn, score_loc, layer=8, *, nano_enc, gemma_encode=None,
                  gemma_model="google/gemma-2-2b", concepts=None, noise_sigma=0.0,
-                 seed=0, name="probe-scores-live", align_policy="mean", sample_texts=None):
+                 seed=0, name="probe-scores-live", align_policy="max", sample_texts=None):
         columns = _read_store_json(score_loc, "columns.json")
         quant = _read_store_json(score_loc, "quant.json")
         corpus_stats = _read_store_json(score_loc, "corpus_stats.json")
@@ -567,10 +663,9 @@ class LiveProbeScoreSource(_RuntimeProbeBase):
             z = self._standardize(raw[:, self.li][:, self.col_idx])
             if z.shape[0] > 0:
                 rows.append(z)
-        if not rows:
-            return np.zeros((0, self.r), np.float32), 0, 0
-        pooled = np.concatenate(rows, axis=0)
-        return pooled, len(rows), pooled.shape[0]
+        pooled, doc_index, n_docs, n_tokens = _pool_doc_rows(rows, self.r)
+        self.last_sample_doc_index = doc_index
+        return pooled, n_docs, n_tokens
 
 
 def _default_gemma_encode(gemma_model):

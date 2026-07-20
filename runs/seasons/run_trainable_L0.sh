@@ -4,7 +4,7 @@
 # --no-value-embeds, seed 1337, max_seq_len 2048, device_batch_size 32, nproc=8,
 # TRAIN_SHARDS=45, --num-iterations 2520 + --target-param-data-ratio 12. Source: gemma
 # L8 scores from climbmix-scored (+overflow..-7, shards 0-184), 4 season channels in
-# STORE order, present_z=0 (the site's relu owns thresholding), align mean, noise 0.
+# STORE order, present_z=0 (the site's relu owns thresholding), align max, noise 0.
 # USAGE:  bash runs/seasons/run_trainable_L0.sh
 #         SMOKE=1 bash runs/seasons/run_trainable_L0.sh   # 3 steps, nothing saved
 # Fresh pod: pod_bootstrap.sh runs/seasons/run_trainable_L0.sh (runs/weekdays/pod_bootstrap.sh)

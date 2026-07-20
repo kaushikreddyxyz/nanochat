@@ -15,7 +15,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from nanochat.injection.sites import InjectionCfg, classify_loudness_spec
+from nanochat.injection.sites import (InjectionCfg, classify_loudness_spec,
+                                      validate_direction_file_order)
 
 REPO = Path(__file__).resolve().parents[2]
 HERE = REPO / "runs" / "lib"
@@ -95,7 +96,7 @@ def test_source_columns_are_the_registry_store_order(arm):
     assert src["concepts"] != list(fam.cycle_order)
     assert src["layer"] == 8
     assert src["kind"] == "probe-scores-runtime"
-    assert src["align_policy"] == "mean" and src["noise_sigma"] == 0.0
+    assert src["align_policy"] == "max" and src["noise_sigma"] == 0.0
 
 
 @pytest.mark.parametrize("arm", INJECTED)
@@ -188,6 +189,26 @@ def test_file_direction_exists_and_matches_the_site(arm):
     D = np.load(path)["D"]
     assert D.shape == (fam.r, 768) and D.dtype == np.float32
     assert np.max(np.abs(np.linalg.norm(D.astype(np.float64), axis=1) - 1.0)) < 1e-5
+
+
+@pytest.mark.parametrize("arm", [a for a in INJECTED if ARMS[a]["direction"].startswith("file:")])
+def test_file_direction_row_order_matches_the_arms_concept_list(arm):
+    # Row i of D IS concept i. The npz declares its own row order and nothing read it,
+    # so reordering a config's `concepts` would silently permute the geometry — the
+    # permutation class of bug this project has been bitten by before.
+    cfg = _cfg(arm)
+    site = cfg["sites"][0]
+    concept_list = cfg["sources"][site["name"]]["concepts"]
+    prev = os.getcwd()
+    os.chdir(REPO)                       # file: paths resolve from the launch CWD
+    try:
+        key = validate_direction_file_order(site["direction_init"], concept_list, site["name"])
+        assert key, f"{arm}: direction npz declares no row order to check against"
+        with pytest.raises(ValueError, match="row order"):
+            validate_direction_file_order(site["direction_init"],
+                                          list(reversed(concept_list)), site["name"])
+    finally:
+        os.chdir(prev)
 
 
 @pytest.mark.parametrize("family", FAMILIES)

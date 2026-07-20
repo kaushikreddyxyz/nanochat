@@ -79,7 +79,7 @@ def main():
             "n_active_tokens": n_act, "active_frac": n_act / max(n_tok, 1),
             "n_store_miss": n_miss, "bos_id": int(bos_id),
             "threshold": args.threshold, "layer": args.layer,
-            "max_tokens": args.max_tokens, "align_policy": "mean",
+            "max_tokens": args.max_tokens, "align_policy": src.align_policy,
             "concepts": list(concept_registry.get_family("weekdays").store_order)}
     torch.save({"docs": docs, "meta": meta}, args.out)
     print(f"[build] {len(docs)} docs, {n_tok} tokens ({n_act} active, "

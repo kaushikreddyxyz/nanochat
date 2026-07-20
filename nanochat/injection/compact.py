@@ -7,7 +7,7 @@ alignment to pool across gemma tokens. Compact mode cuts the text at every gemma
 span boundary and encodes each segment independently with the underlying
 tokenizer, so every compact nanochat token nests inside exactly one gemma token
 (gemma "XYZ ABC" -> "XY","Z"," ","A","BC"). Under compact tokenization the
-overlap alignment is trivially 1:1, so mean and last policies coincide.
+overlap alignment is trivially 1:1, so all three pool policies coincide.
 
 TWO LOUD CAVEATS (see nanochat/injection/README.md):
  (a) compact mode CHANGES the training token stream — breaking BPE merges at

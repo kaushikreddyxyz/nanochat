@@ -73,6 +73,36 @@ def initial_direction(cfg: InjectionCfg, n_embd: int) -> torch.Tensor:
     raise ValueError(f"unknown direction_init {cfg.direction_init!r}")
 
 
+# Spellings in the wild: runs/weekdays/direction_sphere.npz says "weekday_store_order",
+# runs/seasons/direction_sphere.npz says "store_order".
+DIRECTION_ORDER_KEYS = ("store_order", "weekday_store_order", "concept_order", "concepts")
+
+
+def validate_direction_file_order(direction_init, concepts, name="?"):
+    """Hard-assert that a ``file:`` direction's rows line up with the site's concept
+    list, when the npz says what its rows are. The file carries the answer and nothing
+    read it: `initial_direction` checks only SHAPE, so reordering a config's `concepts`
+    would keep loading row 0 for what is now a different concept and silently permute
+    the geometry. Returns the key checked, or None when the file declares no order."""
+    if not (isinstance(direction_init, str) and direction_init.startswith("file:")):
+        return None
+    path = direction_init[len("file:"):]
+    loaded = np.load(path, allow_pickle=False)
+    if not hasattr(loaded, "files"):
+        return None                                  # plain .npy carries no metadata
+    key = next((k for k in DIRECTION_ORDER_KEYS if k in loaded.files), None)
+    if key is None:
+        return None
+    order = [str(c) for c in np.asarray(loaded[key]).ravel().tolist()]
+    if order != [str(c) for c in concepts]:
+        raise ValueError(
+            f"site {name!r}: direction file {path!r} was built for row order {order} but the site's "
+            f"concepts are {list(concepts)}. Row i of D is concept i — a mismatch silently attaches "
+            f"every concept to another concept's geometry. Reorder the config's 'concepts' to match "
+            f"the file, or rebuild the direction for this order.")
+    return key
+
+
 class InjectionSite(nn.Module):
     def __init__(self, cfg: InjectionCfg, n_embd: int):
         super().__init__()
@@ -290,6 +320,43 @@ def discover_loudness_json(src, override, log, load_fn, fallback_repo="kaushikre
             f"--loudness abs:<number> for a fraction of residual RMS.") from e
 
 
+def ignored_cli_flags(args, defaults, names):
+    """The subset of ``names`` the caller passed a non-default value for — flags that
+    a per-site --activation-config would silently override. Returns printable
+    "--flag=value" strings, so the trainer can refuse rather than run a different
+    experiment than the operator typed."""
+    return [f"--{n.replace('_', '-')}={getattr(args, n)!r}"
+            for n in names if getattr(args, n) != defaults[n]]
+
+
+def resolve_persisted_loudness(ckpt_meta, names):
+    """Split ``names`` into sites whose calibration the checkpoint can supply and sites
+    that must recalibrate. Returns (reused, warm_start):
+
+      reused     — name -> {"channel_scale", "threshold", "provenance"}. The provenance
+                   is the checkpoint's OWN gate_calibration entry: a resume reuses the
+                   persisted vector without re-entering calibration, so unless it is
+                   carried forward every later checkpoint saves gate_calibration {} and
+                   the dial / L_ref / layer / dead-channel record is destroyed while the
+                   vector it describes lives on.
+      warm_start — names with no persisted scale. Keyed by site NAME, so RENAMING a site
+                   lands here and recalibrates against today's loudness.json + shard set,
+                   producing a different vector. The caller must say so loudly.
+    """
+    sites = {c["name"]: c for c in (ckpt_meta.get("injection_sites_config") or [])}
+    gate = ckpt_meta.get("gate_calibration") or {}
+    reused, warm_start = {}, []
+    for n in names:
+        saved = sites.get(n) or {}
+        if isinstance(saved.get("channel_scale"), (list, tuple)):
+            reused[n] = {"channel_scale": [float(v) for v in saved["channel_scale"]],
+                         "threshold": saved.get("threshold"),
+                         "provenance": dict(gate.get(n) or {})}
+        else:
+            warm_start.append(n)
+    return reused, warm_start
+
+
 # --------------------------------------------------------------------------- #
 # Dose calibration: resolve amplitude="dose"'s frozen channel_scale. Two stages:
 # PER-EVENT equalization (channel_scale_c ∝ 1/E_c, E_c = rms of channel c's
@@ -308,16 +375,35 @@ def _injected_loudness(a_eff, w, d_hat, chunk=4096):
 
 
 def calibrate_dose_gate(src, loudness, direction, dial=1.0, abs_target=None, threshold=2.0, k=256,
-                        seed=0, min_events=50, min_docs=16, log=print):
+                        seed=0, min_events=50, min_docs=16, min_channel_docs=8,
+                        allow_dead=False, log=print):
     """Frozen per-channel scale for a site. ``direction`` is the site's ACTUAL initial D
     (rows are non-orthogonal in the sphere arm, so a quadrature estimate of loudness
     would be wrong). ``abs_target`` sets the median injected loudness directly and needs
     no loudness.json; otherwise the dial reference is the SUBSET's own median per-concept
     active loudness. Returns (channel_scale_list, meta)."""
+    name = getattr(src, "name", "?")
     rows, n_docs, n_tokens = src.sample_activation_rows(k, seed)
     if n_docs < min_docs:
-        raise RuntimeError(f"dose gate: source {getattr(src, 'name', '?')!r} sampled only {n_docs} docs "
+        raise RuntimeError(f"dose gate: source {name!r} sampled only {n_docs} docs "
                            f"(< min_docs={min_docs}); too few to calibrate")
+    if n_docs < k:
+        # --loudness-k is a REQUEST; a source that quietly returns fewer docs sets the
+        # whole run's scale on a thinner sample than the operator asked for.
+        log(f"[dose-gate] {name!r}: sampled {n_docs} docs, {k} requested (--loudness-k)"
+            + (f"; shards {src.last_sample_shards}" if getattr(src, "last_sample_shards", None) else ""))
+    rows = np.asarray(rows, np.float64)
+    if not np.isfinite(rows).all():
+        # inf/nan in ONE column silently NaNs every output channel: w = 1/inf = 0, then
+        # inf*0 = nan, which spreads through u @ d_hat. Usual cause is an upstream
+        # corpus_stats.std of 0 for that concept.
+        bad = np.flatnonzero(~np.isfinite(rows).all(axis=0))
+        cn = getattr(src, "concepts", None)
+        raise ValueError(
+            f"dose gate: source {name!r} sampled non-finite activations in "
+            f"{bad.size} channel(s): {[(cn[i] if cn else f'ch{i}') for i in bad[:10]]}. One "
+            f"inf/nan column NaNs EVERY channel through the direction matmul. Check the "
+            f"store's corpus_stats.json (a std of 0 for that concept divides by zero).")
     layer = idx = donor_pc = L_ref = L_total = None
     src_concepts = None
     if abs_target is None:
@@ -341,7 +427,7 @@ def calibrate_dose_gate(src, loudness, direction, dial=1.0, abs_target=None, thr
     dial = float(dial)
     if dial < 0:
         raise ValueError(f"dose dial must be >= 0, got {dial}")
-    a = np.asarray(rows, np.float64)
+    a = rows
     r = a.shape[1]
     if src_concepts is not None and len(src_concepts) != r:
         raise ValueError(f"dose gate: source names {len(src_concepts)} concepts but yields r={r} channels")
@@ -353,40 +439,76 @@ def calibrate_dose_gate(src, loudness, direction, dial=1.0, abs_target=None, thr
     E = np.zeros(r, np.float64)                  # rms CONDITIONAL on firing (per-event, not per-total)
     E[fired] = np.sqrt((a_eff ** 2).sum(0)[fired] / n_events[fired])
 
+    # DOCUMENTS, not tokens, are the independent samples. Concepts are bursty: one
+    # weekday document can fire hundreds of times, clearing min_events on a scale that
+    # actually rests on a single document. n_events stays in meta as a diagnostic.
+    doc_index = getattr(src, "last_sample_doc_index", None)
+    if doc_index is None:
+        n_channel_docs = None
+        log(f"[dose-gate] {name!r}: source exposes no last_sample_doc_index; falling back to the "
+            f"per-TOKEN min_events={min_events} test (bursty concepts can pass it on few documents)")
+    else:
+        di = np.asarray(doc_index, np.int64)
+        n_channel_docs = np.array([np.unique(di[a_eff[:, c] > 0.0]).size for c in range(r)], np.int64)
+
     w = np.zeros(r, np.float64)
-    weak = fired & (n_events < min_events)
+    thin_tokens = fired & (n_events < min_events)
+    thin_docs = (fired & (n_channel_docs < min_channel_docs)) if n_channel_docs is not None \
+        else np.zeros(r, bool)
+    weak = thin_tokens | thin_docs
     good = fired & ~weak
     w[good] = 1.0 / E[good]
     E_typical = None
     if weak.any():
         if not good.any():
-            raise RuntimeError(f"dose gate: every firing channel fired < min_events={min_events} times; "
-                               f"no well-measured channel to impute from (raise --gate-k or lower it)")
+            raise RuntimeError(f"dose gate: every firing channel is under-sampled (min_events="
+                               f"{min_events} tokens / min_channel_docs={min_channel_docs} docs); "
+                               f"no well-measured channel to impute from (raise --loudness-k)")
         # Per-event equalization means "equally loud when it fires", so a channel we
         # cannot measure is treated as a TYPICAL channel — same units (1/σ), not donor loudness.
         E_typical = float(np.median(E[good]))
         E[weak] = E_typical
         w[weak] = 1.0 / E_typical
         log("!" * 80)
-        log(f"[dose-gate] FALLBACK: {int(weak.sum())} channel(s) fired < min_events={min_events} times; "
-            f"imputing the median well-measured E_c={E_typical:.4f}: "
-            f"{[(names[i], int(n_events[i])) for i in np.flatnonzero(weak)]}")
+        log(f"[dose-gate] FALLBACK: {int(weak.sum())} channel(s) under-sampled (min_events={min_events} "
+            f"tokens, min_channel_docs={min_channel_docs} docs); imputing the median well-measured "
+            f"E_c={E_typical:.4f}: "
+            + str([(names[i], f"{int(n_events[i])} tok",
+                    f"{int(n_channel_docs[i]) if n_channel_docs is not None else -1} docs")
+                   for i in np.flatnonzero(weak)]))
         log("!" * 80)
     if (~fired).any():
+        dead = [names[i] for i in np.flatnonzero(~fired)]
+        msg = (f"dose gate: {len(dead)} of {r} channel(s) never crossed threshold={threshold} in the "
+               f"{n_docs}-doc / {n_tokens}-token calibration sample -> channel_scale 0, i.e. those "
+               f"concepts inject NOTHING for the entire run: {dead}. An r={r} site would silently "
+               f"become r={r - len(dead)} — not the experiment configured. Raise --loudness-k, widen "
+               f"the calibration shards, or pass --allow-dead-channels to accept it deliberately.")
+        if not allow_dead:
+            raise RuntimeError(msg)
         log("!" * 80)
-        log(f"[dose-gate] DEAD: {int((~fired).sum())} channel(s) never crossed the threshold -> "
-            f"channel_scale 0: {[names[i] for i in np.flatnonzero(~fired)]}")
+        log("[dose-gate] DEAD (allowed via --allow-dead-channels): " + msg)
         log("!" * 80)
 
     d = direction.detach().cpu().numpy() if hasattr(direction, "detach") else direction
     d = np.ascontiguousarray(d, np.float64)
     if d.shape[0] != r:
         raise ValueError(f"dose gate: direction has {d.shape[0]} rows, source r={r}")
+    if not np.isfinite(d).all():
+        raise ValueError(f"dose gate: direction for {name!r} contains non-finite entries")
+    if float(np.sqrt((d ** 2).mean(1)).max()) == 0.0:
+        # Checked BEFORE the firing test, which would otherwise blame the threshold for
+        # what is a direction problem: with D=0 every token injects 0 at any threshold.
+        raise ValueError(
+            f"dose gate: site {name!r} has an all-zero direction (direction_init='zeros'), so every "
+            f"token injects exactly 0 and there is no loudness to scale — a zeros-init direction "
+            f"cannot be calibrated. Zeros only makes sense with trainable_direction=true, and even "
+            f"then the scale must come from a non-zero init (use 'orthonormal'/'randn'/'file:').")
     d_hat = d / np.sqrt(np.maximum((d ** 2).mean(1, keepdims=True), 1e-8))   # _rms's clamp, in numpy
     base = _injected_loudness(a_eff, w, d_hat)
     firing = base > 0.0    # tokens that ACTUALLY inject (a token firing only on a zeroed channel does not)
     if not firing.any():
-        raise RuntimeError(f"dose gate: source {getattr(src, 'name', '?')!r} injects on 0 of {n_tokens} "
+        raise RuntimeError(f"dose gate: source {name!r} injects on 0 of {n_tokens} "
                            f"sampled tokens at threshold={threshold}; nothing to calibrate against")
     target = float(abs_target) if abs_target is not None else dial * L_ref
     s = target / float(np.median(base[firing]))
@@ -401,7 +523,10 @@ def calibrate_dose_gate(src, loudness, direction, dial=1.0, abs_target=None, thr
             "concept_index": None if idx is None else idx.astype(np.int64).tolist(),
             "target_median": float(target), "threshold": z0.astype(np.float32).tolist(),
             "k": int(k), "seed": int(seed), "n_docs": int(n_docs), "n_tokens": int(n_tokens),
+            "n_docs_requested": int(k), "sample_shards": getattr(src, "last_sample_shards", None),
             "min_events": int(min_events), "n_events": n_events.astype(np.int64).tolist(),
+            "min_channel_docs": int(min_channel_docs),
+            "n_channel_docs": None if n_channel_docs is None else n_channel_docs.tolist(),
             "event_rms": E.astype(np.float32).tolist(),   # weak channels carry the imputed median
             "event_rms_imputed": E_typical,
             "firing_rate": (n_events / max(n_tokens, 1)).astype(np.float32).tolist(),
@@ -420,12 +545,14 @@ def calibrate_dose_gate(src, loudness, direction, dial=1.0, abs_target=None, thr
 
 # --------------------------------------------------------------------------- #
 # Realized-loudness check. calibrate_dose_gate measures PRE-alignment (gemma-grid)
-# scores; the site sees POST-alignment rows, and mean-pooling alignment gives
-# mean(relu(·)) >= relu(mean(·)) — the relu is convex, so calibration can only
-# UNDER-estimate wherever a nanochat token pools several gemma tokens (and is exact
-# wherever one gemma token broadcasts to several). The size of that gap is an
-# empirical property of tokenizer granularity, so we measure it on the real stream
-# rather than assume it. Reports a correction factor; never applies one.
+# scores; the site sees POST-alignment rows, so pooling can move the dose either way.
+# Under the max default the per-channel knee commutes with the pool (relu(max(z)-z0)
+# == max(relu(z-z0))), so no peak is lost — but pooling CONCENTRATES co-firing across
+# channels, and loudness adds in quadrature, so a dense site can run LOUDER than
+# calibrated. Under align_policy='mean' the relu is convex and the site runs quieter
+# instead. Either way the size of the gap is an empirical property of tokenizer
+# granularity and firing density, so we measure it on the real stream rather than
+# assume it. Reports a correction factor; never applies one.
 # --------------------------------------------------------------------------- #
 def _loudness_ladder(v):
     return {"p50": float(np.percentile(v, 50)), "p90": float(np.percentile(v, 90)),
@@ -471,6 +598,26 @@ def realized_loudness_report(act_batches, threshold, channel_scale, direction, t
             "tol": float(tol)}
 
 
+def log_pool_depth(stats, name, log=print):
+    """Log the per-nanochat-token pooling-depth distribution — how many gemma tokens
+    each nanochat token pools. This is the MECHANISM behind any realized-vs-calibrated
+    loudness gap: under 'max' both the co-firing concentration and the raised
+    false-firing floor (P(fire) ~ 1 - Phi(z0)^depth) grow with it, under 'mean' the
+    dilution does. Depth 1 everywhere means neither concern is live for this tokenizer
+    pair; a fat tail means read the deviation below as real."""
+    if not stats:
+        log(f"[pool-depth] {name!r}: no aligned tokens observed")
+        return
+    log(f"[pool-depth] {name!r}: gemma tokens pooled per nanochat token over "
+        f"{stats['n_tokens']:,} aligned tokens — p50={stats['p50']} p90={stats['p90']} "
+        f"p99={stats['p99']} max={stats['max']} mean={stats['mean']:.3f}; "
+        f"{100 * stats['zero_coverage_rate']:.2f}% covered by no gemma token (exact-zero rows)")
+    top = sorted(stats["hist"].items())[:10]
+    log(f"[pool-depth] {name!r}: histogram " +
+        ", ".join(f"{d}:{100 * c / stats['n_tokens']:.2f}%" for d, c in top) +
+        (" ..." if len(stats["hist"]) > 10 else ""))
+
+
 def log_realized_loudness(rep, name, calib_ladder, donor_ladder, log=print):
     """Log the realized ladder beside the calibration-time and donor ladders, and WARN
     loudly (never auto-correct) when realized p50 misses the target by > tol."""
@@ -493,9 +640,9 @@ def log_realized_loudness(rep, name, calib_ladder, donor_ladder, log=print):
     log("!" * 80)
     log(f"[dose-check] WARNING {name!r}: realized p50 {rep['realized_p50']:.4f} misses the target "
         f"{rep['target']:.4f} by {100 * rep['rel_dev']:+.1f}% (tol +/-{100 * rep['tol']:.0f}%). Calibration "
-        f"samples PRE-alignment gemma rows; the site sees POST-alignment rows, and mean-pooling makes "
-        f"mean(relu) >= relu(mean). NOT auto-corrected — multiply the dial by {rep['correction']:.4f} to hit "
-        f"the target.")
+        f"samples PRE-alignment gemma rows; the site sees POST-alignment rows, and pooling shifts the dose "
+        f"(max concentrates co-firing UP, mean dilutes peaks DOWN). NOT auto-corrected — multiply the dial "
+        f"by {rep['correction']:.4f} to hit the target.")
     log("!" * 80)
 
 

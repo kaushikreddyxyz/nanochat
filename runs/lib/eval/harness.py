@@ -452,10 +452,10 @@ class GemmaScorer:
 # 4. build_acts — align gemma z onto nanochat tokens, exactly like training
 # --------------------------------------------------------------------------- #
 def build_acts(text, nano_ids, gemma_z, offsets, threshold=DEFAULT_THRESHOLD,
-               policy="mean", nano_enc=None):
+               policy="max", nano_enc=None):
     """Align standardized gemma z onto the nanochat token grid EXACTLY like training:
-    char-span OVERLAP pooling (default 'mean' over covering gemma tokens; 'last' =
-    rightmost), then the realism threshold (a nanochat-token row is EXACT zero unless
+    char-span OVERLAP pooling (default 'max' over covering gemma tokens; 'mean'/'last'
+    opt-in), then the realism threshold (a nanochat-token row is EXACT zero unless
     its max channel >= threshold). Returns (T, r) float32, T = len(nano_ids).
 
     Reuses the shared machinery verbatim — it calls

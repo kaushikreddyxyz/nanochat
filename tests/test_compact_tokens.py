@@ -129,15 +129,18 @@ np.save(os.path.join(STORE, "scores_00000.npy"), sc)
 open(os.path.join(STORE, "docs_00000.jsonl"), "w").write(json.dumps({"doc": 0, "start": 0, "n": n_gemma}) + "\n")
 
 n_tok = len(compact.enc.encode_ordinary(TEXT))
-src_mean = RuntimeProbeScoreSource(STORE, shards=[0], layer=8, nano_enc=compact.enc,
-                                   gemma_encode=word_gemma_encode, noise_sigma=0.0, align_policy="mean")
-src_last = RuntimeProbeScoreSource(STORE, shards=[0], layer=8, nano_enc=compact.enc,
-                                   gemma_encode=word_gemma_encode, noise_sigma=0.0, align_policy="last")
-a_mean, _ = src_mean.lookup_by_row(0, 0, TEXT, n_tok)
-a_last, _ = src_last.lookup_by_row(0, 0, TEXT, n_tok)
-check(a_mean is not None and np.array_equal(a_mean, a_last),
-      "compact tokenization => each nano token nests in one gemma => mean == last")
-check(bool((a_mean != 0).any()), "compact-aligned activations are non-trivial (some tokens carry signal)")
+def _compact_src(policy):
+    return RuntimeProbeScoreSource(STORE, shards=[0], layer=8, nano_enc=compact.enc,
+                                   gemma_encode=word_gemma_encode, noise_sigma=0.0,
+                                   align_policy=policy)
+
+
+a_max, _ = _compact_src("max").lookup_by_row(0, 0, TEXT, n_tok)
+a_mean, _ = _compact_src("mean").lookup_by_row(0, 0, TEXT, n_tok)
+a_last, _ = _compact_src("last").lookup_by_row(0, 0, TEXT, n_tok)
+check(a_max is not None and np.array_equal(a_max, a_mean) and np.array_equal(a_max, a_last),
+      "compact tokenization => each nano token nests in one gemma => max == mean == last")
+check(bool((a_max != 0).any()), "compact-aligned activations are non-trivial (some tokens carry signal)")
 
 print("\n" + ("ALL CHECKS PASSED" if not fails else f"{len(fails)} FAILURES: {fails}"))
 if __name__ == "__main__":
