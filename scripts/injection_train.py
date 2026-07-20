@@ -42,6 +42,7 @@ from nanochat.injection.sites import (InjectionCfg, reassert_optimizability, cla
                                        validate_direction_file_order, log_pool_depth,
                                        ignored_cli_flags, resolve_persisted_loudness)
 from nanochat.injection.sources import open_store, RuntimeProbeScoreSource, load_source_class
+from nanochat.injection.metrics import InjectionMetrics, default_reduce_fn
 from nanochat.injection.activation_dataloader import acts_data_loader_buffered
 from nanochat.injection.buffering import coordinate_rebuffer, duty_cycle_forecast, rebuffer_progress, shard_cover_seconds, size_prefetch_streams
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
@@ -119,6 +120,8 @@ parser.add_argument("--loudness-json", type=str, default="", help="dial/donor ga
 parser.add_argument("--lookup-workers", type=int, default=0, help="threads for per-doc activation lookups in the ride-along loader (0=serial); overlaps runtime gemma scoring with training")
 parser.add_argument("--noise-sigma", type=float, default=0.15, help="gaussian noise std on standardized activations at load time, deterministic per doc-content hash; 0 disables")
 parser.add_argument("--activation-config", type=str, default="", help="JSON for the multi-site form: {\"sites\": [InjectionCfg dicts], \"sources\": {site: {\"kind\": \"qwen-encoder\"|\"probe-scores\", \"dir\": ..., \"noise_sigma\": ..., \"align_policy\": \"max\"|\"mean\"|\"last\"}}}; mutually exclusive with --activation-store. See nanochat/injection/README.md")
+parser.add_argument("--injection-log-every", type=int, default=50, help="log injection health metrics (realized loudness, per-channel firing, alignment, geometry) to wandb every N steps (0 = disable). Accumulation is local and per-step; the single all_reduce happens only on these steps.")
+parser.add_argument("--injection-loss-split", action="store_true", help="also log mean loss over tokens the injection fired on vs tokens it did not. Requires the unreduced loss, so the training step switches to reduction='none' + an explicit masked mean: mathematically identical, NOT bit-identical to the default reduction. Off by default so it cannot silently perturb a paired comparison.")
 parser.add_argument("--compact-tokens", action="store_true", help="OPT-IN: cut nanochat tokens at gemma boundaries so each nests in one gemma token (needs a probe-scores-runtime source). CHANGES the training token stream (inflates token count) — not baseline-comparable. Default OFF (standard tokenization + overlap-max alignment).")
 # Staying-ahead guarantees (Amendment 2): the activation source must keep up with training.
 parser.add_argument("--starvation-threshold", type=float, default=0.15, help="warn if time-blocked-waiting-on-activations exceeds this fraction of step time over the window")
@@ -894,6 +897,25 @@ def _size_prefetchers():
 _size_prefetchers()
 
 # -----------------------------------------------------------------------------
+# Injection health metrics (nanochat.injection.metrics). This stack fails SILENTLY:
+# a channel goes dead, tokenizer drift zeroes documents, alignment shifts the realized
+# dose off its calibration — and the run completes with a normal-looking loss curve.
+# Accumulated locally every step over tensors already in memory; ONE all_reduce every
+# --injection-log-every steps. Reads sites off orig_model (torch.compile wraps model).
+inj_metrics = InjectionMetrics(
+    dict(orig_model.injection_sites), sources=injection_sources,
+    targets={n: (_loudness_provenance.get(n) or {}).get("target_median") for n in injection_sources},
+    concepts={n: (_loudness_provenance.get(n) or {}).get("concepts") for n in injection_sources},
+    device=device, log_every=args.injection_log_every,
+    loss_split=args.injection_loss_split, log=print0,
+    reduce_fn=(default_reduce_fn(dist, device) if (ddp and ddp_world_size > 1 and is_ddp_initialized()) else None))
+if inj_metrics.enabled:
+    print0(f"[inj-metrics] every {args.injection_log_every} steps -> wandb 'inj/<site>/...' for sites "
+           f"{list(orig_model.injection_sites)}: " + "; ".join(inj_metrics.enabled_metrics()))
+else:
+    print0("[inj-metrics] DISABLED (--injection-log-every 0): no injection health metrics in wandb")
+
+# -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
 
 # num_iterations: either it is given, or from target flops, or from target data:param ratio (in that order)
@@ -1128,16 +1150,33 @@ while True:
     t0 = time.time()
     act_wait = 0.0  # time-blocked-waiting-on-activations this step (Amendment 2)
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y, acts=acts)
+        if args.injection_loss_split:
+            # The unreduced loss is the only way to split by whether the injection fired.
+            # sum/count is mathematically identical to reduction='mean' with ignore_index
+            # (same numerator, same denominator) but not bit-identical, which is why the
+            # split is opt-in rather than always on.
+            per_token_loss = model(x, y, acts=acts, loss_reduction='none')
+            loss_valid = y.reshape(-1) != -1
+            loss = per_token_loss.sum() / loss_valid.sum().clamp_min(1)
+        else:
+            per_token_loss = loss_valid = None
+            loss = model(x, y, acts=acts)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
+        # Queued AFTER the backward so the health reductions tail the step's real work
+        # rather than sitting between forward and backward.
+        inj_metrics.observe(acts, per_token_loss=per_token_loss, valid=loss_valid)
         _tw = time.time()
         x, y, acts, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
         act_wait += time.time() - _tw
+    # Injection gradients while they are still RANK-LOCAL (the optimizer all-reduces in
+    # step()) and before zero_grad: the direction's grad norm, and the never-stepped
+    # loudness params' want-signal.
+    inj_metrics.observe_grads()
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -1220,6 +1259,11 @@ while True:
             "train/epoch": epoch,
         }
         wandb_run.log(log_data)
+    # Injection health: every rank reduces (the collective is collective), rank 0 logs.
+    if inj_metrics.should_log(step):
+        inj_data = inj_metrics.flush(step)
+        if inj_data:
+            wandb_run.log({"step": step, **inj_data})
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)

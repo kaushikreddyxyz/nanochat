@@ -535,6 +535,75 @@ loader feeds one rank).
 - **Backpressure.** Production blocks once the buffer reaches `--buffer-max-tokens`
   (default `2× prefill`) — never buffer the whole "video".
 
+## Injection health metrics (`injection/metrics.py`)
+
+The startup checks above fire **once**. Everything they measure can then drift for
+hours with no symptom: a channel goes dead, tokenizer drift starts zeroing documents,
+pooling moves the realized dose, and the loss curve looks exactly the same. So
+`InjectionMetrics` re-measures the site every `--injection-log-every` steps (default
+50; `0` disables) and logs under `inj/<site>/...` so multi-site runs don't collide.
+
+Cost: no extra forward pass — every number is a reduction over the `(B, T, r)` acts
+the site already consumed plus the site's own parameters. Realized loudness needs no
+`x` at all, because the site injects `rms(x) * (u @ D_hat)`, so
+`rms(injected)/rms(x) == rms(u @ D_hat)` exactly; and `rms(u @ D_hat)^2 == (u G uᵀ)/n_embd`
+with `G = D_hat D_hatᵀ`, so it is `O(B·T·r²)` rather than a `(B·T, n_embd)` projection —
+and `G` is also the Gram matrix the geometry metrics want. Accumulation is local; the
+**only** collective is one `all_reduce` of a single packed vector on log steps. Measured
+overhead is launch-bound, ≈0.15 ms per micro-batch per site (<0.05% of step time);
+arithmetic is ~1e-6 of the training FLOPs.
+
+| group | keys |
+|---|---|
+| loudness | `loudness_p50` `loudness_mean` `loudness_ratio_p50` `loudness_ratio_mean` (1.0 = as calibrated) `loudness_target` |
+| channels | `fire_rate/<concept>` `aeff_mean/<concept>` `fire_rate_min` `fire_rate_max` **`dead_channels`** |
+| rows | `row_fire_rate` `cofire_mean` `zero_row_rate` |
+| alignment | `align_ok_rate` `align_drift_rate` `align_miss_rate` `align_docs` `no_coverage_rate` `pool_depth_p50/p90/p99/mean` |
+| science | `loss_injected` `loss_uninjected` `loss_gap` (opt-in, below) |
+| geometry | `d_row_rms_min/max/mean` `gram_offdiag_absmax` `gram_offdiag_absmean` `dir_cos_init_min/mean` |
+| gradients | `grad_norm_direction` `grad_loudness/<concept>` `grad_loudness_mean` `grad_loudness_absmax` `want_louder` `grad_threshold_absmean` |
+| alarms | `nonfinite_acts` `nonfinite_injected` `saturation_rate` |
+
+Notes on the ones that are not self-explanatory:
+
+- **`dead_channels`** is the alarm to actually watch. A dead channel is a hard error at
+  *fresh calibration* only — a channel that dies mid-run, or a resume reusing a zeroed
+  vector, was previously undetectable, and `loudness_p50` medians across channels so one
+  dead channel barely moves it.
+- **`zero_row_rate`** counts tokens receiving *exactly* zero — the fingerprint of a failed
+  lookup (drift/missing doc) or a nanochat token no gemma token covered, measured on the
+  tensor the model saw rather than on the source's own bookkeeping.
+- **`cofire_mean`** (channels live per firing row) is the direct driver of the
+  realized-vs-calibrated gap under `align_policy="max"`: loudness adds in quadrature, so
+  co-firing concentration is what moves `loudness_ratio_p50` off 1.0.
+- **`want_louder`** = `−(∂L/∂channel_scale · channel_scale)/‖channel_scale‖`. The loudness
+  params are never stepped but autograd still assigns them a gradient; positive means the
+  model would lower its loss with a louder injection. Sampled before `optimizer.step()`,
+  while gradients are still rank-local.
+- **`gram_offdiag_*`** is normalized to cosines (unit-*RMS* rows have squared L2 norm
+  `n_embd`). A trainable `D` rotating rows parallel inflates co-firing loudness and
+  collapses concept separation while every per-row gauge stays invariant.
+- **`saturation_rate`** uses the store's own `quant.json` extremes converted to z units,
+  not an assumed ±4σ; it is absent for sources with no quantization. Load-time noise
+  slightly inflates it.
+- **Pool depth** is cumulative (a property of the tokenizer pair, not of the window) and
+  reuses the alignment-time histogram, so it costs nothing.
+
+**Loss split is opt-in** (`--injection-loss-split`, default off). It needs the unreduced
+loss, so the step switches to `reduction='none'` + an explicit masked mean — mathematically
+identical to `reduction='mean'` with `ignore_index` (pinned by a test) but not bit-identical,
+and it must not silently perturb a paired comparison run.
+
+**`rms(x)` at the site is deliberately NOT logged.** It is the only listed metric that
+would require reaching inside the compiled forward, and it cannot explain anything the
+other metrics show: the injection is `rms(x) * (…)`, so the realized loudness *ratio* —
+the quantity calibration targets — is exactly invariant to it.
+
+**Failure containment.** Every entry point is guarded; the first exception disables
+collection for the rest of the run with one loud warning. `flush` still enters the
+`all_reduce` when disabled, because a rank that skipped the collective would hang the
+healthy ranks — strictly worse than the metrics bug being guarded against.
+
 ### Staying-ahead metrics (Amendment 2)
 
 `_ChunkProducer` / `BufferControl` update a cheap `stats` dict (no hot-path overhead
@@ -764,6 +833,15 @@ python -m nanochat.injection.smoke
   `size_prefetch_streams` math, `BufferControl` (prefill fills to target BEFORE
   the first pull, dry detected, `do_rebuffer` refills to target), and the
   buffered loader packing **byte-identically** to the synchronous loader.
+- `test_injection_metrics.py` — the health metrics: a hand-built firing pattern's exact
+  firing rates / `a_eff|firing` / co-fire width / dead-channel count, realized loudness
+  against both a direct projection AND the real `InjectionSite.forward`'s
+  `rms(injected)/rms(x)`, source-stat deltas per window, the loss split (incl. the valid
+  mask, and that the swapped reduction matches `reduction='mean'`), Gram off-diagonal
+  under deliberately parallelized rows, cosine drift, gauge-invariant row RMS, gradient
+  + `want_louder` signals, int8 saturation bounds, per-window reset, the DDP reduce with
+  simulated ranks == the pooled stream, and that an exception inside collection disables
+  metrics instead of killing the step (while still entering the collective).
 - `test_activation_lockstep.py` — the ride-along loader against the REAL
   packing source (ast-extracted from `nanochat/dataloader.py`): bit-identical
   token stream, activation↔token alignment through best-fit + crops,

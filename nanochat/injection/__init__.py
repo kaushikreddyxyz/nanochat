@@ -44,6 +44,7 @@ from nanochat.injection.sites import (
     sites_by_block,
     validate_donor_concepts,
 )
+from nanochat.injection.metrics import InjectionMetrics, saturation_bounds
 from nanochat.injection.sources import (
     ActivationSource,
     FnSource,
@@ -86,6 +87,8 @@ __all__ = [
     "log_realized_loudness",
     "loudness_vector_hash",
     "assert_loudness_identical_across_ranks",
+    "InjectionMetrics",
+    "saturation_bounds",
     "ActivationSource",
     "FnSource",
     "ProbeScoreSource",
