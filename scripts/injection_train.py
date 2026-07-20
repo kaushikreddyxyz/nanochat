@@ -117,7 +117,7 @@ parser.add_argument("--dose-check-tokens", type=int, default=50000, help="firing
 parser.add_argument("--dose-check-tol", type=float, default=0.25, help="warn if realized median injected loudness deviates from dial x L_ref by more than this fraction")
 parser.add_argument("--dose-check-max-batches", type=int, default=32, help="cap on batches peeked for the realized-loudness check (bounds the replay buffer if the firing rate is very low)")
 parser.add_argument("--loudness-json", type=str, default="", help="dial/donor gates: loudness.json location (local file/dir OR HF dataset repo id). Empty = the source's own store root, else fall back to kaushikreddyxyz/climbmix-scored (logged loudly; unavailable = hard error).")
-parser.add_argument("--lookup-workers", type=int, default=0, help="threads for per-doc activation lookups in the ride-along loader (0=serial); overlaps runtime gemma scoring with training")
+parser.add_argument("--lookup-workers", type=int, default=0, help="threads for per-doc activation lookups in the ride-along loader. 0 (DEFAULT) = inline/serial and is FASTEST: the workers are in-process threads that contend on the GIL, so >0 convoys the training loop and cuts MFU (measured ~8.5x slower at 8 workers, 2026-07-20). Only raise if you have proven the loader is genuinely I/O-bound, not CPU-bound.")
 parser.add_argument("--noise-sigma", type=float, default=0.15, help="gaussian noise std on standardized activations at load time, deterministic per doc-content hash; 0 disables")
 parser.add_argument("--activation-config", type=str, default="", help="JSON for the multi-site form: {\"sites\": [InjectionCfg dicts], \"sources\": {site: {\"kind\": \"qwen-encoder\"|\"probe-scores\", \"dir\": ..., \"noise_sigma\": ..., \"align_policy\": \"max\"|\"mean\"|\"last\"}}}; mutually exclusive with --activation-store. See nanochat/injection/README.md")
 parser.add_argument("--injection-log-every", type=int, default=50, help="log injection health metrics (realized loudness, per-channel firing, alignment, geometry) to wandb every N steps (0 = disable). Accumulation is local and per-step; the single all_reduce happens only on these steps.")
@@ -1237,7 +1237,9 @@ while True:
     if len(_starv_dt) >= min(args.starvation_window, 10) and win_frac > args.starvation_threshold:
         msg = (f"[staying-ahead] STARVATION: activation wait = {win_frac*100:.0f}% of step time over "
                f"last {len(_starv_dt)} steps (> {args.starvation_threshold*100:.0f}%); qdepth={q_depth}. "
-               f"Source is not keeping up — raise --lookup-workers / widen the prefetch window.")
+               f"Source is not keeping up. NOTE: the lookup workers are in-process THREADS and "
+               f"contend on the GIL — RAISING --lookup-workers usually makes this WORSE. "
+               f"--lookup-workers=0 (inline) is fastest in practice; widen the prefetch window if truly I/O-bound.")
         if args.starvation_abort:
             raise SystemExit(msg)
         if step - _last_starv_warn >= args.starvation_window:

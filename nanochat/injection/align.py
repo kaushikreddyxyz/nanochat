@@ -138,14 +138,49 @@ def _normalize_offsets(text: str, raw_offsets: Iterable[Offset]) -> List[Offset]
 # offset mapping exists for tiktoken, so reconstruct from per-token byte lengths)
 # --------------------------------------------------------------------------
 
+_BYTE_LEN_LUTS = {}  # id(enc) -> (enc, byte-length lut int64[n], have bool[n])
+#                       (enc kept alive so its id() can never be reused)
+
+
+def _byte_len_lut(enc, ids_a):
+    """Per-tokenizer cache of ``len(enc.decode_single_token_bytes(id))``: the
+    per-token FFI loop this replaces was the single hottest GIL-held cost of the
+    injection loader's production path (~0.5 ms/doc, see act_wait investigation
+    2026-07-20). Grown lazily to the highest id seen; fills are idempotent, so
+    concurrent lookup workers can only ever redo work, never corrupt it."""
+    ent = _BYTE_LEN_LUTS.get(id(enc))
+    if ent is None:
+        ent = _BYTE_LEN_LUTS[id(enc)] = (enc, np.zeros(1024, np.int64),
+                                         np.zeros(1024, bool))
+    _, lut, have = ent
+    hi = int(ids_a.max()) + 1 if ids_a.size else 0
+    if hi > lut.size:
+        n = max(hi, 2 * lut.size)
+        lut = np.concatenate([lut, np.zeros(n - lut.size, np.int64)])
+        have = np.concatenate([have, np.zeros(n - have.size, bool)])
+        _BYTE_LEN_LUTS[id(enc)] = (enc, lut, have)
+    miss = ids_a[~have[ids_a]]
+    for i in np.unique(miss):
+        lut[int(i)] = len(enc.decode_single_token_bytes(int(i)))
+        have[int(i)] = True
+    return lut
+
+
 def nanochat_char_offsets(enc, ids, text):
     """Reconstruct (start, end) CHAR spans for tiktoken/RustBPE ``ids``. ``ids``
     must come from ``encode_ordinary(text)`` (no BOS): byte-level BPE partitions
     ``text.encode('utf-8')``, so per-token byte lengths must sum to the doc's
     byte length (asserted). A char belongs to the token holding its UTF-8 lead
-    byte; pure-continuation-byte tokens get empty spans (align maps them to -1)."""
-    byte_lens = [len(enc.decode_single_token_bytes(int(i))) for i in ids]
-    b = np.concatenate([[0], np.cumsum(byte_lens)]).astype(np.int64)
+    byte; pure-continuation-byte tokens get empty spans (align maps them to -1).
+
+    Vectorized: token byte lengths come from a per-tokenizer LUT
+    (``_byte_len_lut``) instead of a per-token FFI call, and the span list is
+    assembled from numpy gathers. Output is identical to the original per-token
+    implementation (validated element-wise on real ClimbMix docs)."""
+    ids_a = np.asarray(ids, dtype=np.int64)
+    lut = _byte_len_lut(enc, ids_a)
+    b = np.zeros(ids_a.size + 1, dtype=np.int64)
+    np.cumsum(lut[ids_a], out=b[1:])
     fb = text.encode("utf-8")
     assert int(b[-1]) == len(fb), (
         f"token byte lengths do not partition the document bytes "
@@ -154,7 +189,7 @@ def nanochat_char_offsets(enc, ids, text):
     if len(fb):
         fb_arr = np.frombuffer(fb, dtype=np.uint8)
         char_at[1:] = np.cumsum((fb_arr & 0xC0) != 0x80)
-    return [(int(char_at[b[i]]), int(char_at[b[i + 1]])) for i in range(len(ids))]
+    return list(zip(char_at[b[:-1]].tolist(), char_at[b[1:]].tolist()))
 
 
 # --------------------------------------------------------------------------

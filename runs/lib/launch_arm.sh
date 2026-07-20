@@ -33,7 +33,7 @@ SAVE_OPTIMIZER=${SAVE_OPTIMIZER:-final}
 EVAL_EVERY=${EVAL_EVERY:-250}
 CORE_METRIC_EVERY=${CORE_METRIC_EVERY:-2000}
 SAMPLE_EVERY=${SAMPLE_EVERY:-2000}
-LOOKUP_WORKERS=${LOOKUP_WORKERS:-8}
+LOOKUP_WORKERS=${LOOKUP_WORKERS:-0}  # 0=inline is fastest; workers are GIL-bound threads (see injection_train --lookup-workers)
 TRAIN_SHARDS=${TRAIN_SHARDS:-45}                 # COUNT fixes the train/val split (val = LAST parquet) -> must match across arms
 SMOKE=${SMOKE:-0}
 
