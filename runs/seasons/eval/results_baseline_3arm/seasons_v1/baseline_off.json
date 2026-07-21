@@ -1,0 +1,88 @@
+{
+  "arm": "baseline",
+  "completion": {
+    "overall": {
+      "n": 354,
+      "n_skipped": 0,
+      "accuracy": 0.3361581920903955,
+      "mean_answer_ce": 6.038138715118843,
+      "mean_margin": 1.0452995273212704
+    },
+    "by_category": {
+      "characteristic": {
+        "n": 20,
+        "accuracy": 0.4,
+        "mean_answer_ce": 5.4852364420890805,
+        "mean_margin": 0.5559391379356384
+      },
+      "fact_position": {
+        "n": 18,
+        "accuracy": 0.0,
+        "mean_answer_ce": 4.681625405947368,
+        "mean_margin": 0.5503131945927938
+      },
+      "month_to_season": {
+        "n": 60,
+        "accuracy": 0.43333333333333335,
+        "mean_answer_ce": 4.845919640858968,
+        "mean_margin": 0.9396931290626526
+      },
+      "order_k": {
+        "n": 64,
+        "accuracy": 0.15625,
+        "mean_answer_ce": 8.227571189403534,
+        "mean_margin": 0.7680230066180229
+      },
+      "order_next": {
+        "n": 48,
+        "accuracy": 0.25,
+        "mean_answer_ce": 7.19466108083725,
+        "mean_margin": 0.6489401757717133
+      },
+      "order_prev": {
+        "n": 48,
+        "accuracy": 0.0625,
+        "mean_answer_ce": 8.33283586303393,
+        "mean_margin": 0.6477719495693842
+      },
+      "polysemy": {
+        "n": 22,
+        "accuracy": 0.9090909090909091,
+        "mean_answer_ce": 3.111306581984867,
+        "mean_margin": 4.037133095390868
+      },
+      "sanity": {
+        "n": 20,
+        "accuracy": 0.75,
+        "mean_answer_ce": 3.079235206544399,
+        "mean_margin": 2.379424685612321
+      },
+      "season_to_month": {
+        "n": 16,
+        "accuracy": 0.5,
+        "mean_answer_ce": 3.5121225281618536,
+        "mean_margin": 0.766434243414551
+      },
+      "solstice_equinox": {
+        "n": 8,
+        "accuracy": 0.375,
+        "mean_answer_ce": 5.031218230724335,
+        "mean_margin": 0.3494376540184021
+      },
+      "synonym_fall": {
+        "n": 6,
+        "accuracy": 0.5,
+        "mean_answer_ce": 4.52713989218076,
+        "mean_margin": 1.017788976430893
+      },
+      "usage_context": {
+        "n": 24,
+        "accuracy": 0.4583333333333333,
+        "mean_answer_ce": 5.301980689167976,
+        "mean_margin": 0.9859902262687683
+      }
+    }
+  },
+  "valbpb": null,
+  "core": null
+}

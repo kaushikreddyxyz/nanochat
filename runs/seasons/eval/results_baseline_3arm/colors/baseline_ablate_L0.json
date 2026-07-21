@@ -1,0 +1,58 @@
+{
+  "arm": "baseline",
+  "completion": {
+    "overall": {
+      "n": 632,
+      "n_skipped": 0,
+      "accuracy": 0.4936708860759494,
+      "mean_answer_ce": 4.727173076355084,
+      "mean_margin": 1.0778386468034118
+    },
+    "by_category": {
+      "T0_copy": {
+        "n": 96,
+        "accuracy": 0.90625,
+        "mean_answer_ce": 2.456886717428764,
+        "mean_margin": 0.8311737241844336
+      },
+      "T1_assoc": {
+        "n": 80,
+        "accuracy": 0.4375,
+        "mean_answer_ce": 5.140753418207169,
+        "mean_margin": 0.41716877520084383
+      },
+      "T2_member": {
+        "n": 96,
+        "accuracy": 0.4166666666666667,
+        "mean_answer_ce": 5.9363656888405485,
+        "mean_margin": 0.7368136371175448
+      },
+      "T3_hop": {
+        "n": 144,
+        "accuracy": 0.3194444444444444,
+        "mean_answer_ce": 4.85437326795525,
+        "mean_margin": 0.4690754363934199
+      },
+      "T4_compose": {
+        "n": 120,
+        "accuracy": 0.21666666666666667,
+        "mean_answer_ce": 5.939008222023646,
+        "mean_margin": 0.7288169036308925
+      },
+      "T5_polysemy": {
+        "n": 48,
+        "accuracy": 0.875,
+        "mean_answer_ce": 4.032699135468445,
+        "mean_margin": 4.044640895695516
+      },
+      "T6_neutral": {
+        "n": 48,
+        "accuracy": 0.75,
+        "mean_answer_ce": 3.443345501398047,
+        "mean_margin": 3.0863767043532184
+      }
+    }
+  },
+  "valbpb": null,
+  "core": null
+}

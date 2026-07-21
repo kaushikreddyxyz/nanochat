@@ -1,0 +1,34 @@
+{
+  "seasons_accuracy": {
+    "baseline": {
+      "off": {
+        "value": 0.3361581920903955,
+        "n": 354
+      },
+      "ablate_L0": {
+        "value": 0.327683615819209,
+        "n": 354
+      },
+      "ablate_all": {
+        "value": 0.2909604519774011,
+        "n": 354
+      }
+    }
+  },
+  "seasons_answer_ce": {
+    "baseline": {
+      "off": {
+        "value": 6.038138715118843,
+        "n": 354
+      },
+      "ablate_L0": {
+        "value": 6.403116936527066,
+        "n": 354
+      },
+      "ablate_all": {
+        "value": 6.9618335426863975,
+        "n": 354
+      }
+    }
+  }
+}

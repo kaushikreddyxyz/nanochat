@@ -1,0 +1,87 @@
+{
+  "arm": "baseline",
+  "completion": {
+    "overall": {
+      "n": 632,
+      "n_skipped": 0,
+      "accuracy": 0.4129746835443038,
+      "mean_answer_ce": 5.200441706698695,
+      "mean_margin": 1.1577380531508512
+    },
+    "by_category": {
+      "T0_copy": {
+        "n": 96,
+        "accuracy": 0.3854166666666667,
+        "mean_answer_ce": 5.332546781748533,
+        "mean_margin": 0.8850335838894049
+      },
+      "T1_assoc": {
+        "n": 80,
+        "accuracy": 0.3875,
+        "mean_answer_ce": 5.533509904146195,
+        "mean_margin": 0.5893135279417038
+      },
+      "T2_member": {
+        "n": 96,
+        "accuracy": 0.5208333333333334,
+        "mean_answer_ce": 4.6104302530487375,
+        "mean_margin": 0.896914561589559
+      },
+      "T3_hop": {
+        "n": 144,
+        "accuracy": 0.3472222222222222,
+        "mean_answer_ce": 4.963784360223347,
+        "mean_margin": 0.5878461019860374
+      },
+      "T4_compose": {
+        "n": 120,
+        "accuracy": 0.125,
+        "mean_answer_ce": 7.016705111662547,
+        "mean_margin": 0.6946502447128295
+      },
+      "T5_polysemy": {
+        "n": 48,
+        "accuracy": 0.875,
+        "mean_answer_ce": 3.633902984477269,
+        "mean_margin": 4.013816187771024
+      },
+      "T6_neutral": {
+        "n": 48,
+        "accuracy": 0.75,
+        "mean_answer_ce": 3.296993050724268,
+        "mean_margin": 3.1834854234475642
+      }
+    }
+  },
+  "valbpb": null,
+  "core": {
+    "core_metric": 0.1457025903940826,
+    "n_tasks": 22,
+    "centered_results": {
+      "hellaswag_zeroshot": 0.11466670036315918,
+      "jeopardy": 0.010000000707805157,
+      "bigbench_qa_wikidata": 0.24400001764297485,
+      "arc_easy": 0.3733333746592204,
+      "arc_challenge": 0.03733336925506592,
+      "copa": 0.19999992847442627,
+      "commonsense_qa": 0.1375000029802322,
+      "piqa": 0.3640000820159912,
+      "openbook_qa": 0.06400001049041748,
+      "lambada_openai": 0.28200000524520874,
+      "hellaswag": 0.1306666930516561,
+      "winograd": 0.11355316638946533,
+      "winogrande": 0.04400002956390381,
+      "bigbench_dyck_languages": 0.052000001072883606,
+      "agi_eval_lsat_ar": 0.06521737575531004,
+      "bigbench_cs_algorithms": 0.46000000834465027,
+      "bigbench_operators": 0.10476190596818924,
+      "bigbench_repeat_copy_logic": 0.0,
+      "squad": 0.18000000715255737,
+      "coqa": 0.19600000977516174,
+      "boolq": -0.15789473056793213,
+      "bigbench_language_identification": 0.1903190303294703
+    },
+    "adapter_rows": 0,
+    "adapter_drift_rows": 0
+  }
+}
