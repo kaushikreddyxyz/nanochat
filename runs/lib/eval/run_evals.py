@@ -391,7 +391,13 @@ def run_completion(model, meta, scorer, items, device, injection, site_name, thr
     if not need_acts:
         print("[run_evals] all arms are loudness 0 -> skipping gemma for completion")
 
+    n_skipped = 0
     for it in items:
+        # v2 sets mix MC items (options + answer, the T0..T5 tiers) with slot/neutral
+        # items (P1..P3 / T6) that have no gold option -> not a completion-accuracy task.
+        if "options" not in it or it.get("answer") not in (it.get("options") or []):
+            n_skipped += 1
+            continue
         options = it["options"]
         answer_index = options.index(it["answer"])
         fulls = [it["prompt"] + " " + opt for opt in options]
@@ -432,6 +438,8 @@ def run_completion(model, meta, scorer, items, device, injection, site_name, thr
             c["sum_answer_ce"] += opt_ce[g][answer_index]
             c["sum_margin"] += margin
 
+    print(f"[run_evals] completion: scored {len(items) - n_skipped}/{len(items)} MC items "
+          f"(skipped {n_skipped} non-MC)")
     # finalize
     out = {}
     for g in injection:
@@ -443,9 +451,11 @@ def run_completion(model, meta, scorer, items, device, injection, site_name, thr
                          "mean_margin": c["sum_margin"] / c["n"]}
             for k in tot:
                 tot[k] += c[k]
-        out[g] = {"overall": {"n": tot["n"], "accuracy": tot["correct"] / tot["n"],
-                              "mean_answer_ce": tot["sum_answer_ce"] / tot["n"],
-                              "mean_margin": tot["sum_margin"] / tot["n"]},
+        n = max(tot["n"], 1)
+        out[g] = {"overall": {"n": tot["n"], "n_skipped": n_skipped,
+                              "accuracy": tot["correct"] / n,
+                              "mean_answer_ce": tot["sum_answer_ce"] / n,
+                              "mean_margin": tot["sum_margin"] / n},
                   "by_category": cats}
     return out
 
@@ -758,7 +768,16 @@ def main():
     for p in paths:
         with open(p, "r", encoding="utf-8") as f:
             items += [json.loads(line) for line in f if line.strip()]
-    print(f"[run_evals] evalset: {len(items)} items from {len(paths)} file(s)")
+    # A family directory holds the narrow tiers (T*, which have `options`) alongside the
+    # propensity tiers (P*, which deliberately have none — they are scored by next-token
+    # mass, not by picking an option). Completion can only consume the former, so filter
+    # explicitly and say so rather than dying on a KeyError deep in the loop.
+    n_all = len(items)
+    items = [it for it in items if "options" in it]
+    skipped = n_all - len(items)
+    print(f"[run_evals] evalset: {len(items)} scorable items from {len(paths)} file(s)"
+          + (f" ({skipped} option-less propensity items skipped)" if skipped else ""))
+    assert items, f"no items with 'options' in {args.evalset}"
 
     concepts = harness.family_concepts(args.family)
     site_name_default = args.site_name or args.family
