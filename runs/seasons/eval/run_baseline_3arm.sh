@@ -13,15 +13,17 @@ DEVICE="${DEVICE:-cuda}"
 HF_REPO=kaushikreddyxyz/nanochat-d12-injections
 STEP=2520
 EVAL=runs/seasons/eval
-NPZ="${NPZ:-/workspace/hfbaseline/baseline/probes/dom_54_probes_difference_of_means_layer06.npz}"
+PROBES_DIR="${PROBES_DIR:-/workspace/hfbaseline/baseline/probes}"
 SALIENT="${SALIENT:-6}"
 OUT="${OUT:-$EVAL/results_baseline_3arm}"
 CORE_MAX="${CORE_MAX:-500}"
 mkdir -p "$OUT"
 
+# arms: off = baseline plain | ablate_L0 = seasonal ablation @ salient layer (L6, that
+# layer's dirs) | ablate_all = seasonal ablation @ every block, EACH BLOCK'S OWN dirs.
 common=( --arms baseline --injection off ablate_L0 ablate_all
          --hf-repo "$HF_REPO" --step "$STEP" --device "$DEVICE"
-         --baseline-ablate-npz "$NPZ" --baseline-ablate-layer "$SALIENT"
+         --baseline-ablate-dir "$PROBES_DIR" --baseline-ablate-layer "$SALIENT"
          --baseline-ablate-concepts autumn spring summer winter )
 
 echo ">> [1/3] seasons_v2 (narrow) + CORE (general)"

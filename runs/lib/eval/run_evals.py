@@ -197,8 +197,9 @@ def build_parser():
     # probe directions instead of an injection site. The concept lives along the raw
     # residual write direction W_dom(.)nat_std; L0 scope -> --baseline-ablate-layer, all
     # scope -> every block (same basis, matching the injected arms' ablate_all).
-    ap.add_argument("--baseline-ablate-npz", default=None,
-                    help="DoM probe npz (W_dom/nat_std/concepts) for a site-less model's ablation")
+    ap.add_argument("--baseline-ablate-dir", default=None,
+                    help="dir of per-layer DoM probe npz (dom_54_probes_..._layer{L:02d}.npz) "
+                         "for a site-less model's ablation")
     ap.add_argument("--baseline-ablate-layer", type=int, default=None,
                     help="block index for the L0-scope (most-salient-layer) ablation")
     ap.add_argument("--baseline-ablate-concepts", nargs="+", default=None,
@@ -235,54 +236,66 @@ def _ablation():
     return ablation
 
 
-def _ext_basis(ext):
-    """Orthonormal raw-residual basis from external DoM probe directions (site-less
-    models). The concept's raw write direction is W_dom (.) nat_std (W_dom is in
-    standardized space); direction_basis SVD-orthonormalizes the selected rows."""
+def _ext_bases(ext, blocks):
+    """{block: raw-residual orthonormal basis} — each block's OWN seasonal DoM directions
+    from <dir>/dom_54_probes_difference_of_means_layer{L:02d}.npz. The concept's raw write
+    direction is W_dom (.) nat_std (W_dom is standardized-space); direction_basis
+    SVD-orthonormalizes the selected concept rows."""
     import numpy as np
     ABL = _ablation()
-    z = np.load(ext["npz"], allow_pickle=True)
-    names = [str(c) for c in z["concepts"]]
-    W = np.asarray(z["W_dom"], np.float32)
-    nat_std = np.asarray(z["nat_std"], np.float32)
-    pick = ext.get("concepts") or names
-    rows = [names.index(c) for c in pick]
-    D_raw = W[rows] * nat_std[None, :]
-    return ABL.direction_basis(D_raw), rows, pick
+    out = {}
+    for l in blocks:
+        f = os.path.join(ext["dir"], f"dom_54_probes_difference_of_means_layer{l:02d}.npz")
+        z = np.load(f, allow_pickle=True)
+        names = [str(c) for c in z["concepts"]]
+        W = np.asarray(z["W_dom"], np.float32)
+        nat_std = np.asarray(z["nat_std"], np.float32)
+        pick = ext.get("concepts") or names
+        rows = [names.index(c) for c in pick]
+        out[l] = ABL.direction_basis(W[rows] * nat_std[None, :])
+    return out
 
 
 def build_ablation_plan(model, site_name, arms, ext=None):
-    """{basis, blocks: {arm: [block indices]}, info} for one loaded arm.
+    """{basis_by_block: {arm: {block: Q}}, info} for one loaded arm.
 
-    Built ONCE per checkpoint: the basis comes from that model's own site, so the
-    sphere and trainable arms are each ablated along their own learned directions.
-    A site-less model (baseline) with ``ext`` set instead builds the basis from
-    external DoM directions (--baseline-ablate-*). Non-ablation arms map to an empty
-    block list, which `ablated()` treats as a no-op that registers no hooks at all."""
+    Injected arms ablate ONE site direction at each block in scope (built from that
+    model's own site). A site-less model (baseline) with ``ext`` ablates EXTERNAL DoM
+    directions: the L0/most-salient scope at --baseline-ablate-layer using that layer's
+    directions; the 'all' scope at every block using EACH BLOCK'S OWN layer directions.
+    Non-ablation arms map to {} which `ablated_map()` treats as a no-op."""
     ABL = _ablation()
-    scopes = {scope_of(g) for g in arms}
-    basis, _, info = ABL.arm_plan(model, None, site_name, "none")
-    ext_layer = None
-    if basis is None and ext is not None:
-        basis, rows, pick = _ext_basis(ext)
-        ext_layer = int(ext["layer"])
-        info = {"scope": "ext-dom", "rank": int(basis.shape[0]), "r": len(rows),
-                "ext_npz": os.path.basename(ext["npz"]), "salient_layer": ext_layer,
-                "ext_concepts": list(pick)}
+    site_basis, _, info = ABL.arm_plan(model, None, site_name, "none")
     n_layer = len(model.transformer.h)
-    blocks = {}
-    for g in arms:
-        scope = scope_of(g)
-        if basis is None or scope == "none":
-            blocks[g] = []
-        elif ext_layer is not None:
-            blocks[g] = [ext_layer] if scope == "L0" else list(range(n_layer))
-        else:
-            site = model.injection_sites[site_name]
-            blocks[g] = ABL.resolve_blocks(model, scope, int(site.cfg.after_block))
-    info["scopes_requested"] = sorted(scopes)
-    info["blocks_by_arm"] = blocks
-    return {"basis": basis, "blocks": blocks, "info": info}
+    basis_by_block = {}
+    if site_basis is None and ext is not None:
+        salient = int(ext["layer"])
+        for g in arms:
+            scope = scope_of(g)
+            if scope == "none":
+                basis_by_block[g] = {}
+            elif scope == "L0":
+                basis_by_block[g] = _ext_bases(ext, [salient])
+            else:
+                basis_by_block[g] = _ext_bases(ext, list(range(n_layer)))
+        info = {"scope": "ext-dom", "salient_layer": salient,
+                "ext_dir": os.path.basename(ext["dir"].rstrip("/")),
+                "ext_concepts": ext.get("concepts"),
+                "ranks_by_arm": {g: {b: int(Q.shape[0]) for b, Q in m.items()}
+                                 for g, m in basis_by_block.items()}}
+    else:
+        for g in arms:
+            scope = scope_of(g)
+            if site_basis is None or scope == "none":
+                basis_by_block[g] = {}
+            else:
+                site = model.injection_sites[site_name]
+                blocks = ABL.resolve_blocks(model, scope, int(site.cfg.after_block))
+                basis_by_block[g] = {b: site_basis for b in blocks}
+        info["rank"] = int(site_basis.shape[0]) if site_basis is not None else 0
+    info["scopes_requested"] = sorted({scope_of(g) for g in arms})
+    info["blocks_by_arm"] = {g: sorted(m.keys()) for g, m in basis_by_block.items()}
+    return {"basis_by_block": basis_by_block, "info": info}
 
 
 def _ablate_ctx(plan, model, g):
@@ -290,8 +303,8 @@ def _ablate_ctx(plan, model, g):
     ablation arm). Always used as a `with`, so hooks cannot leak between arms."""
     ABL = _ablation()
     if plan is None:
-        return ABL.ablated(model, None, [])
-    return ABL.ablated(model, plan["basis"], plan["blocks"].get(g, []))
+        return ABL.ablated_map(model, {})
+    return ABL.ablated_map(model, plan["basis_by_block"].get(g, {}))
 
 
 def _ce1d(fm_result):
@@ -760,8 +773,8 @@ def main():
         scorer = harness.GemmaScorer(device, concepts, layer=args.layer)
 
     ext_abl = None
-    if args.baseline_ablate_npz:
-        ext_abl = {"npz": args.baseline_ablate_npz, "layer": args.baseline_ablate_layer,
+    if args.baseline_ablate_dir:
+        ext_abl = {"dir": args.baseline_ablate_dir, "layer": args.baseline_ablate_layer,
                    "concepts": args.baseline_ablate_concepts}
 
     all_records = []
