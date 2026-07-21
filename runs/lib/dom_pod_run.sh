@@ -54,10 +54,10 @@ snapshot_download(os.environ["DATA_REPO"], repo_type="dataset",
 print("data ready")
 PY
 
-# 4) fit + eval + push (one stacked npz per layer, into the baseline/ model folder)
+# 4) fit + eval + push (one gold_probes-style stacked npz per layer, into baseline/probes/)
 python runs/lib/build_dom.py \
   --ckpt-dir "$CKPT_DIR" --step 2520 --data-root "$DATA_DIR" \
   --out "$OUT_DIR" --device cuda \
-  --push-repo "$BASELINE_REPO" --push-subdir baseline
+  --push-repo "$BASELINE_REPO" --push-subdir baseline/probes
 
-echo ">> DONE. results in $OUT_DIR (pushed to $BASELINE_REPO/baseline/dom_layer*.npz)"
+echo ">> DONE. results in $OUT_DIR (pushed to $BASELINE_REPO/baseline/probes/)"

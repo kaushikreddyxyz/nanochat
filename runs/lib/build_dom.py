@@ -4,12 +4,14 @@ global per-layer mu/sd so every concept shares one readout frame.
 
   python runs/lib/build_dom.py --ckpt-dir <dir> --step 2520 \
       --data-root <probe-train-data> --out runs/dom_baseline \
-      [--push-repo kaushikreddyxyz/nanochat-d12-injections --push-subdir baseline]
+      [--push-repo kaushikreddyxyz/nanochat-d12-injections --push-subdir baseline/probes]
 
-Per-layer file dom_layer{L:02d}.npz: W_dom[54,d], mu[d], sd[d], auroc[54], dprime[54],
-meter[54,4] (pos_mu,pos_sd,neg_mu,neg_sd of the val projection), concepts[54],
-families[54], layer. dom_index.json holds the best layer per concept. Fit uses
-mixed/<class>.train.jsonl; eval uses mixed/<class>.val.jsonl. See dom_probe.py.
+Output mirrors concept-probes-gemma2-2b/gold_probes: per-layer file
+dom_54_probes_difference_of_means_layer{L:02d}.npz with keys W_dom[54,d], nat_mean[d],
+nat_std[d], G[54,54], G_inv[54,54], concepts[54], families[54], method[54],
+selection_auroc[54], dprime[54], meter[54,4], layer; plus probe_set.json. Uploaded to
+<repo>/baseline/probes/. Fit uses mixed/<class>.train.jsonl; eval uses
+mixed/<class>.val.jsonl. See dom_probe.py.
 """
 import argparse
 import json
@@ -140,30 +142,41 @@ def fit_all(model, enc, bos_id, data_root, device, args):
 
 
 def save_stacked(out_dir, r):
+    """One stacked npz per layer in the concept-probes-gemma2-2b/gold_probes convention
+    (W_dom, nat_mean, nat_std, G, G_inv, concepts, families, method, selection_auroc, ...),
+    plus probe_set.json. Uploaded into <repo>/baseline/probes/."""
     os.makedirs(out_dir, exist_ok=True)
     concepts = np.array(r["concepts"])
     families = np.array(r["families"])
+    method = np.array(["dom"] * len(r["concepts"]))
     for l in range(r["L"]):
+        W = r["W"][:, l, :].astype(np.float32)           # [54,d] standardized-space DoM
+        mu = r["mu"][l].astype(np.float32)
+        sd = r["sd"][l].astype(np.float32)
+        G = (W @ W.T).astype(np.float32)                 # Gram of the 54 dirs (std space)
+        G_inv = np.linalg.inv(G + 1e-3 * np.eye(len(W), dtype=np.float32)).astype(np.float32)
         np.savez_compressed(
-            os.path.join(out_dir, f"dom_layer{l:02d}.npz"),
-            W_dom=r["W"][:, l, :].astype(np.float32),
-            mu=r["mu"][l].astype(np.float32), sd=r["sd"][l].astype(np.float32),
-            auroc=r["auroc"][:, l], dprime=r["dprime"][:, l],
-            meter=r["meter"][:, l, :], concepts=concepts, families=families,
-            layer=np.int64(l), binarize_at=np.float32(dp.BINARIZE_AT))
+            os.path.join(out_dir, f"dom_54_probes_difference_of_means_layer{l:02d}.npz"),
+            W_dom=W, nat_mean=mu, nat_std=sd, G=G, G_inv=G_inv,
+            concepts=concepts, families=families, method=method,
+            selection_auroc=r["auroc"][:, l].astype(np.float32),
+            dprime=r["dprime"][:, l].astype(np.float32),
+            meter=r["meter"][:, l, :].astype(np.float32),
+            layer=np.int64(l))
     idx = {
-        "layers": r["L"], "d": r["d"], "binarize_at": dp.BINARIZE_AT,
-        "concepts": r["concepts"], "families": r["families"],
-        "standardization": "global per-layer mu/sd over all train tokens (all families)",
-        "layer_file": "dom_layer{L:02d}.npz  (W_dom[54,d], mu[d], sd[d], auroc[54], dprime[54], meter[54,4])",
+        "model": "nanochat-d12 baseline (frozen)", "method": "difference_of_means",
+        "layers": list(range(r["L"])), "d_model": r["d"], "binarize_at": dp.BINARIZE_AT,
+        "concepts": r["concepts"],
+        "families": {c: r["families"][i] for i, c in enumerate(r["concepts"])},
+        "standardization": "global per-layer nat_mean/nat_std over all DoM train tokens (baseline nanochat)",
+        "layer_file": "dom_54_probes_difference_of_means_layer{L:02d}.npz  keys: W_dom[54,d], nat_mean[d], nat_std[d], G[54,54], G_inv[54,54], concepts[54], families[54], method[54], selection_auroc[54], dprime[54], meter[54,4], layer",
         "best_layer": {c: int(r["best_layer"][i]) for i, c in enumerate(r["concepts"])},
         "auroc_at_best": {c: round(float(r["auroc"][i, r["best_layer"][i]]), 4)
                           for i, c in enumerate(r["concepts"])},
         "auroc_per_layer": {c: [round(float(x), 4) for x in r["auroc"][i]]
                             for i, c in enumerate(r["concepts"])},
-        "pos_tokens": {c: int(r["pos_n"][i, 0]) for i, c in enumerate(r["concepts"])},
     }
-    with open(os.path.join(out_dir, "dom_index.json"), "w") as f:
+    with open(os.path.join(out_dir, "probe_set.json"), "w") as f:
         json.dump(idx, f, indent=2)
     return idx
 
@@ -179,7 +192,7 @@ def main():
     ap.add_argument("--max-rows", type=int, default=64)
     ap.add_argument("--limit-docs", type=int, default=0)
     ap.add_argument("--push-repo", default=None)
-    ap.add_argument("--push-subdir", default="baseline")
+    ap.add_argument("--push-subdir", default="baseline/probes")
     args = ap.parse_args()
     args.limit_docs = args.limit_docs or None
 
@@ -210,7 +223,7 @@ def main():
         from huggingface_hub import HfApi
         HfApi().upload_folder(folder_path=args.out, repo_id=args.push_repo,
                               path_in_repo=args.push_subdir, repo_type="model",
-                              allow_patterns=["dom_layer*.npz", "dom_index.json"])
+                              allow_patterns=["dom_54_probes_*.npz", "probe_set.json"])
         print(f"pushed -> {args.push_repo}/{args.push_subdir}/", flush=True)
 
 
