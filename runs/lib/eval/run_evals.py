@@ -22,6 +22,27 @@ if _REPO_ROOT not in sys.path:
 LOUDNESS_SCALES = {"on": 1.0, "off": 0.0}
 THRESHOLD_DEFAULT = 2.0
 
+# The four arms, as (loudness_scale, ablation scope). on/off dial the site's calibrated
+# channel_scale; the two ablation arms project the direction row space out of the
+# residual stream (runs/lib/eval/ablation.py) and keep the oracle EXPLICITLY OFF, so
+# they ask whether the model still routes concept behaviour through that subspace with
+# no injected signal in play. Scope 'L0' resolves to the site's own after_block.
+CONDITIONS = {
+    "on":         (1.0, "none"),
+    "off":        (0.0, "none"),
+    "ablate_L0":  (0.0, "L0"),
+    "ablate_all": (0.0, "all"),
+}
+ARM_NAMES = list(CONDITIONS)
+
+
+def loudness_of(g):
+    return CONDITIONS[g][0]
+
+
+def scope_of(g):
+    return CONDITIONS[g][1]
+
 # climbmix-scored HF layout (from runs/weekdays/exp2_config.json prefetch block):
 # 25 shards per repo, sid -> repos[sid // 25].
 SCORED_REPOS = [
@@ -134,8 +155,10 @@ def build_parser():
                     help="arms to evaluate; each is the HF checkpoint FOLDER name")
     ap.add_argument("--metrics", nargs="+", default=["completion", "valbpb", "core"],
                     choices=["completion", "valbpb", "core"], help="metrics to run")
-    ap.add_argument("--injection", nargs="+", default=["on", "off"], choices=["on", "off"],
-                    help="injection settings (on = loudness scale 1.0, off = 0.0)")
+    ap.add_argument("--injection", nargs="+", default=["on", "off"], choices=ARM_NAMES,
+                    help="arms: on (loudness 1.0), off (0.0), ablate_L0 / ablate_all "
+                         "(0.0 + direction-subspace projection at the site's block / "
+                         "every block)")
     ap.add_argument("--evalset", required=True, help="completion eval set JSONL")
     ap.add_argument("--family", required=True,
                     help="concept family in runs/lib/concepts.py: supplies the probe concepts in "
@@ -170,6 +193,16 @@ def build_parser():
                     help="injection site name in the checkpoints (default: the family name)")
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--limit-items", type=int, default=-1, help="debug: cap completion items (-1 = all)")
+    # Site-less (baseline) ablation: build the projected-out subspace from EXTERNAL DoM
+    # probe directions instead of an injection site. The concept lives along the raw
+    # residual write direction W_dom(.)nat_std; L0 scope -> --baseline-ablate-layer, all
+    # scope -> every block (same basis, matching the injected arms' ablate_all).
+    ap.add_argument("--baseline-ablate-npz", default=None,
+                    help="DoM probe npz (W_dom/nat_std/concepts) for a site-less model's ablation")
+    ap.add_argument("--baseline-ablate-layer", type=int, default=None,
+                    help="block index for the L0-scope (most-salient-layer) ablation")
+    ap.add_argument("--baseline-ablate-concepts", nargs="+", default=None,
+                    help="concept names to ablate (subset of the npz); default all in the npz")
     return ap
 
 
@@ -191,6 +224,74 @@ def _harness():
         sys.path.insert(0, here)
     import harness  # noqa: WPS433 (intentional lazy import)
     return harness
+
+
+def _ablation():
+    """Import the ablation module the same lazy, name-based way as the harness."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import ablation  # noqa: WPS433 (intentional lazy import)
+    return ablation
+
+
+def _ext_basis(ext):
+    """Orthonormal raw-residual basis from external DoM probe directions (site-less
+    models). The concept's raw write direction is W_dom (.) nat_std (W_dom is in
+    standardized space); direction_basis SVD-orthonormalizes the selected rows."""
+    import numpy as np
+    ABL = _ablation()
+    z = np.load(ext["npz"], allow_pickle=True)
+    names = [str(c) for c in z["concepts"]]
+    W = np.asarray(z["W_dom"], np.float32)
+    nat_std = np.asarray(z["nat_std"], np.float32)
+    pick = ext.get("concepts") or names
+    rows = [names.index(c) for c in pick]
+    D_raw = W[rows] * nat_std[None, :]
+    return ABL.direction_basis(D_raw), rows, pick
+
+
+def build_ablation_plan(model, site_name, arms, ext=None):
+    """{basis, blocks: {arm: [block indices]}, info} for one loaded arm.
+
+    Built ONCE per checkpoint: the basis comes from that model's own site, so the
+    sphere and trainable arms are each ablated along their own learned directions.
+    A site-less model (baseline) with ``ext`` set instead builds the basis from
+    external DoM directions (--baseline-ablate-*). Non-ablation arms map to an empty
+    block list, which `ablated()` treats as a no-op that registers no hooks at all."""
+    ABL = _ablation()
+    scopes = {scope_of(g) for g in arms}
+    basis, _, info = ABL.arm_plan(model, None, site_name, "none")
+    ext_layer = None
+    if basis is None and ext is not None:
+        basis, rows, pick = _ext_basis(ext)
+        ext_layer = int(ext["layer"])
+        info = {"scope": "ext-dom", "rank": int(basis.shape[0]), "r": len(rows),
+                "ext_npz": os.path.basename(ext["npz"]), "salient_layer": ext_layer,
+                "ext_concepts": list(pick)}
+    n_layer = len(model.transformer.h)
+    blocks = {}
+    for g in arms:
+        scope = scope_of(g)
+        if basis is None or scope == "none":
+            blocks[g] = []
+        elif ext_layer is not None:
+            blocks[g] = [ext_layer] if scope == "L0" else list(range(n_layer))
+        else:
+            site = model.injection_sites[site_name]
+            blocks[g] = ABL.resolve_blocks(model, scope, int(site.cfg.after_block))
+    info["scopes_requested"] = sorted(scopes)
+    info["blocks_by_arm"] = blocks
+    return {"basis": basis, "blocks": blocks, "info": info}
+
+
+def _ablate_ctx(plan, model, g):
+    """Context manager projecting the subspace out for arm ``g`` (no-op if not an
+    ablation arm). Always used as a `with`, so hooks cannot leak between arms."""
+    ABL = _ablation()
+    if plan is None:
+        return ABL.ablated(model, None, [])
+    return ABL.ablated(model, plan["basis"], plan["blocks"].get(g, []))
 
 
 def _ce1d(fm_result):
@@ -254,7 +355,7 @@ def _acts_with_bos(acts_body, r):
 # (1) the family's completion eval set
 # --------------------------------------------------------------------------- #
 def run_completion(model, meta, scorer, items, device, injection, site_name, threshold, r,
-                   limit=-1):
+                   limit=-1, abl_plan=None):
     """Score the completion eval set at each requested injection setting. Acts are
     computed ONCE per option (gemma is expensive) and forwarded at every loudness scale,
     so on/off see byte-identical activations. Returns
@@ -265,8 +366,17 @@ def run_completion(model, meta, scorer, items, device, injection, site_name, thr
     if limit and limit > 0:
         items = items[:limit]
 
-    # accumulator: injection -> category -> {n, correct, sum_answer_ce, sum_margin}
+    # accumulator: injection -> tier/category -> {n, correct, sum_answer_ce, sum_margin}
     acc = {g: {} for g in injection}
+
+    # If EVERY requested arm has loudness 0 (an off-only or ablation-only invocation),
+    # the site is an exact no-op and the acts can never matter — so skip the gemma pass
+    # entirely and forward vanilla. harness.forward_metrics documents acts=None as
+    # bit-identical to loudness 0. This is what makes an ablation-only process cheap
+    # enough to run beside the `on` process instead of after it.
+    need_acts = any(loudness_of(g) > 0.0 for g in injection)
+    if not need_acts:
+        print("[run_evals] all arms are loudness 0 -> skipping gemma for completion")
 
     for it in items:
         options = it["options"]
@@ -281,19 +391,29 @@ def run_completion(model, meta, scorer, items, device, injection, site_name, thr
         opt_ce = {g: [] for g in injection}
         for i, f in enumerate(fulls):
             ids = seqs[i]
-            gemma_z, offsets = _gemma_z_and_offsets(scorer, f)
-            nano_body = ids[1:]
-            acts_body = harness.build_acts(f, nano_body, gemma_z, offsets, threshold=threshold)
-            acts = _acts_with_bos(acts_body, r)[None]  # [1, T, r] aligned to [1,T] ids
+            if need_acts:
+                gemma_z, offsets = _gemma_z_and_offsets(scorer, f)
+                nano_body = ids[1:]
+                acts_body = harness.build_acts(f, nano_body, gemma_z, offsets,
+                                               threshold=threshold)
+                acts = _acts_with_bos(acts_body, r)[None]  # [1,T,r] aligned to [1,T] ids
+            else:
+                acts = None
             for g in injection:
-                fm = harness.forward_metrics(model, ids, acts, loudness_scale=LOUDNESS_SCALES[g])
+                with _ablate_ctx(abl_plan, model, g):
+                    fm = harness.forward_metrics(model, ids, acts,
+                                                 loudness_scale=loudness_of(g))
                 ce = _ce1d(fm)
                 opt_ce[g].append(option_mean_ce(ce, start, len(ids)))
 
         for g in injection:
             pred, margin = predict_from_option_ces(opt_ce[g])
-            c = acc[g].setdefault(it["category"], {"n": 0, "correct": 0,
-                                                   "sum_answer_ce": 0.0, "sum_margin": 0.0})
+            # Group by TIER when the item has one (the v2 sets): the difficulty ladder
+            # is the axis the four-arm analysis compares within. Falls back to
+            # `category` for v1 sets, which have no tier.
+            key = it.get("tier") or it["category"]
+            c = acc[g].setdefault(key, {"n": 0, "correct": 0,
+                                        "sum_answer_ce": 0.0, "sum_margin": 0.0})
             c["n"] += 1
             c["correct"] += int(pred == answer_index)
             c["sum_answer_ce"] += opt_ce[g][answer_index]
@@ -381,7 +501,8 @@ def _make_prescored_source(sid, nano_enc, gemma_encode, layer, threshold, stagin
         noise_sigma=0.0, present_z=threshold, name=f"{family}-valbpb")
 
 
-def run_valbpb(model, meta, scorer, args, device, injection, site_name, threshold, r):
+def run_valbpb(model, meta, scorer, args, device, injection, site_name, threshold, r,
+               abl_plan=None):
     """bits-per-byte over held-out scored climbmix docs, bucketed injected/after/rest.
     Acts computed once per doc, forwarded at every loudness scale. Returns
     {injection: {bucket: {bpb, mean_ce, n_tokens}}}."""
@@ -435,8 +556,10 @@ def run_valbpb(model, meta, scorer, args, device, injection, site_name, threshol
                      for t in range(T)]
             masks = bucket_masks(acts, valid)
             for g in injection:
-                fm = harness.forward_metrics(model, ids, acts[None], loudness_scale=LOUDNESS_SCALES[g],
-                                             return_logits=False)  # CE-only: skip ~268MB/doc copy
+                with _ablate_ctx(abl_plan, model, g):
+                    fm = harness.forward_metrics(model, ids, acts[None],
+                                                 loudness_scale=loudness_of(g),
+                                                 return_logits=False)  # CE-only: skip ~268MB/doc copy
                 ce = _ce1d(fm)
                 for t in range(T):
                     if not valid[t]:
@@ -471,7 +594,9 @@ class CoreActivationsAdapter:
     SAME on/off mechanism as forward_metrics (scale 0.0 = exact no-op)."""
 
     def __init__(self, model, tok, scorer, harness, loudness_scale, site_name, threshold, r,
-                 device, skip_gemma=False, z_cache=None):
+                 device, skip_gemma=False, z_cache=None, abl_plan=None, arm_name="on"):
+        self.abl_plan = abl_plan
+        self.arm_name = arm_name
         self.model = model
         self.tok = tok
         self.bos = tok.get_bos_token_id()
@@ -533,8 +658,11 @@ class CoreActivationsAdapter:
         # channel_scale (harness.scaled_loudness; 0.0 = exact no-op), never the acts.
         # test_consolidation.py asserts loudness-0, acts*0 and the vanilla forward are
         # bit-identical.
-        with self.harness.scaled_loudness(self.model, float(self.loudness_scale)):
-            return self.model(input_ids, acts={self.site_name: acts_t})
+        # Ablation (if this arm is one) wraps the forward, so CORE is measured under
+        # exactly the same intervention as the narrow sets and val-bpb.
+        with _ablate_ctx(self.abl_plan, self.model, self.arm_name):
+            with self.harness.scaled_loudness(self.model, float(self.loudness_scale)):
+                return self.model(input_ids, acts={self.site_name: acts_t})
 
 
 # Built acts per CORE row text (post-threshold [T,r]); text -> acts is arm- and
@@ -543,18 +671,22 @@ class CoreActivationsAdapter:
 _CORE_ACTS_CACHE = {}
 
 
-def run_core(model, meta, scorer, args, device, injection, site_name, threshold, r):
-    """CORE on/off via the adapter. Returns {injection: {core_metric, n_tasks}}."""
+def run_core(model, meta, scorer, args, device, injection, site_name, threshold, r,
+             abl_plan=None):
+    """CORE per arm via the adapter. Returns {arm: {core_metric, n_tasks}}."""
     harness = _harness()
     from scripts.base_eval import evaluate_core
     tok = _nano_tokenizer(meta)
     z_cache = _CORE_ACTS_CACHE  # shared across arms AND the on/off passes
     out = {}
     for g in injection:
-        skip = args.core_skip_gemma_when_off and g == "off"
-        adapter = CoreActivationsAdapter(model, tok, scorer, harness, LOUDNESS_SCALES[g],
+        # Loudness 0 makes the site an exact no-op, so the acts are irrelevant and the
+        # (expensive) gemma pass is pure waste. That covers `off` AND both ablation
+        # arms — the single biggest time saving in the four-arm matrix.
+        skip = args.core_skip_gemma_when_off and loudness_of(g) == 0.0
+        adapter = CoreActivationsAdapter(model, tok, scorer, harness, loudness_of(g),
                                          site_name, threshold, r, device, skip_gemma=skip,
-                                         z_cache=z_cache)
+                                         z_cache=z_cache, abl_plan=abl_plan, arm_name=g)
         res = evaluate_core(adapter, tok, device, max_per_task=args.core_max_per_task)
         out[g] = {"core_metric": res["core_metric"], "n_tasks": len(res["centered_results"]),
                   "centered_results": res["centered_results"],
@@ -600,17 +732,37 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
-    with open(args.evalset, "r", encoding="utf-8") as f:
-        items = [json.loads(line) for line in f if line.strip()]
+    # --evalset takes a single .jsonl OR a directory of tier files (the v2 layout:
+    # <family>_v2/T0_copy.jsonl, T1_assoc.jsonl, ...). A directory is read in sorted
+    # order so the item sequence is reproducible.
+    if os.path.isdir(args.evalset):
+        paths = sorted(os.path.join(args.evalset, f)
+                       for f in os.listdir(args.evalset) if f.endswith(".jsonl"))
+        assert paths, f"no .jsonl files in {args.evalset}"
+    else:
+        paths = [args.evalset]
+    items = []
+    for p in paths:
+        with open(p, "r", encoding="utf-8") as f:
+            items += [json.loads(line) for line in f if line.strip()]
+    print(f"[run_evals] evalset: {len(items)} items from {len(paths)} file(s)")
 
     concepts = harness.family_concepts(args.family)
     site_name_default = args.site_name or args.family
     lm_kw = {"hf_repo": args.hf_repo, "step": args.step}
 
+    # Gemma is only needed to score an injection-ON arm (loudness>0) or gemma val-bpb.
+    # A baseline / off / ablation-only run is loudness 0 everywhere -> skip the ~5GB load.
+    need_gemma = any(loudness_of(g) > 0.0 for g in injection) or \
+        ("valbpb" in args.metrics and args.valbpb_source == "gemma")
     scorer = None
-    if "completion" in args.metrics or "core" in args.metrics or \
-            ("valbpb" in args.metrics and args.valbpb_source == "gemma"):
+    if need_gemma:
         scorer = harness.GemmaScorer(device, concepts, layer=args.layer)
+
+    ext_abl = None
+    if args.baseline_ablate_npz:
+        ext_abl = {"npz": args.baseline_ablate_npz, "layer": args.baseline_ablate_layer,
+                   "concepts": args.baseline_ablate_concepts}
 
     all_records = []
     for arm in args.arms:
@@ -620,21 +772,25 @@ def main():
         threshold = (meta.get("threshold") if isinstance(meta, dict) else None) or THRESHOLD_DEFAULT
         r = len(concepts)
 
+        abl_plan = build_ablation_plan(model, site_name, injection, ext=ext_abl)
+        print(f"[run_evals] {arm}: ablation {abl_plan['info']}")
+
         completion_res = valbpb_res = core_res = None
         if "completion" in args.metrics:
             print(f"[run_evals] {arm}: {args.family} completion ({len(items)} items) "
                   f"injection={injection}")
             completion_res = run_completion(model, meta, scorer, items, device, injection,
-                                            site_name, threshold, r, limit=args.limit_items)
+                                            site_name, threshold, r, limit=args.limit_items,
+                                            abl_plan=abl_plan)
         if "valbpb" in args.metrics:
             print(f"[run_evals] {arm}: val_bpb shards={args.heldout_shards} src={args.valbpb_source}")
             valbpb_res = run_valbpb(model, meta, scorer, args, device, injection, site_name,
-                                    threshold, r)
+                                    threshold, r, abl_plan=abl_plan)
         if "core" in args.metrics:
             print(f"[run_evals] {arm}: CORE (max_per_task={args.core_max_per_task}) "
                   f"injection={injection}")
             core_res = run_core(model, meta, scorer, args, device, injection, site_name,
-                                threshold, r)
+                                threshold, r, abl_plan=abl_plan)
 
         detail = {"arm": arm, "injection": injection, "completion": completion_res,
                   "valbpb": valbpb_res, "core": core_res}
